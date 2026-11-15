@@ -1,0 +1,144 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-muted: #eef1f5;
+  --border: #d7dce3;
+  --text: #18202c;
+  --text-muted: #5b6676;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.14);
+  --highlight: rgba(250, 204, 21, 0.36);
+  --highlight-border: rgba(217, 119, 6, 0.85);
+  --danger: #dc2626;
+  --warn: #d97706;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #11161d;
+  --bg-panel: #19202a;
+  --bg-muted: #222b38;
+  --border: #2e3a4a;
+  --text: #e6ebf2;
+  --text-muted: #9aa7b8;
+  --accent: #60a5fa;
+  --accent-soft: rgba(96, 165, 250, 0.18);
+  --highlight: rgba(250, 204, 21, 0.32);
+  --highlight-border: rgba(251, 191, 36, 0.9);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #11161d;
+    --bg-panel: #19202a;
+    --bg-muted: #222b38;
+    --border: #2e3a4a;
+    --text: #e6ebf2;
+    --text-muted: #9aa7b8;
+    --accent: #60a5fa;
+    --accent-soft: rgba(96, 165, 250, 0.18);
+    --highlight: rgba(250, 204, 21, 0.32);
+    --highlight-border: rgba(251, 191, 36, 0.9);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input,
+select {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+/* pdf.js selectable text layer */
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  opacity: 0.25;
+  line-height: 1;
+  text-size-adjust: none;
+  user-select: text;
+}
+
+.textLayer span,
+.textLayer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+
+.textLayer ::selection,
+.djvu-text-layer ::selection {
+  background: rgba(37, 99, 235, 0.35);
+}
+
+.djvu-text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  user-select: text;
+}
+
+.djvu-text-span {
+  position: absolute;
+  color: transparent;
+  white-space: nowrap;
+  cursor: text;
+  line-height: 1;
+  overflow: hidden;
+}

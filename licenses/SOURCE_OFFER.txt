@@ -1,0 +1,28 @@
+WRITTEN OFFER FOR DJVULIBRE SOURCE CODE (GPL-2.0-or-later, Section 3b)
+==========================================================================
+
+Papero distributes the standalone DjVuLibre command-line executables (`ddjvu`,
+`djvused`, `djvutxt`) and their accompanying runtime shared libraries as an
+independent mere aggregation alongside the Papero application (`MIT OR
+Apache-2.0`). Papero executes these tools exclusively as separate operating
+system child processes and does not link `libdjvulibre` into Papero's Rust or
+JavaScript code.
+
+DjVuLibre is licensed under the GNU General Public License, version 2 or (at
+your option) any later version. See `GPL-2.0-DjVuLibre.txt` in this directory
+for the full license text.
+
+Corresponding Source Code:
+- Upstream package: djvulibre-3.5.30.tar.gz
+- Upstream URL:     https://downloads.sourceforge.net/project/djvu/DjVuLibre/3.5.30/djvulibre-3.5.30.tar.gz
+- SHA-256:          ee5e457d4cfebe566f94b99e5e3d3cc7f5c79ddb741c2ac2ba2e456f00329644
+- GitHub Releases:  Each tagged Papero GitHub Release attaches `djvulibre-3.5.30.tar.gz`
+                    (and any build/packaging patches, if ever introduced) directly as a
+                    release asset alongside the installers.
+
+If for any reason the source tarball is unavailable from the GitHub Release page
+or upstream mirror, anyone who received this binary distribution from Papero's
+GitHub Releases may obtain a complete machine-readable copy of the corresponding
+source code by opening an issue on the Papero public GitHub repository within
+three (3) years of the release date (at no charge beyond nominal media/shipping
+costs if physical media is requested).

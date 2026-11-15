@@ -1,0 +1,2 @@
+# Native runtime libraries (PDFium non-V8, ONNX Runtime CPU, DjVuLibre standalone tools)
+# are staged here before bundling via `scripts/stage-resources.sh` or `scripts/stage-resources.ps1`.

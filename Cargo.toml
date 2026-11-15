@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "crates/papero-core",
+    "crates/papero-eval",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+blake3 = { version = "1", features = ["mmap", "rayon"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+hex = "0.4"
+keyring = "3"
+ndarray = "0.17"
+notify = "7"
+notify-debouncer-full = "0.4"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-22"] }
+pdfium-render = { version = "0.8", features = ["thread_safe"] }
+percent-encoding = "2"
+png = "0.18"
+quick-xml = "0.42"
+rayon = "1"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip", "charset", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+strsim = "0.11"
+tantivy = "0.22"
+tempfile = "3"
+thiserror = "2"
+thread-priority = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "sync", "time"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-normalization = "0.1"
+url = "2"
+usearch = "2.26"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+zstd = { version = "0.13", default-features = false }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "s"

@@ -1,0 +1,16 @@
+pub mod backup;
+pub mod bibtex;
+pub mod classify;
+pub mod config;
+pub mod credentials;
+pub mod db;
+pub mod dedup;
+pub mod error;
+pub mod extract;
+pub mod fs;
+pub mod index;
+pub mod llm;
+pub mod metadata;
+pub mod ml;
+pub mod text_norm;
+pub mod viewer;

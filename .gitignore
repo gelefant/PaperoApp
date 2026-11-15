@@ -1,0 +1,13 @@
+/target
+/frontend/node_modules
+/frontend/dist
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+/src-tauri/resources/*
+!/src-tauri/resources/.gitkeep
+.tmp_icon_build
+.tmp_stage_cache
+/dist-artifacts
+/Papero.app

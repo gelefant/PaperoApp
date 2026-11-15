@@ -1,0 +1,219 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ONNXRUNTIME_VERSION: "1.23.2"
+  DJVULIBRE_TARBALL: "djvulibre-3.5.30.tar.gz"
+  DJVULIBRE_URL: "https://downloads.sourceforge.net/project/djvu/DjVuLibre/3.5.30/djvulibre-3.5.30.tar.gz"
+  DJVULIBRE_SHA256: "ee5e457d4cfebe566f94b99e5e3d3cc7f5c79ddb741c2ac2ba2e456f00329644"
+
+jobs:
+  build:
+    name: Build Installer (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            djvulibre-bin
+
+      - name: Install macOS DjVuLibre tools
+        if: runner.os == 'macOS'
+        run: brew install djvulibre
+
+      - name: Install Windows DjVuLibre standalone tools (MSYS2 UCRT64)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          mssystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-djvulibre
+
+      - name: Stage native binaries & license files (Unix)
+        if: runner.os != 'Windows'
+        run: ./scripts/stage-resources.sh --target "${{ matrix.target }}"
+
+      - name: Stage native binaries & license files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\stage-resources.ps1
+
+      - name: Build frontend & install Tauri CLI
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          npm --prefix frontend install --no-save @tauri-apps/cli@^2
+
+      - name: Build Tauri bundle (Unix)
+        if: runner.os != 'Windows'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          ARGS=(build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}")
+          if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "Updater signing key detected; enabling Tauri updater signature artifacts."
+            ARGS+=(--config '{"bundle":{"createUpdaterArtifacts":true}}')
+          fi
+          ./frontend/node_modules/.bin/tauri "${ARGS[@]}"
+
+      - name: Build Tauri bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $argsList = @("build", "--target", "${{ matrix.target }}", "--bundles", "${{ matrix.bundles }}")
+          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+            Write-Host "Updater signing key detected; enabling Tauri updater signature artifacts."
+            $argsList += @("--config", '{"bundle":{"createUpdaterArtifacts":true}}')
+          }
+          & .\frontend\node_modules\.bin\tauri.cmd @argsList
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Ad-hoc sign macOS app bundle & build compressed DMG
+        if: runner.os == 'macOS'
+        run: |
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          APP_PATH="${BUNDLE_DIR}/macos/Papero.app"
+          codesign --force --deep --sign - "${APP_PATH}"
+          codesign --verify --deep --strict "${APP_PATH}"
+
+          ARCH_LABEL="aarch64"
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
+            ARCH_LABEL="x64"
+          fi
+          APP_VER="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          mkdir -p "${BUNDLE_DIR}/dmg" dist-artifacts
+          DMG_STAGE="$(mktemp -d)"
+          cp -R "${APP_PATH}" "${DMG_STAGE}/Papero.app"
+          ln -s /Applications "${DMG_STAGE}/Applications"
+          DMG_OUT="dist-artifacts/Papero_${APP_VER}_${ARCH_LABEL}.dmg"
+          hdiutil create -volname "Papero" -srcfolder "${DMG_STAGE}" -ov -format ULFO "${DMG_OUT}"
+          rm -rf "${DMG_STAGE}"
+
+      - name: Collect & verify installer size limit (<= 40 MB)
+        shell: bash
+        run: |
+          mkdir -p dist-artifacts
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
+          for ext in deb AppImage msi exe sig tar.gz zip; do
+            while IFS= read -r -d '' f; do
+              cp "$f" dist-artifacts/
+            done < <(find "${BUNDLE_DIR}" -type f -name "*.${ext}" -print0 2>/dev/null || true)
+          done
+
+          MAX_BYTES=40000000
+          echo "=== Release Installer Size Report (${{ matrix.target }}) ==="
+          shopt -s nullglob
+          for artifact in dist-artifacts/*; do
+            bytes=$(wc -c < "${artifact}")
+            mb=$(awk "BEGIN { printf \"%.2f\", ${bytes} / 1000000 }")
+            mib=$(awk "BEGIN { printf \"%.2f\", ${bytes} / 1048576 }")
+            echo "  $(basename "${artifact}"): ${bytes} bytes (${mb} MB / ${mib} MiB)"
+            case "${artifact}" in
+              *.dmg|*.deb|*.msi|*.exe)
+                if [[ "${bytes}" -gt "${MAX_BYTES}" ]]; then
+                  echo "ERROR: Installer $(basename "${artifact}") exceeds 40 MB budget (${bytes} > ${MAX_BYTES})!" >&2
+                  exit 1
+                fi
+                ;;
+              *.AppImage)
+                echo "    (AppImage embeds WebKitGTK/GTK runtime libraries cleanly outside 40 MB native cap.)"
+                ;;
+            esac
+          done
+
+      - name: Upload target artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.target }}
+          path: dist-artifacts/*
+          if-no-files-found: error
+
+  djvulibre-source:
+    name: Fetch & Verify DjVuLibre GPLv2 Source Tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download & verify djvulibre-3.5.30.tar.gz
+        run: |
+          mkdir -p source-artifacts
+          curl -fL --retry 3 --retry-delay 2 -o "source-artifacts/${DJVULIBRE_TARBALL}" "${DJVULIBRE_URL}"
+          echo "${DJVULIBRE_SHA256}  source-artifacts/${DJVULIBRE_TARBALL}" | sha256sum -c -
+          cp licenses/SOURCE_OFFER.txt source-artifacts/SOURCE_OFFER.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: djvulibre-source-offer
+          path: source-artifacts/*
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, djvulibre-source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          generate_release_notes: true

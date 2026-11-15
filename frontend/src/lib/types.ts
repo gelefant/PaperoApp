@@ -1,0 +1,609 @@
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface SourceRoot {
+  id: string;
+  label: string;
+  root_path: string;
+  is_enabled: boolean;
+  is_network_or_cloud: boolean;
+  is_reachable: boolean;
+  exclude_from_cloud_llm: boolean;
+  last_scan_at: number | null;
+}
+
+export interface DocumentListItem {
+  document_id: number;
+  file_id: number;
+  root_id: string;
+  root_label: string;
+  work_type?: string;
+  title: string;
+  authors_summary: string;
+  year: number | null;
+  format: 'pdf' | 'djvu' | string;
+  rel_path: string;
+  page_count: number | null;
+  is_available: boolean;
+  index_state: string;
+  error_message: string | null;
+  msc_primary: string | null;
+  msc_primary_status: string;
+  has_text_layer: boolean;
+  ocr_status: 'none' | 'queued' | 'running' | 'done' | 'failed' | string;
+  metadata_source?: string | null;
+  metadata_verified?: boolean;
+}
+
+export interface ContentSearchPassageHit {
+  passage_id: number;
+  file_id: number;
+  page_ord: number;
+  printed_label: string | null;
+  score: number;
+  text_content: string;
+  bboxes: NormalizedRect[];
+}
+
+export interface ContentSearchDocResult {
+  document_id: number;
+  file_id: number;
+  work_type?: string;
+  title: string;
+  format: 'pdf' | 'djvu' | string;
+  rel_path: string;
+  is_available: boolean;
+  max_score: number;
+  passages: ContentSearchPassageHit[];
+}
+
+export interface FilePageInfo {
+  page_ord: number;
+  printed_label: string | null;
+  width_pts: number;
+  height_pts: number;
+}
+
+export interface OutlineItem {
+  title: string;
+  page_ord: number | null;
+  children: OutlineItem[];
+}
+
+export interface FileViewerInfo {
+  file_id: number;
+  document_id: number;
+  title: string;
+  format: 'pdf' | 'djvu' | string;
+  page_count: number;
+  byte_size: number;
+  is_available: boolean;
+  abs_path: string;
+  pages: FilePageInfo[];
+  outline: OutlineItem[];
+}
+
+export interface ExtractedSpan {
+  text: string;
+  bbox: NormalizedRect;
+}
+
+export interface ViewerTargetPassage {
+  page_ord: number;
+  printed_label: string | null;
+  bboxes: NormalizedRect[];
+  text_content: string;
+}
+
+export interface ViewerTab {
+  tabId: string;
+  fileId: number;
+  title: string;
+  format: string;
+  targetPage: number;
+  highlightRects: NormalizedRect[];
+  matches: ViewerTargetPassage[];
+  activeMatchIndex: number;
+}
+
+export interface ExternalReaderPreset {
+  id: string;
+  label: string;
+  os: string;
+  formats: string[];
+  template: string;
+  requires_accessibility: boolean;
+  note: string | null;
+}
+
+export interface UiSettingsPayload {
+  viewer_open_in_separate_window: boolean;
+  external_pdf_command: string | null;
+  external_djvu_command: string | null;
+  linux_reveal_mode: 'dbus_with_fallback' | 'parent_xdg_open_only';
+  max_worker_threads: number;
+  cache_limit_mb: number;
+  polite_email: string | null;
+  network_lookups_enabled: boolean;
+  mrlookup_enabled_single: boolean;
+  mrlookup_enabled_bulk: boolean;
+  zbmath_enabled: boolean;
+  crossref_enabled: boolean;
+  arxiv_enabled: boolean;
+  openlibrary_enabled: boolean;
+  dblp_enabled: boolean;
+  openalex_enabled: boolean;
+  datacite_enabled: boolean;
+  inspirehep_enabled: boolean;
+  europepmc_enabled: boolean;
+  semanticscholar_enabled: boolean;
+  metadata_source_priority: string[];
+  ml_profile: 'light' | 'quality' | string;
+  reranker_enabled: boolean;
+  model_idle_unload_secs: number;
+  hybrid_top_n: number;
+  rerank_top_m_light: number;
+  rerank_top_m_quality: number;
+  search_top_k_docs: number;
+  search_min_score: number;
+  doc_score_aggregation: 'max' | 'top2_mean' | string;
+  ui_language: 'it' | 'en' | string;
+  ui_theme: 'system' | 'light' | 'dark' | string;
+  first_run_completed: boolean;
+  fs_watcher_enabled: boolean;
+  tesseract_bin: string | null;
+  ocr_languages: string | null;
+  ocr_dpi: number;
+  llm_provider: LlmProvider;
+  llm_model: string | null;
+  llm_ollama_url: string;
+  llm_max_passages: number;
+  llm_max_input_tokens: number;
+  llm_max_output_tokens: number;
+  llm_consent_anthropic: boolean;
+  llm_consent_openai: boolean;
+  llm_consent_gemini: boolean;
+  backup_path?: string | null;
+  auto_backup_enabled?: boolean;
+  last_backup_at?: number | null;
+  last_backup_bytes?: number | null;
+}
+
+export interface HybridSearchStats {
+  mode: string;
+  bm25_hits: number;
+  vector_hits: number;
+  rrf_candidates: number;
+  reranked_count: number;
+  total_ms: number;
+  bm25_ms: number;
+  embed_query_ms: number;
+  vector_ms: number;
+  rerank_ms: number;
+}
+
+export interface HybridSearchResponse {
+  results: ContentSearchDocResult[];
+  stats: HybridSearchStats;
+}
+
+export interface ModelProfileStatus {
+  profile: 'light' | 'quality' | string;
+  label: string;
+  ready: boolean;
+  total_bytes: number;
+  downloaded_bytes: number;
+  embedder_repo: string;
+  reranker_repo: string;
+  missing_files: string[];
+}
+
+export interface MlEnvironmentStatus {
+  onnxruntime_found: boolean;
+  onnxruntime_path: string | null;
+  embedder_loaded: boolean;
+  reranker_loaded: boolean;
+  rss_mb: number;
+  active_profile: 'light' | 'quality' | string;
+  profiles: ModelProfileStatus[];
+}
+
+export interface DownloadProgressEvent {
+  profile: 'light' | 'quality' | string;
+  artifact_name: string;
+  artifact_bytes_done: number;
+  artifact_bytes_total: number;
+  profile_bytes_done: number;
+  profile_bytes_total: number;
+  bytes_per_sec: number;
+  finished: boolean;
+}
+
+export interface AltFormulaImportReport {
+  file_id: number;
+  document_id: number;
+  cache_path: string;
+  passages_inserted: number;
+  pages_parsed: number;
+}
+
+export interface BibliographicAuthor {
+  family_name: string;
+  given_name: string;
+  role: 'author' | 'editor' | string;
+}
+
+export interface BibliographicRecord {
+  work_type: string;
+  title: string;
+  authors: BibliographicAuthor[];
+  journal_abbrev: string | null;
+  journal_full: string | null;
+  booktitle: string | null;
+  series: string | null;
+  volume: string | null;
+  issue_number: string | null;
+  year: number | null;
+  pages: string | null;
+  edition: string | null;
+  note: string | null;
+  publisher: string | null;
+  address: string | null;
+  isbn: string | null;
+  issn: string | null;
+  coden: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  arxiv_version: string | null;
+  mr_number: string | null;
+  mr_number_display: string | null;
+  mr_reviewer: string | null;
+  zbl_number: string | null;
+  url: string | null;
+  msc_primary: string | null;
+  msc_secondary: string[];
+  abstract_text: string | null;
+  raw_mrlookup_bibtex: string | null;
+  source: string;
+  license_note: string | null;
+}
+
+export interface CandidateRow {
+  id: number;
+  document_id: number;
+  source: string;
+  match_score: number;
+  record: BibliographicRecord;
+}
+
+export interface DocumentMetadataView {
+  document_id: number;
+  work_type: string;
+  title: string;
+  authors: BibliographicAuthor[];
+  journal_abbrev: string | null;
+  journal_full: string | null;
+  booktitle: string | null;
+  series: string | null;
+  volume: string | null;
+  issue_number: string | null;
+  year: number | null;
+  pages: string | null;
+  edition: string | null;
+  publisher: string | null;
+  address: string | null;
+  isbn: string | null;
+  issn: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  arxiv_version: string | null;
+  mr_number: string | null;
+  mr_number_display: string | null;
+  mr_reviewer: string | null;
+  zbl_number: string | null;
+  url: string | null;
+  msc_primary: string | null;
+  msc_primary_status: string;
+  msc_secondary: string[];
+  abstract_text: string | null;
+  raw_mrlookup_bibtex: string | null;
+  metadata_source: string | null;
+  metadata_license_note: string | null;
+  manual_locked_fields: string[];
+  exclude_from_cloud_llm: boolean;
+  metadata_verified: boolean;
+  tags: string[];
+  pending_candidates: CandidateRow[];
+}
+
+export interface ManualMetadataEdit {
+  document_id: number;
+  work_type: string;
+  title: string;
+  authors: BibliographicAuthor[];
+  journal_abbrev: string | null;
+  journal_full: string | null;
+  booktitle: string | null;
+  series: string | null;
+  volume: string | null;
+  issue_number: string | null;
+  year: number | null;
+  pages: string | null;
+  edition: string | null;
+  publisher: string | null;
+  address: string | null;
+  isbn: string | null;
+  issn: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  mr_number: string | null;
+  mr_reviewer: string | null;
+  zbl_number: string | null;
+  url: string | null;
+  msc_primary: string | null;
+  msc_secondary: string[];
+  abstract_text: string | null;
+  exclude_from_cloud_llm: boolean;
+  tags: string[];
+  edited_fields: string[];
+}
+
+export interface ResolveOutcome {
+  document_id: number;
+  status: 'updated' | 'candidates_found' | 'offline_only' | 'unchanged' | string;
+  source: string | null;
+  candidates_count: number;
+}
+
+export interface SaveAndFetchResult {
+  outcome: ResolveOutcome;
+  metadata: DocumentMetadataView;
+}
+
+export interface BulkMetadataProgressEvent {
+  current: number;
+  total: number;
+  updated: number;
+  candidates: number;
+  unchanged: number;
+  failed: number;
+  current_title: string;
+  finished: boolean;
+  cancelled: boolean;
+}
+
+export type WorkCategory = 'all' | 'paper' | 'book';
+export type VerifiedFilter = 'all' | 'unverified' | 'verified';
+export type SortField = 'updated' | 'title' | 'author' | 'year';
+export type SortDirection = 'asc' | 'desc';
+
+export interface MetadataSearchFilter {
+  text?: string | null;
+  author?: string | null;
+  title?: string | null;
+  journal?: string | null;
+  year_from?: number | null;
+  year_to?: number | null;
+  msc_prefix?: string | null;
+  tag?: string | null;
+  cluster_id?: number | null;
+  root_id?: string | null;
+  format?: string | null;
+  work_category?: WorkCategory | string | null;
+  verified_filter?: VerifiedFilter | string | null;
+  sort_by?: SortField | null;
+  sort_dir?: SortDirection | null;
+}
+
+export interface ImportMetadataReport {
+  total_entries: number;
+  matched_documents: number;
+  unmatched_entries: number;
+}
+
+export interface DuplicateFileMember {
+  document_id: number;
+  file_id: number;
+  root_id: string;
+  root_label: string;
+  rel_path: string;
+  format: string;
+  title: string;
+  year: number | null;
+  edition: string | null;
+  isbn: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  mr_number: string | null;
+  zbl_number: string | null;
+  page_count: number | null;
+  size_bytes: number;
+  is_available: boolean;
+}
+
+export interface DuplicateGroupView {
+  group_id: number;
+  group_level: number;
+  max_similarity: number;
+  reason_detail: string;
+  status: string;
+  members: DuplicateFileMember[];
+}
+
+export interface DuplicateReport {
+  pairs_checked: number;
+  pairs_skipped_cached: number;
+  new_groups_created: number;
+}
+
+export interface ScanSummary {
+  scan_id: number;
+  status: string;
+  cnt_unchanged: number;
+  cnt_new: number;
+  cnt_identical_copy: number;
+  cnt_moved_renamed: number;
+  cnt_modified: number;
+  cnt_removed: number;
+  cnt_errors: number;
+  cnt_dup_groups_new: number;
+}
+
+export type ScanProgressEvent =
+  | { stage: 'started' }
+  | { stage: 'scan_done'; summary: ScanSummary }
+  | {
+      stage: 'indexing_done';
+      report: {
+        processed: number;
+        succeeded: number;
+        failed: number;
+        passages_indexed: number;
+      };
+    }
+  | { stage: 'finished' }
+  | { stage: 'error'; message: string };
+
+export interface MscTreeNode {
+  code: string;
+  title: string;
+  level: number;
+  confirmed_count: number;
+  proposed_count: number;
+  total_count: number;
+  children: MscTreeNode[];
+}
+
+export interface KnnProposeReport {
+  labeled_docs: number;
+  unlabeled_docs: number;
+  proposed_count: number;
+}
+
+export interface ClusteringReport {
+  documents_clustered: number;
+  clusters_created: number;
+  selected_k: number;
+  silhouette_score: number;
+}
+
+export interface TopicClusterView {
+  id: number;
+  model_profile: string;
+  label: string;
+  is_label_locked: boolean;
+  keywords: string[];
+  document_count: number;
+  document_ids: number[];
+}
+
+export interface TagSummary {
+  id: number;
+  name: string;
+  color_hex: string | null;
+  document_count: number;
+}
+
+export interface BackupReport {
+  archive_path: string;
+  files_count: number;
+  total_bytes: number;
+}
+
+export interface RestoreReport {
+  files_restored: number;
+  total_bytes: number;
+  restart_recommended: boolean;
+}
+
+export interface OcrEnvironmentStatus {
+  available: boolean;
+  tesseract_path: string;
+  version: string | null;
+  installed_langs: string[];
+  selected_langs: string[];
+  reason: string | null;
+}
+
+export interface OcrProgressEvent {
+  file_id: number;
+  page_ord: number;
+  total_pages: number;
+}
+
+export interface OcrFileReport {
+  file_id: number;
+  document_id: number;
+  pages_processed: number;
+  passages_indexed: number;
+  languages_used: string;
+}
+
+export type LlmProvider = 'disabled' | 'ollama' | 'anthropic' | 'openai' | 'gemini';
+
+export interface LlmKeyStatus {
+  anthropic_present: boolean;
+  openai_present: boolean;
+  gemini_present: boolean;
+}
+
+export interface LlmModelInfo {
+  id: string;
+  display_name: string;
+}
+
+export interface LlmUsage {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+}
+
+export interface LlmPromptPreview {
+  provider: LlmProvider;
+  model: string | null;
+  requires_cloud_consent: boolean;
+  estimated_input_tokens: number;
+  max_input_tokens: number;
+  max_passages: number;
+  passages_total: number;
+  passages_included: number;
+  passages_excluded_cloud: number;
+  passages_dropped_budget: number;
+  excluded_doc_titles: string[];
+}
+
+export interface LlmCitation {
+  marker: string;
+  document_id: number;
+  file_id: number;
+  page_ord: number;
+  printed_label: string | null;
+  doc_title: string;
+  bboxes: NormalizedRect[];
+  snippet: string;
+}
+
+export interface LlmAnswerResult {
+  provider: LlmProvider;
+  model: string;
+  answer_markdown: string;
+  citations: LlmCitation[];
+  refused: boolean;
+  refusal_reason: string | null;
+  usage: LlmUsage;
+  estimated_input_tokens: number;
+  included_passages: number;
+  excluded_passages: number;
+}
+
+export interface LlmKeyVerifyResult {
+  ok: boolean;
+  provider: LlmProvider;
+  models_count: number;
+  models: LlmModelInfo[];
+  message: string;
+}
