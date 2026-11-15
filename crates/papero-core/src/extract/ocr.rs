@@ -757,15 +757,15 @@ where
             total_pages,
         });
 
-        let tmp_tif_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.tif"));
-        let _guard = TempOcrFile::new(tmp_tif_path.clone());
+        let tmp_pnm_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.pnm"));
+        let _guard = TempOcrFile::new(tmp_pnm_path.clone());
 
         let ddjvu_out = Command::new(&ddjvu)
-            .arg("-format=tiff")
+            .arg("-format=pnm")
             .arg(format!("-page={page_ord}"))
             .arg(format!("-scale={dpi}"))
             .arg(djvu_path)
-            .arg(&tmp_tif_path)
+            .arg(&tmp_pnm_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -776,11 +776,11 @@ where
         if !ddjvu_out.status.success() {
             let stderr = String::from_utf8_lossy(&ddjvu_out.stderr).trim().to_string();
             return Err(CoreError::Extract(format!(
-                "ddjvu TIFF render p.{page_ord} failed: {stderr}"
+                "ddjvu PNM render p.{page_ord} failed: {stderr}"
             )));
         }
 
-        let tsv = invoke_tesseract_tsv(tesseract_bin, &tmp_tif_path, lang_arg, dpi)?;
+        let tsv = invoke_tesseract_tsv(tesseract_bin, &tmp_pnm_path, lang_arg, dpi)?;
         pages.push(parse_tesseract_tsv(&tsv, page_ord, 0.0, 0.0, None)?);
     }
 

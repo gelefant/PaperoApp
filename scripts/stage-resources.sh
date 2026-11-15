@@ -223,30 +223,42 @@ case "${TARGET}" in
     cp "${CACHE_DIR}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}/LICENSE" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE"
     install_name_tool -id "@rpath/libonnxruntime.dylib" "${RESOURCES_DIR}/libonnxruntime.dylib"
 
-    X64_STAGE="${CACHE_DIR}/x64_bottles"
-    rm -rf "${X64_STAGE}"
-    mkdir -p "${X64_STAGE}"
     if [[ -x "/usr/local/opt/djvulibre/bin/ddjvu" ]] && file "/usr/local/opt/djvulibre/bin/ddjvu" | grep -q "x86_64"; then
       cp /usr/local/opt/djvulibre/bin/{ddjvu,djvused,djvutxt} "${RESOURCES_DIR}/"
       relocate_macos_deps "x86_64" "/usr/local/opt:/usr/local/Cellar"
     else
-      echo "    Fetching x86_64 Homebrew bottles for DjVuLibre runtime closure..."
-      BREW_TAG="${MACOS_X64_BOTTLE_OS:-sequoia}"
-      PKGS=(djvulibre $(brew deps --formula djvulibre))
-      for pkg in "${PKGS[@]}"; do
-        bottle_path="$(brew fetch --os="${BREW_TAG}" --arch=x86_64 "${pkg}" 2>/dev/null | grep -E '\.bottle\..*\.tar\.gz' | tail -n1 | awk '{print $NF}' || true)"
-        if [[ -z "${bottle_path}" ]]; then
-          bottle_path="$(find "$(brew --cache)/downloads" -name "*${pkg}--*${BREW_TAG}*.bottle*.tar.gz" -o -name "*${pkg}--*x86_64*.bottle*.tar.gz" 2>/dev/null | head -n1 || true)"
-        fi
-        if [[ -n "${bottle_path}" && -f "${bottle_path}" ]]; then
-          tar -xzf "${bottle_path}" -C "${X64_STAGE}"
-        fi
-      done
-      DJVU_BIN_DIR="$(dirname "$(find "${X64_STAGE}/djvulibre" -type f -name ddjvu | head -n1)")"
-      cp "${DJVU_BIN_DIR}/ddjvu" "${RESOURCES_DIR}/ddjvu"
-      cp "${DJVU_BIN_DIR}/djvused" "${RESOURCES_DIR}/djvused"
-      cp "${DJVU_BIN_DIR}/djvutxt" "${RESOURCES_DIR}/djvutxt"
-      relocate_macos_deps "x86_64" "${X64_STAGE}"
+      DJVULIBRE_VERSION="${DJVULIBRE_VERSION:-3.5.30}"
+      DJVULIBRE_URL="${DJVULIBRE_URL:-https://downloads.sourceforge.net/project/djvu/DjVuLibre/${DJVULIBRE_VERSION}/djvulibre-${DJVULIBRE_VERSION}.tar.gz}"
+      DJVULIBRE_SHA256="${DJVULIBRE_SHA256:-ee5e457d4cfebe566f94b99e5e3d3cc7f5c79ddb741c2ac2ba2e456f00329644}"
+      DJVU_TARBALL="${CACHE_DIR}/djvulibre-${DJVULIBRE_VERSION}.tar.gz"
+      X64_SRC="${CACHE_DIR}/djvulibre_x64_src"
+      X64_PREFIX="${CACHE_DIR}/djvulibre_x64_prefix"
+
+      echo "    Cross-compiling DjVuLibre ${DJVULIBRE_VERSION} for x86_64-apple-darwin..."
+      download_file "${DJVULIBRE_URL}" "${DJVU_TARBALL}"
+      echo "${DJVULIBRE_SHA256}  ${DJVU_TARBALL}" | shasum -a 256 -c -
+      rm -rf "${X64_SRC}" "${X64_PREFIX}"
+      mkdir -p "${X64_SRC}" "${X64_PREFIX}"
+      tar -xzf "${DJVU_TARBALL}" -C "${X64_SRC}"
+      (
+        cd "${X64_SRC}/djvulibre-${DJVULIBRE_VERSION}"
+        ./configure \
+          --host=x86_64-apple-darwin \
+          --prefix="${X64_PREFIX}" \
+          --disable-desktopfiles \
+          --disable-xmltools \
+          --without-tiff \
+          --without-jpeg \
+          CC="clang -arch x86_64 -mmacosx-version-min=10.15" \
+          CXX="clang++ -arch x86_64 -mmacosx-version-min=10.15" \
+          CFLAGS="-O2" \
+          CXXFLAGS="-O2"
+        make -j"$(sysctl -n hw.ncpu)" install
+      )
+      cp "${X64_PREFIX}/bin/ddjvu" "${RESOURCES_DIR}/ddjvu"
+      cp "${X64_PREFIX}/bin/djvused" "${RESOURCES_DIR}/djvused"
+      cp "${X64_PREFIX}/bin/djvutxt" "${RESOURCES_DIR}/djvutxt"
+      relocate_macos_deps "x86_64" "${X64_PREFIX}/lib"
     fi
     ;;
 

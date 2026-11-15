@@ -82,9 +82,25 @@ if (Test-Path (Join-Path $ResourcesDir "DirectML.dll")) {
 # 3. DjVuLibre standalone executables (ddjvu.exe, djvused.exe, djvutxt.exe) + non-system runtime DLLs
 $SearchDirs = @()
 if ($DjvuBinDir) { $SearchDirs += $DjvuBinDir }
+$DdjvuOnPath = Get-Command ddjvu.exe -ErrorAction SilentlyContinue
+if ($DdjvuOnPath) { $SearchDirs += (Split-Path -Parent $DdjvuOnPath.Source) }
+if ($env:MSYS2_LOCATION) {
+    $SearchDirs += @(
+        (Join-Path $env:MSYS2_LOCATION "ucrt64\bin"),
+        (Join-Path $env:MSYS2_LOCATION "mingw64\bin")
+    )
+}
+if ($env:RUNNER_TEMP) {
+    $SearchDirs += @(
+        (Join-Path $env:RUNNER_TEMP "msys64\ucrt64\bin"),
+        (Join-Path $env:RUNNER_TEMP "msys64\mingw64\bin")
+    )
+}
 $SearchDirs += @(
     "C:\msys64\ucrt64\bin",
     "C:\msys64\mingw64\bin",
+    "D:\msys64\ucrt64\bin",
+    "D:\a\_temp\msys64\ucrt64\bin",
     "${env:ProgramFiles}\DjVuLibre",
     "${env:ProgramFiles(x86)}\DjVuLibre"
 )
