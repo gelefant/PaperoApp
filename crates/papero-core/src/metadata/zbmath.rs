@@ -11,7 +11,10 @@ use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
 
+use crate::metadata::journal_abbrev::{looks_abbreviated_journal, serial_titles_match};
+
 const ZBMATH_SEARCH_URL: &str = "https://api.zbmath.org/v1/document/_search";
+const ZBMATH_SERIAL_SEARCH_URL: &str = "https://api.zbmath.org/v1/serial/_search";
 const ZBMATH_LICENSE_NOTE: &str = "CC-BY-SA 4.0 (zbMATH Open / FIZ Karlsruhe)";
 
 #[derive(Debug)]
@@ -19,10 +22,23 @@ pub struct ZbMathClient {
     http: Client,
     limiter: SequentialRateLimiter,
     search_url: String,
+    serial_search_url: String,
 }
 
 impl ZbMathClient {
     pub fn new(user_agent: String) -> Result<Self> {
+        Self::with_urls(
+            user_agent,
+            ZBMATH_SEARCH_URL.to_string(),
+            ZBMATH_SERIAL_SEARCH_URL.to_string(),
+        )
+    }
+
+    fn with_urls(
+        user_agent: String,
+        search_url: String,
+        serial_search_url: String,
+    ) -> Result<Self> {
         let http = Client::builder()
             .user_agent(user_agent)
             .connect_timeout(Duration::from_secs(4))
@@ -32,7 +48,8 @@ impl ZbMathClient {
         Ok(Self {
             http,
             limiter: SequentialRateLimiter::new(Duration::from_secs(1)),
-            search_url: ZBMATH_SEARCH_URL.to_string(),
+            search_url,
+            serial_search_url,
         })
     }
 
@@ -177,13 +194,91 @@ impl ZbMathClient {
         Ok(Vec::new())
     }
 
+    pub async fn lookup_serial_abbrev(
+        &self,
+        db: &Database,
+        journal_name: Option<&str>,
+        issn: Option<&str>,
+    ) -> Result<Option<String>> {
+        let clean_name = journal_name.map(str::trim).filter(|s| !s.is_empty());
+        let clean_issn = issn
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_uppercase());
+
+        if let Some(ref sn) = clean_issn {
+            let ck = format!("sn:{sn}");
+            if let Some(body) = self
+                .fetch_cached_get(
+                    db,
+                    "zbmath_serial",
+                    &self.serial_search_url,
+                    sn,
+                    "5",
+                    &ck,
+                )
+                .await?
+            {
+                if let Some(abbrev) = parse_zbmath_serial_abbrev(&body, clean_name, Some(sn))? {
+                    return Ok(Some(abbrev));
+                }
+            }
+        }
+
+        if let Some(name) = clean_name {
+            let norm = normalize_math_text(name);
+            if norm.len() >= 3 {
+                let ck = format!("ti:{norm}");
+                if let Some(body) = self
+                    .fetch_cached_get(
+                        db,
+                        "zbmath_serial",
+                        &self.serial_search_url,
+                        name,
+                        "5",
+                        &ck,
+                    )
+                    .await?
+                {
+                    if let Some(abbrev) =
+                        parse_zbmath_serial_abbrev(&body, Some(name), clean_issn.as_deref())?
+                    {
+                        return Ok(Some(abbrev));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     async fn fetch_zbmath_raw(
         &self,
         db: &Database,
         search_string: &str,
         cache_key: &str,
     ) -> Result<Option<String>> {
-        if let Some(cached) = load_http_cache(db, "zbmath", cache_key)? {
+        self.fetch_cached_get(
+            db,
+            "zbmath",
+            &self.search_url,
+            search_string,
+            "10",
+            cache_key,
+        )
+        .await
+    }
+
+    async fn fetch_cached_get(
+        &self,
+        db: &Database,
+        cache_source: &str,
+        base_url: &str,
+        search_string: &str,
+        results_per_page: &str,
+        cache_key: &str,
+    ) -> Result<Option<String>> {
+        if let Some(cached) = load_http_cache(db, cache_source, cache_key)? {
             if cached.status_code >= 400 {
                 return Ok(None);
             }
@@ -192,10 +287,10 @@ impl ZbMathClient {
 
         self.limiter.acquire().await;
         let req_url = url::Url::parse_with_params(
-            &self.search_url,
+            base_url,
             &[
                 ("search_string", search_string),
-                ("results_per_page", "10"),
+                ("results_per_page", results_per_page),
             ],
         )
         .map_err(|e| CoreError::Network(format!("zbmath url build: {e}")))?;
@@ -211,7 +306,7 @@ impl ZbMathClient {
             .await
             .map_err(|e| CoreError::Network(format!("zbmath read body: {e}")))?;
         if status < 400 || status == 404 || status == 422 {
-            store_http_cache(db, "zbmath", cache_key, status, &text)?;
+            store_http_cache(db, cache_source, cache_key, status, &text)?;
         }
         if status >= 400 {
             return Ok(None);
@@ -557,5 +652,127 @@ fn parse_comma_author(raw: &str, role: &str) -> BibliographicAuthor {
                 role: role.to_string(),
             }
         }
+    }
+}
+
+fn normalize_issn_cmp(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn issns_match(item: &Value, query_issn: &str) -> bool {
+    let target = normalize_issn_cmp(query_issn);
+    if target.len() < 7 {
+        return false;
+    }
+    let Some(list) = item.get("issn").and_then(Value::as_array) else {
+        return false;
+    };
+    list.iter().any(|entry| {
+        entry
+            .get("number")
+            .or(Some(entry))
+            .and_then(Value::as_str)
+            .map(normalize_issn_cmp)
+            .is_some_and(|n| n == target)
+    })
+}
+
+fn parse_zbmath_serial_abbrev(
+    body: &str,
+    query_name: Option<&str>,
+    query_issn: Option<&str>,
+) -> Result<Option<String>> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Ok(None);
+    };
+    let Some(arr) = v.get("result").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    for item in arr {
+        let Some(short_title) = item
+            .get("short_title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if !looks_abbreviated_journal(short_title) {
+            continue;
+        }
+        let item_title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let matched_by_issn = query_issn.is_some_and(|sn| issns_match(item, sn));
+        let matched_by_title = query_name
+            .is_some_and(|qn| !item_title.is_empty() && serial_titles_match(item_title, qn));
+        if matched_by_issn || matched_by_title {
+            if let Some(qn) = query_name {
+                if normalize_math_text(short_title) == normalize_math_text(qn) {
+                    continue;
+                }
+            }
+            return Ok(Some(short_title.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn serial_lookup_resolves_short_title_by_issn_or_title_from_cache() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("zbm_serial.db"), 2).unwrap();
+        let client = ZbMathClient::new("PaperoTest/0.2".into()).unwrap();
+
+        let body = r#"{
+            "result": [
+                {
+                    "id": 465,
+                    "title": "Inventiones Mathematicae",
+                    "short_title": "Invent. Math.",
+                    "acronym": null,
+                    "issn": [
+                        {"number": "0020-9910", "type": "print"},
+                        {"number": "1432-1297", "type": "electronic"}
+                    ]
+                }
+            ]
+        }"#;
+        store_http_cache(&db, "zbmath_serial", "sn:0020-9910", 200, body).unwrap();
+
+        let by_issn = client
+            .lookup_serial_abbrev(&db, Some("Inventiones Mathematicae"), Some("0020-9910"))
+            .await
+            .unwrap();
+        assert_eq!(by_issn.as_deref(), Some("Invent. Math."));
+
+        let esoteric = r#"{
+            "result": [
+                {
+                    "id": 99999,
+                    "title": "Carpathian Journal of Weird Examples",
+                    "short_title": "Carpathian J. Weird Ex.",
+                    "issn": []
+                }
+            ]
+        }"#;
+        let ck = format!("ti:{}", normalize_math_text("Carpathian Journal of Weird Examples"));
+        store_http_cache(&db, "zbmath_serial", &ck, 200, esoteric).unwrap();
+
+        let by_title = client
+            .lookup_serial_abbrev(&db, Some("Carpathian Journal of Weird Examples"), None)
+            .await
+            .unwrap();
+        assert_eq!(by_title.as_deref(), Some("Carpathian J. Weird Ex."));
     }
 }

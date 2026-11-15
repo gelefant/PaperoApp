@@ -6,6 +6,7 @@ pub mod europepmc;
 pub mod extract;
 pub mod inspirehep;
 pub mod io;
+pub mod journal_abbrev;
 pub mod limiter;
 pub mod models;
 pub mod mrlookup;

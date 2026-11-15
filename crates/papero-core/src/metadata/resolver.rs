@@ -16,6 +16,11 @@ use crate::metadata::extract::{
     looks_like_garbage_title, strip_inline_markup_tags,
 };
 use crate::metadata::inspirehep::InspireHepClient;
+use crate::metadata::journal_abbrev::{
+    apply_iso4_journal_fallback, is_preprint_or_generic_venue, journal_name_needing_abbrev,
+    looks_abbreviated_journal, lookup_curated_journal_abbrev, normalize_record_curated_journal,
+    normalize_record_journals_locally, resolve_local_journal_abbrev,
+};
 use crate::metadata::models::{
     clean_author_surname, clean_metadata_text, normalize_doi, normalize_mr_digits, normalize_pages,
     BibliographicAuthor, BibliographicRecord, CandidateMatch, CandidateRow, DocumentMetadataView,
@@ -529,6 +534,11 @@ async fn resolve_document_metadata_inner(
                 enrich_record_from_same_work(&mut chosen.record, &cand.record);
             }
         }
+        let lock_abbrev = {
+            let r = db.reader();
+            load_locked_fields(&r, document_id)?.contains("journal_abbrev")
+        };
+        resolve_record_journal_fields(db, clients, config, &mut chosen.record, lock_abbrev).await;
         let w = db.writer();
         apply_record_respecting_locks(&w, document_id, &chosen.record, false)?;
         w.execute(
@@ -568,6 +578,9 @@ async fn resolve_document_metadata_inner(
     all_candidates.truncate(8);
 
     if !all_candidates.is_empty() {
+        for cand in &mut all_candidates {
+            normalize_record_journals_locally(&mut cand.record, false);
+        }
         let now = chrono::Utc::now().timestamp();
         let w = db.writer();
         let tx = w.unchecked_transaction()?;
@@ -939,6 +952,57 @@ fn enrich_record_from_same_work(
     if target.url.is_none() {
         target.url = donor.url.clone();
     }
+    if target.issn.is_none() && donor.issn.is_some() {
+        target.issn = donor.issn.clone();
+    }
+    if target.journal_full.is_none() {
+        if let Some(ref abbr) = target.journal_abbrev {
+            if !looks_abbreviated_journal(abbr) && !is_preprint_or_generic_venue(abbr) {
+                target.journal_full = Some(abbr.clone());
+            }
+        }
+    }
+    if target.journal_full.is_none() && donor.journal_full.is_some() {
+        target.journal_full = donor.journal_full.clone();
+    }
+    let donor_abbr_is_abbrev = donor
+        .journal_abbrev
+        .as_deref()
+        .is_some_and(looks_abbreviated_journal);
+    let target_abbr_is_abbrev = target
+        .journal_abbrev
+        .as_deref()
+        .is_some_and(looks_abbreviated_journal);
+    if donor.journal_abbrev.is_some()
+        && (target.journal_abbrev.is_none() || (donor_abbr_is_abbrev && !target_abbr_is_abbrev))
+    {
+        target.journal_abbrev = donor.journal_abbrev.clone();
+    }
+}
+
+async fn resolve_record_journal_fields(
+    db: &Database,
+    clients: &WaterfallClients,
+    config: &AppConfig,
+    rec: &mut BibliographicRecord,
+    lock_abbrev: bool,
+) {
+    if lock_abbrev {
+        return;
+    }
+    normalize_record_curated_journal(rec, false);
+    if config.zbmath_enabled {
+        if let Some(full_name) = journal_name_needing_abbrev(rec) {
+            if let Ok(Some(abbr)) = clients
+                .zbmath
+                .lookup_serial_abbrev(db, Some(&full_name), rec.issn.as_deref())
+                .await
+            {
+                rec.journal_abbrev = Some(abbr);
+            }
+        }
+    }
+    apply_iso4_journal_fallback(rec, false);
 }
 
 fn absorb_hits(
@@ -1896,6 +1960,57 @@ pub struct ManualMetadataEdit {
     pub edited_fields: Vec<String>,
 }
 
+fn normalize_manual_journal_fields(
+    journal_abbrev: &mut Option<String>,
+    journal_full: &mut Option<String>,
+    prev_locked: &HashSet<String>,
+    edited_fields: &[String],
+    explicit_locks_provided: bool,
+    full_keep: bool,
+) {
+    if explicit_locks_provided {
+        return;
+    }
+    let abbrev_edited = edited_fields.iter().any(|f| f.trim() == "journal_abbrev");
+    let full_edited = edited_fields.iter().any(|f| f.trim() == "journal_full");
+    let abbrev_was_locked = prev_locked.contains("journal_abbrev");
+    let full_was_locked = prev_locked.contains("journal_full");
+
+    if let Some(abbr) = journal_abbrev.clone() {
+        let should_normalize = !abbrev_was_locked || abbrev_edited;
+        let same_as_curated_full = journal_full.as_deref().is_some_and(|full| {
+            normalize_math_text(&abbr) == normalize_math_text(full)
+                && lookup_curated_journal_abbrev(full)
+                    .is_some_and(|c| normalize_math_text(c) != normalize_math_text(&abbr))
+        });
+        if should_normalize
+            && !is_preprint_or_generic_venue(&abbr)
+            && (!looks_abbreviated_journal(&abbr) || same_as_curated_full)
+        {
+            if full_keep && journal_full.is_none() && (!full_was_locked || full_edited) {
+                *journal_full = Some(abbr.clone());
+            }
+            let lookup_source = journal_full.as_deref().unwrap_or(&abbr);
+            if let Some(resolved) = resolve_local_journal_abbrev(lookup_source)
+                .or_else(|| resolve_local_journal_abbrev(&abbr))
+            {
+                *journal_abbrev = Some(resolved);
+            }
+            return;
+        }
+    }
+
+    if journal_abbrev.is_none() && !abbrev_edited && !abbrev_was_locked {
+        if let Some(full) = journal_full.as_deref() {
+            if !is_preprint_or_generic_venue(full) {
+                if let Some(resolved) = resolve_local_journal_abbrev(full) {
+                    *journal_abbrev = Some(resolved);
+                }
+            }
+        }
+    }
+}
+
 /// Applies manual user edits, locks modified fields in `manual_locked_fields`,
 /// updates tags, and snapshots into `manual_metadata_archive`.
 pub fn apply_manual_metadata_edit(db: &Database, edit: &ManualMetadataEdit) -> Result<DocumentMetadataView> {
@@ -1913,6 +2028,7 @@ pub fn apply_manual_metadata_edit_with_locks(
     {
         let conn = db.writer();
         let now = chrono::Utc::now().timestamp();
+        let prev_locked = load_locked_fields(&conn, edit.document_id)?;
         let mut locked: HashSet<String> = match explicit_locks {
             Some(list) => list
                 .iter()
@@ -1920,7 +2036,7 @@ pub fn apply_manual_metadata_edit_with_locks(
                 .filter(|s| !s.is_empty())
                 .collect(),
             None => {
-                let mut prev = load_locked_fields(&conn, edit.document_id)?;
+                let mut prev = prev_locked.clone();
                 for f in &edit.edited_fields {
                     let trimmed = f.trim();
                     if !trimmed.is_empty() {
@@ -1978,8 +2094,18 @@ pub fn apply_manual_metadata_edit_with_locks(
         };
 
         let title_norm = normalize_math_text(&effective_title);
-        let journal_abbrev_val = if keep("journal_abbrev") { clean_opt(&edit.journal_abbrev) } else { None };
-        let journal_full_val = if keep("journal_full") { clean_opt(&edit.journal_full) } else { None };
+        let mut journal_abbrev_val = if keep("journal_abbrev") { clean_opt(&edit.journal_abbrev) } else { None };
+        let mut journal_full_val = if keep("journal_full") { clean_opt(&edit.journal_full) } else { None };
+        if !reset_unlocked && keep("journal_abbrev") {
+            normalize_manual_journal_fields(
+                &mut journal_abbrev_val,
+                &mut journal_full_val,
+                &prev_locked,
+                &edit.edited_fields,
+                explicit_locks.is_some(),
+                keep("journal_full"),
+            );
+        }
         let booktitle_val = if keep("booktitle") { clean_opt(&edit.booktitle) } else { None };
         let series_val = if keep("series") { clean_opt(&edit.series) } else { None };
         let volume_val = if keep("volume") { clean_opt(&edit.volume) } else { None };
@@ -2162,7 +2288,9 @@ pub fn confirm_metadata_candidate(
             params![candidate_id, document_id],
             |r| r.get(0),
         )?;
-        let rec: BibliographicRecord = serde_json::from_str(&json)?;
+        let mut rec: BibliographicRecord = serde_json::from_str(&json)?;
+        let lock_abbrev = load_locked_fields(&conn, document_id)?.contains("journal_abbrev");
+        normalize_record_journals_locally(&mut rec, lock_abbrev);
         apply_record_respecting_locks(&conn, document_id, &rec, false)?;
         conn.execute(
             "DELETE FROM metadata_candidates WHERE document_id = ?1",
@@ -4449,5 +4577,267 @@ mod tests {
         let meta4 = get_document_metadata(&db, doc_db_title).unwrap();
         assert_eq!(meta4.doi.as_deref(), Some("10.1007/parabolic-regularity"));
         assert_eq!(meta4.year, Some(1983));
+    }
+
+    #[tokio::test]
+    async fn journal_abbreviation_is_resolved_during_fetch_merge_and_zbmath_serial_lookup() {
+        use crate::metadata::limiter::store_http_cache;
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("journal_abbrev.db"), 2).unwrap();
+        let cfg = AppConfig {
+            metadata_source_priority: vec!["dblp".into()],
+            mrlookup_enabled_single: false,
+            zbmath_enabled: false,
+            crossref_enabled: false,
+            dblp_enabled: true,
+            openalex_enabled: false,
+            datacite_enabled: false,
+            inspirehep_enabled: false,
+            arxiv_enabled: false,
+            semanticscholar_enabled: false,
+            europepmc_enabled: false,
+            openlibrary_enabled: false,
+            ..Default::default()
+        };
+        let clients = WaterfallClients::from_config(&cfg).unwrap();
+
+        let title = "Harmonic Analysis on Symplectic Manifolds";
+        let doc_id = {
+            let w = db.writer();
+            create_heuristic_document(&w, title).unwrap()
+        };
+        let ck = format!("q:{}", normalize_math_text(title));
+        let dblp_json = r#"{
+            "result": {
+                "hits": {
+                    "hit": [{
+                        "info": {
+                            "title": "Harmonic Analysis on Symplectic Manifolds",
+                            "authors": {"author": [{"text": "Elena Conti"}]},
+                            "venue": "Inventiones Mathematicae",
+                            "type": "Journal Articles",
+                            "year": "2020",
+                            "doi": "10.1007/s00222-020-00001-0"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        store_http_cache(&db, "dblp", &ck, 200, dblp_json).unwrap();
+
+        let outcome = resolve_document_metadata(
+            &db,
+            &clients,
+            &cfg,
+            doc_id,
+            MetadataLookupScope::SingleRecordUserAction,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, "updated");
+
+        let meta = get_document_metadata(&db, doc_id).unwrap();
+        assert_eq!(meta.journal_full.as_deref(), Some("Inventiones Mathematicae"));
+        assert_eq!(meta.journal_abbrev.as_deref(), Some("Invent. Math."));
+
+        // Verify same-work enrichment transfers genuine abbreviations and preserves full titles.
+        let mut target = BibliographicRecord {
+            work_type: WorkType::Article,
+            title: title.into(),
+            journal_abbrev: Some("Inventiones Mathematicae".into()),
+            journal_full: None,
+            ..Default::default()
+        };
+        let donor = BibliographicRecord {
+            work_type: WorkType::Article,
+            title: title.into(),
+            journal_abbrev: Some("Invent. Math.".into()),
+            journal_full: Some("Inventiones Mathematicae".into()),
+            issn: Some("0020-9910".into()),
+            ..Default::default()
+        };
+        enrich_record_from_same_work(&mut target, &donor);
+        assert_eq!(target.journal_full.as_deref(), Some("Inventiones Mathematicae"));
+        assert_eq!(target.journal_abbrev.as_deref(), Some("Invent. Math."));
+        assert_eq!(target.issn.as_deref(), Some("0020-9910"));
+
+        // Verify resolve_record_journal_fields queries cached zbMATH serials before ISO-4 fallback.
+        let mut zbm_cfg = cfg.clone();
+        zbm_cfg.zbmath_enabled = true;
+        let zbm_clients = WaterfallClients::from_config(&zbm_cfg).unwrap();
+        let serial_ck = format!("ti:{}", normalize_math_text("Carpathian Journal of Weird Analysis"));
+        store_http_cache(
+            &db,
+            "zbmath_serial",
+            &serial_ck,
+            200,
+            r#"{"result":[{"id":777,"title":"Carpathian Journal of Weird Analysis","short_title":"Carpathian J. Weird Anal.","issn":[]}]}"#,
+        )
+        .unwrap();
+
+        let mut custom_rec = BibliographicRecord {
+            work_type: WorkType::Article,
+            title: "Weird Analysis".into(),
+            journal_abbrev: Some("Carpathian Journal of Weird Analysis".into()),
+            journal_full: None,
+            ..Default::default()
+        };
+        resolve_record_journal_fields(&db, &zbm_clients, &zbm_cfg, &mut custom_rec, false).await;
+        assert_eq!(
+            custom_rec.journal_full.as_deref(),
+            Some("Carpathian Journal of Weird Analysis")
+        );
+        assert_eq!(
+            custom_rec.journal_abbrev.as_deref(),
+            Some("Carpathian J. Weird Anal.")
+        );
+    }
+
+    #[test]
+    fn manual_metadata_edit_derives_and_normalizes_journal_abbrev_respecting_locks() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("manual_journal.db"), 2).unwrap();
+
+        let doc_id = {
+            let w = db.writer();
+            create_heuristic_document(&w, "Manual Journal Doc").unwrap()
+        };
+
+        // 1. User enters full journal name without abbreviation -> abbreviation is auto-filled.
+        let after_full = apply_manual_metadata_edit(
+            &db,
+            &ManualMetadataEdit {
+                document_id: doc_id,
+                work_type: "article".into(),
+                title: "Manual Journal Doc".into(),
+                authors: vec![],
+                journal_abbrev: None,
+                journal_full: Some("Advances in Mathematics".into()),
+                booktitle: None,
+                series: None,
+                volume: None,
+                issue_number: None,
+                year: None,
+                pages: None,
+                edition: None,
+                publisher: None,
+                address: None,
+                isbn: None,
+                issn: None,
+                doi: None,
+                arxiv_id: None,
+                mr_number: None,
+                mr_reviewer: None,
+                zbl_number: None,
+                url: None,
+                msc_primary: None,
+                msc_secondary: vec![],
+                abstract_text: None,
+                exclude_from_cloud_llm: false,
+                tags: vec![],
+                edited_fields: vec!["journal_full".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(after_full.journal_full.as_deref(), Some("Advances in Mathematics"));
+        assert_eq!(after_full.journal_abbrev.as_deref(), Some("Adv. Math."));
+        assert!(
+            !after_full
+                .manual_locked_fields
+                .iter()
+                .any(|f| f == "journal_abbrev"),
+            "derived journal_abbrev must remain unlocked unless user edits it"
+        );
+
+        // 2. User clears journal_abbrev explicitly -> clear is respected and field locks.
+        let after_clear = apply_manual_metadata_edit(
+            &db,
+            &ManualMetadataEdit {
+                document_id: doc_id,
+                work_type: "article".into(),
+                title: "Manual Journal Doc".into(),
+                authors: vec![],
+                journal_abbrev: None,
+                journal_full: Some("Advances in Mathematics".into()),
+                booktitle: None,
+                series: None,
+                volume: None,
+                issue_number: None,
+                year: None,
+                pages: None,
+                edition: None,
+                publisher: None,
+                address: None,
+                isbn: None,
+                issn: None,
+                doi: None,
+                arxiv_id: None,
+                mr_number: None,
+                mr_reviewer: None,
+                zbl_number: None,
+                url: None,
+                msc_primary: None,
+                msc_secondary: vec![],
+                abstract_text: None,
+                exclude_from_cloud_llm: false,
+                tags: vec![],
+                edited_fields: vec!["journal_abbrev".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(after_clear.journal_abbrev, None);
+        assert!(after_clear
+            .manual_locked_fields
+            .iter()
+            .any(|f| f == "journal_abbrev"));
+
+        // 3. User pastes an unabbreviated journal title directly into `journal_abbrev` on a fresh doc.
+        let doc2 = {
+            let w = db.writer();
+            create_heuristic_document(&w, "Manual Journal Doc 2").unwrap()
+        };
+        let after_pasted = apply_manual_metadata_edit(
+            &db,
+            &ManualMetadataEdit {
+                document_id: doc2,
+                work_type: "article".into(),
+                title: "Manual Journal Doc 2".into(),
+                authors: vec![],
+                journal_abbrev: Some("Communications in Mathematical Physics".into()),
+                journal_full: None,
+                booktitle: None,
+                series: None,
+                volume: None,
+                issue_number: None,
+                year: None,
+                pages: None,
+                edition: None,
+                publisher: None,
+                address: None,
+                isbn: None,
+                issn: None,
+                doi: None,
+                arxiv_id: None,
+                mr_number: None,
+                mr_reviewer: None,
+                zbl_number: None,
+                url: None,
+                msc_primary: None,
+                msc_secondary: vec![],
+                abstract_text: None,
+                exclude_from_cloud_llm: false,
+                tags: vec![],
+                edited_fields: vec!["journal_abbrev".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            after_pasted.journal_full.as_deref(),
+            Some("Communications in Mathematical Physics")
+        );
+        assert_eq!(
+            after_pasted.journal_abbrev.as_deref(),
+            Some("Comm. Math. Phys.")
+        );
     }
 }
