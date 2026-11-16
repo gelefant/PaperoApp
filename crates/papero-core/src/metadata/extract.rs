@@ -2262,6 +2262,46 @@ fn split_camel_case(token: &str) -> String {
     out
 }
 
+fn is_non_author_filename_prefix(tok: &str) -> bool {
+    let low = tok.trim().to_ascii_lowercase();
+    looks_like_garbage_author(&low)
+        || matches!(
+            low.as_str(),
+            "arxiv"
+                | "scan"
+                | "scanned"
+                | "paper"
+                | "book"
+                | "draft"
+                | "version"
+                | "vol"
+                | "chapter"
+                | "part"
+                | "document"
+                | "doc"
+                | "manuscript"
+                | "article"
+                | "main"
+                | "preprint"
+                | "final"
+                | "fulltext"
+                | "lecture"
+                | "notes"
+                | "thesis"
+                | "slides"
+                | "copy"
+                | "acm"
+                | "cvpr"
+                | "iccv"
+                | "icml"
+                | "neurips"
+                | "eccv"
+                | "aaai"
+                | "ijcai"
+                | "iclr"
+        )
+}
+
 fn parse_filename_author_and_title(stem: &str) -> (Option<String>, Option<String>) {
     // Supports common academic naming like `GrettonBorgwardt_AKernelTwoSampleTest` or `Author - Title`
     if let Some((left, right)) = stem.split_once(" - ").or_else(|| stem.split_once('_')) {
@@ -2269,10 +2309,15 @@ fn parse_filename_author_and_title(stem: &str) -> (Option<String>, Option<String
         let first_surname = left_spaced
             .split_whitespace()
             .next()
-            .filter(|w| w.len() >= 2 && w.chars().all(|c| c.is_alphabetic() || c == '-'))
+            .filter(|w| {
+                w.len() >= 2
+                    && w.chars().all(|c| c.is_alphabetic() || c == '-')
+                    && !is_non_author_filename_prefix(w)
+            })
             .map(ToOwned::to_owned);
         let right_title = clean_filename_to_title(right);
-        if right_title.len() >= 4 && !looks_like_garbage_title(&right_title) {
+        if first_surname.is_some() && right_title.len() >= 4 && !looks_like_garbage_title(&right_title)
+        {
             return (first_surname, Some(right_title));
         }
     }

@@ -568,14 +568,30 @@ async fn resolve_document_metadata_inner(
                 .then_with(|| rank_of(&a.source).cmp(&rank_of(&b.source)))
                 .then_with(|| b.score.total_cmp(&a.score))
         } else if diff <= 0.015 {
-            rank_of(&a.source)
-                .cmp(&rank_of(&b.source))
+            record_completeness_score(&b.record)
+                .cmp(&record_completeness_score(&a.record))
+                .then_with(|| rank_of(&a.source).cmp(&rank_of(&b.source)))
                 .then_with(|| b.score.total_cmp(&a.score))
         } else {
             b.score.total_cmp(&a.score)
         }
     });
-    all_candidates.truncate(8);
+    let mut deduped_candidates: Vec<CandidateMatch> =
+        Vec::with_capacity(all_candidates.len().min(8));
+    for cand in all_candidates {
+        if let Some(existing) = deduped_candidates
+            .iter_mut()
+            .find(|kept| is_same_work(&kept.record, &cand.record))
+        {
+            if (cand.score - existing.score).abs() <= 0.05 {
+                enrich_record_from_same_work(&mut existing.record, &cand.record);
+            }
+        } else {
+            deduped_candidates.push(cand);
+        }
+    }
+    deduped_candidates.truncate(8);
+    let mut all_candidates = deduped_candidates;
 
     if !all_candidates.is_empty() {
         for cand in &mut all_candidates {
@@ -754,9 +770,7 @@ fn push_unique_verified_candidates(
     all_candidates: &mut Vec<CandidateMatch>,
 ) {
     for h in &mut hits {
-        if !verify_candidate_against_context(h, ctx) {
-            h.score *= 0.35;
-        }
+        h.score *= context_verification_factor(h, ctx);
         if !all_candidates
             .iter()
             .any(|existing| existing.source == h.source && is_same_work(&existing.record, &h.record))
@@ -1012,13 +1026,11 @@ fn absorb_hits(
     all_candidates: &mut Vec<CandidateMatch>,
 ) {
     for h in &mut hits {
-        if !verify_candidate_against_context(h, ctx) {
-            h.score *= 0.35;
-        }
+        h.score *= context_verification_factor(h, ctx);
     }
     hits.sort_by(|a, b| {
         let diff = (b.score - a.score).abs();
-        if diff <= 0.035 && is_same_work(&a.record, &b.record) {
+        if (diff <= 0.035 && is_same_work(&a.record, &b.record)) || diff <= 0.015 {
             record_completeness_score(&b.record)
                 .cmp(&record_completeness_score(&a.record))
                 .then_with(|| b.score.total_cmp(&a.score))
@@ -1031,7 +1043,9 @@ fn absorb_hits(
         let second_distinct = hits
             .iter()
             .skip(1)
-            .find(|cand| !is_same_work(&top.record, &cand.record));
+            .chain(all_candidates.iter())
+            .filter(|cand| !is_same_work(&top.record, &cand.record))
+            .max_by(|a, b| a.score.total_cmp(&b.score));
         if is_high_confidence(top, second_distinct) {
             *best_certain = Some(top.clone());
         } else {
@@ -1065,10 +1079,17 @@ fn record_completeness_score(rec: &BibliographicRecord) -> i32 {
     if rec.work_type != WorkType::Misc {
         pts += 3;
     }
+    if !rec.authors.is_empty() {
+        pts += 3;
+        if rec.authors.len() >= 2 {
+            pts += 1;
+        }
+    }
     if rec
         .journal_full
         .as_deref()
         .or(rec.journal_abbrev.as_deref())
+        .or(rec.booktitle.as_deref())
         .is_some_and(|j| {
             let low = j.to_ascii_lowercase();
             !low.is_empty()
@@ -1111,6 +1132,22 @@ fn is_same_work(a: &BibliographicRecord, b: &BibliographicRecord) -> bool {
         return false;
     }
     if a.authors.is_empty() || b.authors.is_empty() {
+        if a.authors.is_empty() != b.authors.is_empty() {
+            let both_non_arxiv_distinct_doi = matches!(
+                (a.doi.as_deref(), b.doi.as_deref()),
+                (Some(da), Some(db))
+                    if !da.is_empty()
+                        && !db.is_empty()
+                        && da != db
+                        && !da.starts_with("10.48550/")
+                        && !db.starts_with("10.48550/")
+            );
+            let year_far =
+                matches!((a.year, b.year), (Some(ya), Some(yb)) if (ya - yb).abs() > 1);
+            if both_non_arxiv_distinct_doi || year_far || a.work_type != b.work_type {
+                return false;
+            }
+        }
         return true;
     }
     authors_share_surname(&a.authors, &b.authors)
@@ -1144,6 +1181,10 @@ fn word_stem_without_last_char(w: &str) -> Option<&str> {
 }
 
 fn verify_candidate_against_context(cand: &CandidateMatch, ctx: &GatheredDocContext) -> bool {
+    context_verification_factor(cand, ctx) >= 0.99
+}
+
+fn context_verification_factor(cand: &CandidateMatch, ctx: &GatheredDocContext) -> f32 {
     let rec = &cand.record;
 
     // 1. In guided mode, never override an author explicitly locked by the user
@@ -1168,23 +1209,23 @@ fn verify_candidate_against_context(cand: &CandidateMatch, ctx: &GatheredDocCont
                 })
             });
             if !matched {
-                return false;
+                return 0.35;
             }
         }
-        return true;
+        return 1.0;
     }
 
     if ctx.is_guided {
-        return true;
+        return 1.0;
     }
 
     // 2. Zotero-style PDF front-matter cross-check in automatic mode
     let Some(ref vtxt) = ctx.verify_text else {
-        return true;
+        return 1.0;
     };
     let v_words: Vec<&str> = vtxt.split_whitespace().collect();
     if v_words.len() < 12 {
-        return true;
+        return 1.0;
     };
 
     let author_in_pdf = if rec.authors.is_empty() {
@@ -1230,19 +1271,41 @@ fn verify_candidate_against_context(cand: &CandidateMatch, ctx: &GatheredDocCont
     // Exact identifier match (DOI / arXiv / MR / Zbl): guard against footnote-citation DOIs on page 1
     if cand.score >= 0.985 {
         if vtxt.len() >= 140 {
-            return author_in_pdf || matched_title_words >= 2 || title_ratio >= 0.45;
+            return if author_in_pdf || matched_title_words >= 2 || title_ratio >= 0.45 {
+                1.0
+            } else {
+                0.35
+            };
         }
-        return true;
+        return 1.0;
     }
 
-    // Heuristic Title / Author match: candidate's author AND core title words must appear in pages 1-2
-    if !rec.authors.is_empty() && !author_in_pdf {
-        return false;
-    }
     if !sig_words.is_empty() && title_ratio < 0.45 && matched_title_words < 4 {
-        return false;
+        return 0.35;
     }
-    true
+
+    if rec.authors.is_empty() && rec.work_type != WorkType::Book {
+        return 0.78;
+    }
+
+    // Heuristic Title / Author match: keep exact title-only matches as confirmable candidates when
+    // no author was extracted from the PDF/filename/DB, while keeping auto-accept conservative.
+    if !rec.authors.is_empty() && !author_in_pdf {
+        let q_title_opt = ctx.ids.heuristic_title.as_deref().or(ctx.db_title.as_deref());
+        let exact_title_unverified_author = !ctx.locked_authors
+            && ctx.ids.heuristic_authors.is_empty()
+            && q_title_opt.is_some_and(|qt| is_total_title_match(qt, rec).is_some())
+            && !sig_words.is_empty()
+            && matched_title_words >= 3
+            && title_ratio >= 0.85;
+        return if exact_title_unverified_author {
+            0.80
+        } else {
+            0.35
+        };
+    }
+
+    1.0
 }
 
 struct DocIdRow {
@@ -1588,10 +1651,8 @@ fn gather_document_context(
         page2_layout,
     );
 
-    // Last-resort fallback for synthetic/fileless rows where only `documents.title` was populated
+    // Last-resort fallback when PDF/DjVu front matter and filename yielded no usable title
     if extracted.heuristic_title.is_none()
-        && filename_stem.is_none()
-        && effective_first_pages.is_empty()
         && !stripped_title.trim().is_empty()
         && !looks_like_garbage_title(&stripped_title)
     {
@@ -4867,6 +4928,263 @@ mod tests {
         assert_eq!(
             after_pasted.journal_abbrev.as_deref(),
             Some("Comm. Math. Phys.")
+        );
+    }
+
+    #[tokio::test]
+    async fn title_only_ieee_conference_proceedings_resolution_and_candidate_ranking() {
+        use crate::metadata::limiter::store_http_cache;
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("ieee_proceedings.db"), 2).unwrap();
+        let root_path = dir.path().join("docs");
+        std::fs::create_dir_all(&root_path).unwrap();
+
+        let cfg = AppConfig {
+            metadata_source_priority: vec!["crossref".into(), "openalex".into()],
+            mrlookup_enabled_single: false,
+            zbmath_enabled: false,
+            crossref_enabled: true,
+            dblp_enabled: false,
+            openalex_enabled: true,
+            datacite_enabled: false,
+            inspirehep_enabled: false,
+            arxiv_enabled: false,
+            semanticscholar_enabled: false,
+            europepmc_enabled: false,
+            openlibrary_enabled: false,
+            ..Default::default()
+        };
+        let clients = WaterfallClients::from_config(&cfg).unwrap();
+
+        let (doc_title_only, doc_text_without_authors, doc_qt_fallback) = {
+            let w = db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "r1".into(),
+                    label: "IEEE".into(),
+                    root_path: root_path.to_string_lossy().into_owned(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+
+            // 1. Numeric IEEE Xplore filename (`04587670.pdf`), textless, only DB title populated.
+            let d1 = create_heuristic_document(&w, "Large-Scale Manifold Learning").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d1,
+                    root_id: "r1",
+                    rel_path: "04587670.pdf",
+                    format: "pdf",
+                    size_bytes: 100,
+                    mtime_ns: 1,
+                    blake3_hash: "ieee1",
+                    index_state: "bm25_done",
+                },
+            )
+            .unwrap();
+
+            // 2. PDF with page-1 text >= 12 words containing only the title & IEEE venue boilerplate,
+            // without parseable author names on page 1.
+            let d2 = create_heuristic_document(&w, "04587670").unwrap();
+            let f2 = insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d2,
+                    root_id: "r1",
+                    rel_path: "cvpr08.pdf",
+                    format: "pdf",
+                    size_bytes: 100,
+                    mtime_ns: 2,
+                    blake3_hash: "ieee2",
+                    index_state: "bm25_done",
+                },
+            )
+            .unwrap();
+            let p1_text = "Large-Scale Manifold Learning\n\
+                           2008 IEEE Conference on Computer Vision and Pattern Recognition\n\
+                           Authorized licensed use limited to IEEE Xplore library download";
+            w.execute(
+                "INSERT INTO passages (document_id, file_id, page_ord, chunk_index, token_count, text_content, bboxes_blob)
+                 VALUES (?1, ?2, 1, 0, 20, ?3, X'')",
+                params![d2, f2, p1_text],
+            )
+            .unwrap();
+
+            // 3. Unique IEEE proceeding where bibliographic search misses strong match and `query.title` hits.
+            let d3 = create_heuristic_document(&w, "Deep Residual Learning for Image Recognition").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d3,
+                    root_id: "r1",
+                    rel_path: "07780459.pdf",
+                    format: "pdf",
+                    size_bytes: 100,
+                    mtime_ns: 3,
+                    blake3_hash: "ieee3",
+                    index_state: "bm25_done",
+                },
+            )
+            .unwrap();
+
+            (d1, d2, d3)
+        };
+
+        let cr_lsml = r#"{
+            "status": "ok",
+            "message": {
+                "items": [
+                    {
+                        "DOI": "10.1201/b11431-12",
+                        "type": "book-chapter",
+                        "title": ["Large-Scale Manifold Learning"],
+                        "container-title": ["Manifold Learning Theory and Applications"],
+                        "page": "145-168",
+                        "published-print": {"date-parts": [[2011, 12, 20]]}
+                    },
+                    {
+                        "DOI": "10.1109/cvpr.2008.4587670",
+                        "type": "proceedings-article",
+                        "title": ["Large-scale manifold learning"],
+                        "container-title": ["2008 IEEE Conference on Computer Vision and Pattern Recognition"],
+                        "author": [
+                            {"family": "Talwalkar", "given": "Ameet"},
+                            {"family": "Kumar", "given": "Sanjiv"},
+                            {"family": "Rowley", "given": "Henry"}
+                        ],
+                        "page": "1-8",
+                        "published-print": {"date-parts": [[2008, 6]]}
+                    }
+                ]
+            }
+        }"#;
+        let oa_lsml = r#"{
+            "results": [
+                {
+                    "title": "Large-scale manifold learning",
+                    "type": "conference-paper",
+                    "publication_year": 2008,
+                    "doi": "https://doi.org/10.1109/cvpr.2008.4587670",
+                    "primary_location": {
+                        "source": {"display_name": "2008 IEEE Conference on Computer Vision and Pattern Recognition"}
+                    },
+                    "authorships": [
+                        {"author": {"display_name": "Ameet Talwalkar"}},
+                        {"author": {"display_name": "Sanjiv Kumar"}},
+                        {"author": {"display_name": "Henry Rowley"}}
+                    ]
+                }
+            ]
+        }"#;
+        let lsml_norm = normalize_math_text("Large-Scale Manifold Learning");
+        store_http_cache(&db, "crossref", &format!("q:{lsml_norm}"), 200, cr_lsml).unwrap();
+        store_http_cache(&db, "openalex", &format!("q:{lsml_norm}"), 200, oa_lsml).unwrap();
+        store_http_cache(&db, "openalex", &format!("ts:{lsml_norm}"), 200, oa_lsml).unwrap();
+
+        // Case 1: book-chapter (0 authors) must NOT collapse with or override IEEE CVPR 2008;
+        // both remain distinct, deduplicated across Crossref & OpenAlex, with IEEE CVPR 2008 ranked #1.
+        let out1 = resolve_document_metadata(
+            &db,
+            &clients,
+            &cfg,
+            doc_title_only,
+            MetadataLookupScope::SingleRecordUserAction,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out1.status, "candidates_found");
+        let m1 = get_document_metadata(&db, doc_title_only).unwrap();
+        assert_eq!(m1.pending_candidates.len(), 2);
+        assert_eq!(
+            m1.pending_candidates[0].record.doi.as_deref(),
+            Some("10.1109/cvpr.2008.4587670")
+        );
+        assert_eq!(
+            m1.pending_candidates[0].record.booktitle.as_deref(),
+            Some("2008 IEEE Conference on Computer Vision and Pattern Recognition")
+        );
+        assert_eq!(
+            m1.pending_candidates[1].record.doi.as_deref(),
+            Some("10.1201/b11431-12")
+        );
+
+        // Case 2: PDF page 1 has text >= 12 words without readable authors; IEEE CVPR 2008
+        // is retained in pending candidates instead of being dropped below 0.45.
+        let out2 = resolve_document_metadata(
+            &db,
+            &clients,
+            &cfg,
+            doc_text_without_authors,
+            MetadataLookupScope::SingleRecordUserAction,
+        )
+        .await
+        .unwrap();
+        let m2 = get_document_metadata(&db, doc_text_without_authors).unwrap();
+        assert_eq!(out2.status, "candidates_found", "out2={out2:?} m2={m2:?}");
+        assert!(m2
+            .pending_candidates
+            .iter()
+            .any(|c| c.record.doi.as_deref() == Some("10.1109/cvpr.2008.4587670")));
+
+        // Case 3: `query.bibliographic` returns an unrelated low-scoring hit, so `query.title`
+        // fallback runs and resolves the IEEE CVPR proceeding automatically.
+        let resnet_norm = normalize_math_text("Deep Residual Learning for Image Recognition");
+        let cr_bib_miss = r#"{
+            "status": "ok",
+            "message": {
+                "items": [{
+                    "DOI": "10.9999/butterflies",
+                    "type": "posted-content",
+                    "title": ["Multiple butterflies recognition using deep learning survey"],
+                    "author": [{"family": "Smith", "given": "J."}],
+                    "published-print": {"date-parts": [[2023]]}
+                }]
+            }
+        }"#;
+        let cr_title_hit = r#"{
+            "status": "ok",
+            "message": {
+                "items": [{
+                    "DOI": "10.1109/cvpr.2016.90",
+                    "type": "proceedings-article",
+                    "title": ["Deep Residual Learning for Image Recognition"],
+                    "container-title": ["2016 IEEE Conference on Computer Vision and Pattern Recognition"],
+                    "author": [
+                        {"family": "He", "given": "Kaiming"},
+                        {"family": "Zhang", "given": "Xiangyu"},
+                        {"family": "Ren", "given": "Shaoqing"},
+                        {"family": "Sun", "given": "Jian"}
+                    ],
+                    "page": "770-778",
+                    "published-print": {"date-parts": [[2016, 6]]}
+                }]
+            }
+        }"#;
+        store_http_cache(&db, "crossref", &format!("q:{resnet_norm}"), 200, cr_bib_miss).unwrap();
+        store_http_cache(&db, "crossref", &format!("qt:{resnet_norm}"), 200, cr_title_hit).unwrap();
+        store_http_cache(&db, "openalex", &format!("q:{resnet_norm}"), 200, r#"{"results":[]}"#).unwrap();
+        store_http_cache(&db, "openalex", &format!("ts:{resnet_norm}"), 200, r#"{"results":[]}"#).unwrap();
+
+        let out3 = resolve_document_metadata(
+            &db,
+            &clients,
+            &cfg,
+            doc_qt_fallback,
+            MetadataLookupScope::SingleRecordUserAction,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out3.status, "updated");
+        let m3 = get_document_metadata(&db, doc_qt_fallback).unwrap();
+        assert_eq!(m3.doi.as_deref(), Some("10.1109/cvpr.2016.90"));
+        assert_eq!(m3.work_type, "inproceedings");
+        assert_eq!(
+            m3.booktitle.as_deref(),
+            Some("2016 IEEE Conference on Computer Vision and Pattern Recognition")
         );
     }
 }

@@ -101,10 +101,15 @@ impl DblpClient {
         cache_key: &str,
     ) -> Result<Option<String>> {
         if let Some(cached) = load_http_cache(db, "dblp", cache_key)? {
+            let trimmed = cached.body.trim_start();
+            let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+            if cached.status_code == 200 && looks_json {
+                return Ok(Some(cached.body));
+            }
             if cached.status_code >= 400 {
                 return Ok(None);
             }
-            return Ok(Some(cached.body));
+            // Ignore non-JSON 202 anti-bot/HTML challenge entries cached before this guard.
         }
 
         self.limiter.acquire().await;
@@ -125,10 +130,14 @@ impl DblpClient {
             .text()
             .await
             .map_err(|e| CoreError::Network(format!("dblp read body: {e}")))?;
-        if status < 400 || status == 404 {
+        let is_json_like = {
+            let trimmed = text.trim_start();
+            trimmed.starts_with('{') || trimmed.starts_with('[')
+        };
+        if (status == 200 && is_json_like) || status == 404 {
             store_http_cache(db, "dblp", cache_key, status, &text)?;
         }
-        if status >= 400 {
+        if status >= 400 || !is_json_like {
             return Ok(None);
         }
         Ok(Some(text))
@@ -403,5 +412,53 @@ mod tests {
         assert_eq!(second.record.authors[0].family_name, "Knuth");
         assert_eq!(second.record.work_type, WorkType::Inproceedings);
         assert_eq!(second.record.arxiv_id.as_deref(), Some("2301.09999"));
+    }
+
+    #[tokio::test]
+    async fn ignores_non_json_antibot_html_cache_entries() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("dblp_html.db"), 2).unwrap();
+        let client = DblpClient::new("PaperoTest/0.2".into()).unwrap();
+
+        let err_ck = format!("q:{}", normalize_math_text("Large-Scale Manifold Learning"));
+        store_http_cache(
+            &db,
+            "dblp",
+            &err_ck,
+            202,
+            "<!doctype html><html><title>Making sure you're not a bot!</title></html>",
+        )
+        .unwrap();
+
+        // Confirm valid JSON cache still works normally
+        let ok_ck = format!("q:{}", normalize_math_text("Valid Cached Paper"));
+        store_http_cache(
+            &db,
+            "dblp",
+            &ok_ck,
+            200,
+            r#"{"result":{"hits":{"hit":[{"info":{"title":"Valid Cached Paper","authors":{"author":{"text":"Ada Lovelace"}},"year":"1843","type":"Conference and Workshop Papers","venue":"Notes"}}]}}}"#,
+        )
+        .unwrap();
+        let hits = client
+            .lookup(
+                &db,
+                &ExtractedIdentifiers {
+                    heuristic_title: Some("Valid Cached Paper".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.booktitle.as_deref(), Some("Notes"));
+
+        // Cached 202 HTML is ignored cleanly rather than crashing JSON parsing if parsed directly.
+        let loaded = load_http_cache(&db, "dblp", &err_ck).unwrap().unwrap();
+        assert_eq!(loaded.status_code, 202);
+        let trimmed = loaded.body.trim_start();
+        assert!(!(trimmed.starts_with('{') || trimmed.starts_with('[')));
     }
 }

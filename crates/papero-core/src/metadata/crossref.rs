@@ -97,8 +97,24 @@ impl CrossrefClient {
                 (ti, Some(surname.as_str()), "10")
             };
             let mut hits = self
-                .search_list(db, bib_q, au_filter, None, rows_str, &ck, ids)
+                .search_list(db, bib_q, au_filter, None, rows_str, &ck, false, ids)
                 .await?;
+
+            // When searching by title alone without an author, `query.bibliographic` matches across
+            // abstracts and conference names (often burying IEEE proceedings below unrelated hits).
+            // Query Crossref's `query.title` index as well if bibliographic search missed strong authored hits.
+            let has_strong_authored_hit = hits
+                .iter()
+                .any(|h| h.score >= 0.88 && !h.record.authors.is_empty());
+            if surname.is_empty() && !has_strong_authored_hit {
+                let qt_ck = format!("qt:{}", normalize_math_text(ti));
+                if let Ok(qt_hits) = self
+                    .search_list(db, ti, None, None, "15", &qt_ck, true, ids)
+                    .await
+                {
+                    merge_crossref_hits(&mut hits, qt_hits);
+                }
+            }
 
             let mut top_score = hits.first().map(|c| c.score).unwrap_or(0.0);
             let ti_words = normalize_math_text(ti).split_whitespace().count();
@@ -108,8 +124,20 @@ impl CrossrefClient {
                 ids_no_au.heuristic_first_author = None;
                 ids_no_au.heuristic_authors.clear();
                 let mut fb_hits = self
-                    .search_list(db, ti, None, None, "15", &fb_ck, &ids_no_au)
+                    .search_list(db, ti, None, None, "15", &fb_ck, false, &ids_no_au)
                     .await?;
+                if !fb_hits
+                    .iter()
+                    .any(|h| h.score >= 0.88 && !h.record.authors.is_empty())
+                {
+                    let qt_ck = format!("qt:{}", normalize_math_text(ti));
+                    if let Ok(qt_hits) = self
+                        .search_list(db, ti, None, None, "15", &qt_ck, true, &ids_no_au)
+                        .await
+                    {
+                        merge_crossref_hits(&mut fb_hits, qt_hits);
+                    }
+                }
                 for h in &mut fb_hits {
                     h.score *= 0.97;
                 }
@@ -124,7 +152,7 @@ impl CrossrefClient {
                 if let Some(prose_ti) = extract_prose_core_title(ti) {
                     let p_ck = format!("qp:{}", normalize_math_text(&prose_ti));
                     let p_hits = self
-                        .search_list(db, &prose_ti, au_filter, None, "12", &p_ck, ids)
+                        .search_list(db, &prose_ti, au_filter, None, "12", &p_ck, false, ids)
                         .await?;
                     if p_hits.first().map(|c| c.score).unwrap_or(0.0) > top_score {
                         hits = p_hits;
@@ -151,7 +179,7 @@ impl CrossrefClient {
             };
             let ck = format!("auyr:{}", normalize_math_text(&q));
             return self
-                .search_list(db, &q, Some(&surname), yf.as_deref(), "10", &ck, ids)
+                .search_list(db, &q, Some(&surname), yf.as_deref(), "10", &ck, false, ids)
                 .await;
         }
 
@@ -352,6 +380,7 @@ impl CrossrefClient {
         year_filter: Option<&str>,
         rows_str: &str,
         cache_key: &str,
+        title_field_only: bool,
         ids: &ExtractedIdentifiers,
     ) -> Result<Vec<CandidateMatch>> {
         let body = if let Some(c) = load_http_cache(db, "crossref", cache_key)? {
@@ -361,8 +390,13 @@ impl CrossrefClient {
             c.body
         } else {
             self.list_limiter.acquire().await;
+            let q_param = if title_field_only {
+                "query.title"
+            } else {
+                "query.bibliographic"
+            };
             let mut query_pairs = vec![
-                ("query.bibliographic", query_str),
+                (q_param, query_str),
                 ("rows", rows_str),
             ];
             if let Some(af) = author_filter {
@@ -426,6 +460,27 @@ impl CrossrefClient {
         out.sort_by(|a, b| b.score.total_cmp(&a.score));
         Ok(out)
     }
+}
+
+fn merge_crossref_hits(dest: &mut Vec<CandidateMatch>, extra: Vec<CandidateMatch>) {
+    for cand in extra {
+        let already = dest.iter().any(|existing| {
+            if let (Some(da), Some(db)) =
+                (existing.record.doi.as_deref(), cand.record.doi.as_deref())
+            {
+                if !da.is_empty() && da.eq_ignore_ascii_case(db) {
+                    return true;
+                }
+            }
+            existing.record.title.eq_ignore_ascii_case(&cand.record.title)
+                && existing.record.year == cand.record.year
+                && existing.record.authors.len() == cand.record.authors.len()
+        });
+        if !already {
+            dest.push(cand);
+        }
+    }
+    dest.sort_by(|a, b| b.score.total_cmp(&a.score));
 }
 
 pub fn parse_crossref_work(w: &Value) -> Option<BibliographicRecord> {

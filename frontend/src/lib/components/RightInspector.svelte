@@ -606,15 +606,31 @@
       <section class="candidates-box">
         <strong>Candidati ambigui ({meta.pending_candidates.length})</strong>
         {#each meta.pending_candidates as cand (cand.id)}
+          {@const venue =
+            cand.record.booktitle || cand.record.journal_abbrev || cand.record.journal_full}
+          {@const typeLabel =
+            cand.record.work_type === 'inproceedings'
+              ? 'Atti'
+              : cand.record.work_type === 'incollection'
+                ? 'Capitolo'
+                : cand.record.work_type === 'book'
+                  ? 'Libro'
+                  : cand.record.work_type === 'phdthesis'
+                    ? 'Tesi'
+                    : cand.record.work_type === 'misc'
+                      ? 'Preprint'
+                      : 'Articolo'}
           <div class="cand-card">
             <div class="cand-head">
-              <span class="cand-source">{cand.source}</span>
+              <span class="cand-source">{cand.source} · {typeLabel}</span>
               <span class="cand-score">{Math.round(cand.match_score * 100)}%</span>
             </div>
             <div class="cand-title">{cand.record.title}</div>
             <div class="cand-sub">
               {cand.record.authors.map((a) => a.family_name).join(', ')}
               {#if cand.record.year} · {cand.record.year}{/if}
+              {#if venue} · {venue}{/if}
+              {#if cand.record.pages} · pp. {cand.record.pages}{/if}
               {#if cand.record.mr_number} · MR{cand.record.mr_number}{/if}
               {#if cand.record.doi} · DOI {cand.record.doi}{/if}
             </div>
