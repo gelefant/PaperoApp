@@ -34,7 +34,7 @@ async fn openlibrary_enforces_1_req_per_sec_sequentially_and_uses_permanent_cach
 
     let limiter = Arc::new(OpenLibraryLimiter::default_tos());
     let client = Arc::new(
-        OpenLibraryClient::new("0.2.0", None)
+        OpenLibraryClient::new("0.2.1", None)
             .unwrap()
             .with_base_and_limiter("https://openlibrary.example", limiter)
             .with_mock_transport(transport),
@@ -87,7 +87,7 @@ async fn openlibrary_429_triggers_backoff_and_circuit_breaker() {
         Duration::from_millis(20),
         Duration::from_secs(60),
     ));
-    let client = OpenLibraryClient::new("0.2.0", None)
+    let client = OpenLibraryClient::new("0.2.1", None)
         .unwrap()
         .with_base_and_limiter("https://openlibrary.example", Arc::clone(&limiter))
         .with_mock_transport(transport);
