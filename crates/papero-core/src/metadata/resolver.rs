@@ -2580,7 +2580,8 @@ pub fn search_documents_metadata(
                 f.has_text_layer,
                 f.ocr_status,
                 d.metadata_source,
-                d.metadata_verified
+                d.metadata_verified,
+                d.title_norm
          FROM files f
          JOIN documents d ON d.id = f.document_id
          JOIN source_roots sr ON sr.id = f.root_id
@@ -2656,42 +2657,62 @@ pub fn search_documents_metadata(
                 r.get::<_, String>(7)?,
                 r.get::<_, String>(15)?,
                 r.get::<_, String>(16)?,
+                r.get::<_, String>(22)?,
             ))
         },
     )?;
 
+    let text_has_digit = text_q
+        .as_deref()
+        .is_some_and(|q| q.bytes().any(|b| b.is_ascii_digit()));
+    let has_text_filter =
+        title_q.is_some() || author_q.is_some() || journal_q.is_some() || text_q.is_some();
+
     let mut out = Vec::new();
     for r in rows {
-        let (item, raw_authors_norm, journal_raw, msc_raw) = r?;
-        let t_norm = normalize_math_text(&item.title);
-        let a_disp_norm = normalize_math_text(&item.authors_summary);
-        let j_norm = normalize_math_text(&journal_raw);
-        let m_norm = msc_raw.to_ascii_lowercase();
+        let (item, raw_authors_norm, journal_raw, msc_raw, db_title_norm) = r?;
+        if !has_text_filter {
+            out.push(item);
+            continue;
+        }
 
-        if let Some(ref q) = title_q {
-            if !t_norm.contains(q) {
-                continue;
-            }
-        }
         if let Some(ref q) = author_q {
-            if !a_disp_norm.contains(q) && !raw_authors_norm.contains(q) {
+            let matched = raw_authors_norm.contains(q)
+                || (!item.authors_summary.is_empty()
+                    && item.authors_summary != raw_authors_norm
+                    && normalize_math_text(&item.authors_summary).contains(q));
+            if !matched {
                 continue;
             }
         }
+        if let Some(ref q) = title_q {
+            if !normalized_title_contains(&db_title_norm, &item.title, q) {
+                continue;
+            }
+        }
+        let mut cached_j_norm: Option<String> = None;
         if let Some(ref q) = journal_q {
+            if journal_raw.trim().is_empty() {
+                continue;
+            }
+            let j_norm = cached_j_norm.get_or_insert_with(|| normalize_math_text(&journal_raw));
             if !j_norm.contains(q) {
                 continue;
             }
         }
         if let Some(ref q) = text_q {
-            let yr_str = item.year.map(|y| y.to_string()).unwrap_or_default();
-            if !t_norm.contains(q)
-                && !a_disp_norm.contains(q)
-                && !raw_authors_norm.contains(q)
-                && !j_norm.contains(q)
-                && !m_norm.contains(q)
-                && !yr_str.contains(q)
-            {
+            let matched = raw_authors_norm.contains(q)
+                || normalized_title_contains(&db_title_norm, &item.title, q)
+                || (!msc_raw.is_empty() && msc_raw.to_ascii_lowercase().contains(q))
+                || (text_has_digit && item.year.is_some_and(|y| y.to_string().contains(q)))
+                || (!journal_raw.trim().is_empty()
+                    && cached_j_norm
+                        .get_or_insert_with(|| normalize_math_text(&journal_raw))
+                        .contains(q))
+                || (!item.authors_summary.is_empty()
+                    && item.authors_summary != raw_authors_norm
+                    && normalize_math_text(&item.authors_summary).contains(q));
+            if !matched {
                 continue;
             }
         }
@@ -2725,6 +2746,14 @@ pub fn search_documents_metadata(
     }
 
     Ok(out)
+}
+
+fn normalized_title_contains(db_title_norm: &str, raw_title: &str, needle: &str) -> bool {
+    if !db_title_norm.is_empty() || raw_title.trim().is_empty() {
+        db_title_norm.contains(needle)
+    } else {
+        normalize_math_text(raw_title).contains(needle)
+    }
 }
 
 fn norm_opt(opt: &Option<String>) -> Option<String> {

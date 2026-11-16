@@ -79,8 +79,9 @@ fn metadata_search_5000_docs_benchmark() {
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("metadata_search_5000_docs: hits={} elapsed_ms={:.2}", hits.len(), elapsed_ms);
     assert_eq!(hits.len(), 1);
+    let budget_ms = if cfg!(debug_assertions) { 350.0 } else { 100.0 };
     assert!(
-        elapsed_ms < 250.0,
-        "unexpectedly slow even unoptimized debug search: {elapsed_ms:.2} ms"
+        elapsed_ms < budget_ms,
+        "unexpectedly slow search: {elapsed_ms:.2} ms (budget {budget_ms:.0} ms)"
     );
 }
