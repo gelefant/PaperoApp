@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tr, type Lang } from '../i18n';
+  import { shouldShowRowVerifyControl } from '../viewerUtils';
   import type {
     DocumentListItem,
     SortDirection,
@@ -49,6 +50,8 @@
     onConfirmMsc,
     onRejectMsc,
   }: Props = $props();
+
+  const showVerifyControl = $derived(shouldShowRowVerifyControl(verifiedFilter, unverifiedCount));
 </script>
 
 <div class="doc-list">
@@ -182,26 +185,28 @@
           }}
         >
           <div class="doc-title">
-            {#if onToggleVerified}
-              <button
-                type="button"
-                class="verify-btn"
-                class:checked={Boolean(doc.metadata_verified)}
-                title={doc.metadata_verified
-                  ? tr(lang, 'unmarkVerifiedTip')
-                  : tr(lang, 'markVerifiedTip')}
-                aria-label={doc.metadata_verified
-                  ? tr(lang, 'unmarkVerifiedTip')
-                  : tr(lang, 'markVerifiedTip')}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  onToggleVerified(doc.document_id, !doc.metadata_verified);
-                }}
-              >
-                ✓
-              </button>
-            {:else if doc.metadata_verified}
-              <span class="verified-dot" title={tr(lang, 'unmarkVerifiedTip')}>✓</span>
+            {#if showVerifyControl}
+              {#if onToggleVerified}
+                <button
+                  type="button"
+                  class="verify-btn"
+                  class:checked={Boolean(doc.metadata_verified)}
+                  title={doc.metadata_verified
+                    ? tr(lang, 'unmarkVerifiedTip')
+                    : tr(lang, 'markVerifiedTip')}
+                  aria-label={doc.metadata_verified
+                    ? tr(lang, 'unmarkVerifiedTip')
+                    : tr(lang, 'markVerifiedTip')}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    onToggleVerified(doc.document_id, !doc.metadata_verified);
+                  }}
+                >
+                  ✓
+                </button>
+              {:else if doc.metadata_verified}
+                <span class="verified-dot" title={tr(lang, 'unmarkVerifiedTip')}>✓</span>
+              {/if}
             {/if}
             <span class="fmt-badge">{doc.format.toUpperCase()}</span>
             {#if doc.work_type === 'book'}

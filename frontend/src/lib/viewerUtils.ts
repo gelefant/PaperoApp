@@ -1,4 +1,17 @@
-import type { FilePageInfo, LlmCitation, NormalizedRect } from './types';
+import type { FilePageInfo, LlmCitation, NormalizedRect, VerifiedFilter } from './types';
+
+/**
+ * Determines whether per-row metadata verification checkboxes/badges should be rendered in the catalog list.
+ * Hides them when explicitly viewing already-verified entries or when no unverified items remain.
+ */
+export function shouldShowRowVerifyControl(
+  verifiedFilter: VerifiedFilter,
+  unverifiedCount?: number
+): boolean {
+  if (verifiedFilter === 'verified') return false;
+  if (unverifiedCount === 0) return false;
+  return true;
+}
 
 /**
  * Builds a platform-aware custom protocol URL for `papero-doc://`.

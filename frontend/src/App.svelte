@@ -106,6 +106,7 @@
   let llmError = $state('');
   let cloudConsentModal = $state<{ provider: LlmProvider; preview: LlmPromptPreview } | null>(null);
   let backupBusy = $state(false);
+  let backupDialogOpen = false;
   let backupNotice = $state('');
   let backupError = $state('');
   let lang = $derived(normalizeLang(settings?.ui_language));
@@ -916,11 +917,37 @@
     }
   }
 
-  async function handleCreateBackup() {
-    const outPath = await saveFileDialog({
-      defaultPath: settings?.backup_path || 'papero-library.papero-backup',
-      filters: [{ name: 'Papero Backup', extensions: ['papero-backup'] }],
+  async function pickBackupSavePath(): Promise<string | null> {
+    const filters = [{ name: 'Papero Backup', extensions: ['papero-backup'] }];
+    const preferred = settings?.backup_path?.trim();
+    if (preferred) {
+      try {
+        return await saveFileDialog({ defaultPath: preferred, filters });
+      } catch {
+        // Fallback to default filename if stored backup path parent no longer exists
+      }
+    }
+    return await saveFileDialog({
+      defaultPath: 'papero-library.papero-backup',
+      filters,
     });
+  }
+
+  async function handleCreateBackup() {
+    if (backupBusy || backupDialogOpen) return;
+    backupError = '';
+    backupDialogOpen = true;
+    let outPath: string | null = null;
+    try {
+      outPath = await pickBackupSavePath();
+    } catch (e) {
+      const msg = String(e);
+      backupError = msg;
+      scanStatusText = msg;
+      return;
+    } finally {
+      backupDialogOpen = false;
+    }
     if (!outPath) return;
     await runBackupAction(async () => {
       const rep = await api.createBackup(outPath);
@@ -932,6 +959,7 @@
   }
 
   async function handleUpdateBackupNow() {
+    if (backupBusy || backupDialogOpen) return;
     await runBackupAction(async () => {
       const rep = await api.updateBackupNow();
       settings = await api.getUiSettings();
@@ -942,10 +970,23 @@
   }
 
   async function handleRestoreBackup() {
-    const selected = await openFileDialog({
-      multiple: false,
-      filters: [{ name: 'Papero Backup', extensions: ['papero-backup'] }],
-    });
+    if (backupBusy || backupDialogOpen) return;
+    backupError = '';
+    backupDialogOpen = true;
+    let selected: string | string[] | null = null;
+    try {
+      selected = await openFileDialog({
+        multiple: false,
+        filters: [{ name: 'Papero Backup', extensions: ['papero-backup'] }],
+      });
+    } catch (e) {
+      const msg = String(e);
+      backupError = msg;
+      scanStatusText = msg;
+      return;
+    } finally {
+      backupDialogOpen = false;
+    }
     if (typeof selected !== 'string' || !selected) return;
     await runBackupAction(async () => {
       const rep = await api.restoreBackup(selected);
@@ -1184,42 +1225,59 @@
     }
   }
 
+  async function exportCatalog(
+    label: string,
+    defaultPath: string,
+    filter: { name: string; extensions: string[] },
+    exportFn: (docIds: number[], outPath: string) => Promise<string>
+  ) {
+    try {
+      const docIds = documents.map((d) => d.document_id);
+      const outPath = await saveFileDialog({ defaultPath, filters: [filter] });
+      if (!outPath) return;
+      await exportFn(docIds, outPath);
+      scanStatusText = `Esportati ${docIds.length} record ${label} in ${outPath}`;
+    } catch (e) {
+      scanStatusText = `Errore esportazione ${label}: ${String(e)}`;
+    }
+  }
+
   async function handleExportBibtex() {
-    const docIds = documents.map((d) => d.document_id);
-    const outPath = await saveFileDialog({
-      defaultPath: 'papero_catalogo.bib',
-      filters: [{ name: 'BibTeX', extensions: ['bib'] }],
-    });
-    if (!outPath) return;
-    await api.exportBibtexMany(docIds, outPath);
-    scanStatusText = `Esportati ${docIds.length} record in ${outPath}`;
+    await exportCatalog(
+      'BibTeX',
+      'papero_catalogo.bib',
+      { name: 'BibTeX', extensions: ['bib'] },
+      api.exportBibtexMany
+    );
   }
 
   async function handleExportCsv() {
-    const docIds = documents.map((d) => d.document_id);
-    const outPath = await saveFileDialog({
-      defaultPath: 'papero_catalogo.csv',
-      filters: [{ name: 'CSV', extensions: ['csv'] }],
-    });
-    if (!outPath) return;
-    await api.exportCsvMany(docIds, outPath);
-    scanStatusText = `Esportati ${docIds.length} record CSV in ${outPath}`;
+    await exportCatalog(
+      'CSV',
+      'papero_catalogo.csv',
+      { name: 'CSV', extensions: ['csv'] },
+      api.exportCsvMany
+    );
   }
 
   async function handleImportMetadata() {
-    const selected = await openFileDialog({
-      multiple: false,
-      filters: [{ name: 'BibTeX / Zotero CSL-JSON', extensions: ['bib', 'json'] }],
-    });
-    if (typeof selected !== 'string' || !selected) return;
-    const fmt = selected.toLowerCase().endsWith('.json') ? 'csl_json' : 'bib';
-    const report = await api.importMetadataFile({
-      path: selected,
-      format: fmt,
-      targetDocumentId: selectedDocId,
-    });
-    scanStatusText = `Importati: ${report.matched_documents}/${report.total_entries} voci abbinate.`;
-    await refreshLibrary();
+    try {
+      const selected = await openFileDialog({
+        multiple: false,
+        filters: [{ name: 'BibTeX / Zotero CSL-JSON', extensions: ['bib', 'json'] }],
+      });
+      if (typeof selected !== 'string' || !selected) return;
+      const fmt = selected.toLowerCase().endsWith('.json') ? 'csl_json' : 'bib';
+      const report = await api.importMetadataFile({
+        path: selected,
+        format: fmt,
+        targetDocumentId: selectedDocId,
+      });
+      scanStatusText = `Importati: ${report.matched_documents}/${report.total_entries} voci abbinate.`;
+      await refreshLibrary();
+    } catch (e) {
+      scanStatusText = `Errore importazione metadati: ${String(e)}`;
+    }
   }
 
   async function handleRunDedup() {

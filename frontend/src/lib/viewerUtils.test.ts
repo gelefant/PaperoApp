@@ -5,6 +5,7 @@ import {
   computePassageCenterFraction,
   paperoDocUrl,
   resolveGoToPage,
+  shouldShowRowVerifyControl,
   splitAnswerWithCitations,
 } from './viewerUtils';
 
@@ -80,5 +81,14 @@ describe('viewerUtils', () => {
       pageOrd: 2,
       citation: null,
     });
+  });
+
+  it('hides row verify controls when filtering verified or when unverified list is empty', () => {
+    expect(shouldShowRowVerifyControl('all', 5)).toBe(true);
+    expect(shouldShowRowVerifyControl('unverified', 5)).toBe(true);
+    expect(shouldShowRowVerifyControl('verified', 5)).toBe(false);
+    expect(shouldShowRowVerifyControl('all', 0)).toBe(false);
+    expect(shouldShowRowVerifyControl('verified', 0)).toBe(false);
+    expect(shouldShowRowVerifyControl('all', undefined)).toBe(true);
   });
 });

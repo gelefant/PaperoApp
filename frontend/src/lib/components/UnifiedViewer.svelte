@@ -17,6 +17,7 @@
     computePassageCenterFraction,
     resolveGoToPage,
   } from '../viewerUtils';
+  import { attachSelectableTextLayer } from '../textLayerSelection';
 
   // Register PDF.js's built-in LoopbackPort worker handler directly in-module.
   // On macOS WKWebView (`tauri://localhost`), `new URL(location.href).origin` is `"null"`,
@@ -85,6 +86,7 @@
   function pdfPageAction(surfaceEl: HTMLDivElement, initial: PdfPageParams) {
     let current = initial;
     let activeTask: RenderTask | null = null;
+    let detachSelection: (() => void) | null = null;
     let renderToken = 0;
     let lastRenderedKey = '';
 
@@ -135,6 +137,8 @@
         lastRenderedKey = key;
 
         try {
+          detachSelection?.();
+          detachSelection = null;
           textDiv.innerHTML = '';
           textDiv.style.width = `${Math.floor(viewport.width)}px`;
           textDiv.style.height = `${Math.floor(viewport.height)}px`;
@@ -147,6 +151,8 @@
             viewport,
           });
           await textLayer.render();
+          if (token !== renderToken) return;
+          detachSelection = attachSelectableTextLayer(textDiv);
         } catch {
           // Keep rendered canvas even if TextLayer encounters font quirks
         }
@@ -170,6 +176,8 @@
       },
       destroy() {
         renderToken++;
+        detachSelection?.();
+        detachSelection = null;
         if (activeTask) {
           try {
             activeTask.cancel();
@@ -178,6 +186,15 @@
           }
           activeTask = null;
         }
+      },
+    };
+  }
+
+  function djvuTextLayerAction(node: HTMLDivElement) {
+    const detach = attachSelectableTextLayer(node);
+    return {
+      destroy() {
+        detach();
       },
     };
   }
@@ -840,18 +857,17 @@
                       class="djvu-page-img"
                       src={pageImgUrl}
                       alt={`Pagina ${slot.pageOrd}`}
+                      draggable="false"
                     />
                   {:else}
                     <div class="page-placeholder">Rendering DjVu p. {slot.pageOrd}…</div>
                   {/if}
-                  <div class="djvu-text-layer">
+                  <div class="djvu-text-layer" use:djvuTextLayerAction>
                     {#each djvuSpansCache[slot.pageOrd] ?? [] as sp}
                       <span
                         class="djvu-text-span"
                         style="left: {sp.bbox.x * 100}%; top: {sp.bbox.y * 100}%; width: {sp.bbox.w * 100}%; height: {sp.bbox.h * 100}%; font-size: {Math.max(8, sp.bbox.h * slot.height * 0.85)}px;"
-                      >
-                        {sp.text}
-                      </span>
+                      >{sp.text}</span>
                     {/each}
                   </div>
                 {/if}
@@ -1039,50 +1055,17 @@
   }
   .pdf-canvas {
     display: block;
+    pointer-events: none;
+    -webkit-user-select: none;
     user-select: none;
-  }
-  .textLayer {
-    position: absolute;
-    inset: 0;
-    overflow: hidden;
-    line-height: 1;
-    text-size-adjust: none;
-    forced-color-adjust: none;
-    transform-origin: 0 0;
-    z-index: 2;
-  }
-  .textLayer :global(span),
-  .textLayer :global(br) {
-    color: transparent;
-    position: absolute;
-    white-space: pre;
-    cursor: text;
-    transform-origin: 0% 0%;
-  }
-  .textLayer :global(::selection) {
-    background: rgba(37, 99, 235, 0.28);
   }
   .djvu-page-img {
     width: 100%;
     height: 100%;
     display: block;
+    pointer-events: none;
+    -webkit-user-select: none;
     user-select: none;
-  }
-  .djvu-text-layer {
-    position: absolute;
-    inset: 0;
-    overflow: hidden;
-    z-index: 2;
-  }
-  .djvu-text-span {
-    position: absolute;
-    color: transparent;
-    white-space: pre;
-    cursor: text;
-    line-height: 1;
-  }
-  .djvu-text-span::selection {
-    background: rgba(37, 99, 235, 0.28);
   }
   .highlight-layer {
     position: absolute;
