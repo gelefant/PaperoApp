@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
@@ -58,21 +59,60 @@ if (Test-Path $PdfiumLic) {
     Copy-Item $PdfiumLic (Join-Path $LicensesOut "PDFium-LICENSE")
 }
 
-# 2. ONNX Runtime (CPU build ONLY; verify DirectML.dll is NOT staged)
-$OrtArchive = Join-Path $CacheDir "onnxruntime-win-x64-$OnnxRuntimeVersion.zip"
-Download-Cached "https://github.com/microsoft/onnxruntime/releases/download/v$OnnxRuntimeVersion/onnxruntime-win-x64-$OnnxRuntimeVersion.zip" $OrtArchive
-$OrtExtract = Join-Path $CacheDir "ort_win"
-if (Test-Path $OrtExtract) { Remove-Item -Recurse -Force $OrtExtract }
-Expand-Archive -Path $OrtArchive -DestinationPath $OrtExtract -Force
-$OrtRoot = Join-Path $OrtExtract "onnxruntime-win-x64-$OnnxRuntimeVersion"
-$OrtDll = Join-Path $OrtRoot "lib\onnxruntime.dll"
-if (-not (Test-Path $OrtDll)) {
-    throw "onnxruntime.dll not found at $OrtDll"
-}
-Copy-Item $OrtDll (Join-Path $ResourcesDir "onnxruntime.dll")
-$OrtLic = Join-Path $OrtRoot "LICENSE"
-if (Test-Path $OrtLic) {
-    Copy-Item $OrtLic (Join-Path $LicensesOut "ONNXRuntime-LICENSE")
+# 2. ONNX Runtime (CPU build ONLY from Microsoft's immutable NuGet CDN; verify DirectML.dll is NOT staged)
+$OrtLegacyZip = Join-Path $CacheDir "onnxruntime-win-x64-$OnnxRuntimeVersion.zip"
+$OrtVersionLower = $OnnxRuntimeVersion.ToLowerInvariant()
+$OrtNugetPkg = Join-Path $CacheDir "microsoft.ml.onnxruntime.$OrtVersionLower.nupkg"
+$OrtNugetUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$OrtVersionLower/microsoft.ml.onnxruntime.$OrtVersionLower.nupkg"
+$OrtGhUrl = "https://github.com/microsoft/onnxruntime/releases/download/v$OnnxRuntimeVersion/onnxruntime-win-x64-$OnnxRuntimeVersion.zip"
+
+if ((Test-Path $OrtLegacyZip) -and ((Get-Item $OrtLegacyZip).Length -gt 0)) {
+    Write-Host "    [cache hit] $(Split-Path -Leaf $OrtLegacyZip)"
+    $OrtExtract = Join-Path $CacheDir "ort_win"
+    if (Test-Path $OrtExtract) { Remove-Item -Recurse -Force $OrtExtract }
+    Expand-Archive -Path $OrtLegacyZip -DestinationPath $OrtExtract -Force
+    $OrtRoot = Join-Path $OrtExtract "onnxruntime-win-x64-$OnnxRuntimeVersion"
+    $OrtDll = Join-Path $OrtRoot "lib\onnxruntime.dll"
+    if (-not (Test-Path $OrtDll)) {
+        throw "onnxruntime.dll not found at $OrtDll"
+    }
+    Copy-Item $OrtDll (Join-Path $ResourcesDir "onnxruntime.dll")
+    $OrtLic = Join-Path $OrtRoot "LICENSE"
+    if (Test-Path $OrtLic) {
+        Copy-Item $OrtLic (Join-Path $LicensesOut "ONNXRuntime-LICENSE")
+    }
+} else {
+    try {
+        Download-Cached $OrtNugetUrl $OrtNugetPkg
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Zip = [System.IO.Compression.ZipFile]::OpenRead($OrtNugetPkg)
+        try {
+            $DllEntry = $Zip.Entries | Where-Object { $_.FullName -eq "runtimes/win-x64/native/onnxruntime.dll" } | Select-Object -First 1
+            if (-not $DllEntry) {
+                throw "runtimes/win-x64/native/onnxruntime.dll not found inside $OrtNugetPkg"
+            }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($DllEntry, (Join-Path $ResourcesDir "onnxruntime.dll"), $true)
+
+            $LicEntry = $Zip.Entries | Where-Object { $_.FullName -eq "LICENSE" -or $_.FullName -eq "LICENSE.txt" } | Select-Object -First 1
+            if ($LicEntry) {
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($LicEntry, (Join-Path $LicensesOut "ONNXRuntime-LICENSE"), $true)
+            }
+        } finally {
+            $Zip.Dispose()
+        }
+    } catch {
+        Write-Host "    [fallback]  NuGet staging failed ($($_.Exception.Message)); trying GitHub Releases..."
+        Download-Cached $OrtGhUrl $OrtLegacyZip
+        $OrtExtract = Join-Path $CacheDir "ort_win"
+        if (Test-Path $OrtExtract) { Remove-Item -Recurse -Force $OrtExtract }
+        Expand-Archive -Path $OrtLegacyZip -DestinationPath $OrtExtract -Force
+        $OrtRoot = Join-Path $OrtExtract "onnxruntime-win-x64-$OnnxRuntimeVersion"
+        Copy-Item (Join-Path $OrtRoot "lib\onnxruntime.dll") (Join-Path $ResourcesDir "onnxruntime.dll")
+        $OrtLic = Join-Path $OrtRoot "LICENSE"
+        if (Test-Path $OrtLic) {
+            Copy-Item $OrtLic (Join-Path $LicensesOut "ONNXRuntime-LICENSE")
+        }
+    }
 }
 
 if (Test-Path (Join-Path $ResourcesDir "DirectML.dll")) {

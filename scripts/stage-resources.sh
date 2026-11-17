@@ -63,6 +63,62 @@ download_file() {
   mv "${dest}.part" "${dest}"
 }
 
+stage_onnxruntime() {
+  local nuget_rid="$1"      # osx-arm64 | osx-x64 | linux-x64
+  local out_lib_name="$2"   # libonnxruntime.dylib | libonnxruntime.so
+  local gh_stem="$3"        # onnxruntime-osx-arm64-1.23.2 | ...
+  local gh_inner_lib="$4"   # libonnxruntime.1.23.2.dylib | libonnxruntime.so.1.23.2
+
+  local gh_tgz="${CACHE_DIR}/${gh_stem}.tgz"
+  local nuget_pkg="${CACHE_DIR}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg"
+  local ver_lower
+  ver_lower="$(printf '%s' "${ONNXRUNTIME_VERSION}" | tr '[:upper:]' '[:lower:]')"
+  local nuget_url="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ver_lower}/microsoft.ml.onnxruntime.${ver_lower}.nupkg"
+  local gh_url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/${gh_stem}.tgz"
+
+  if [[ -s "${gh_tgz}" ]]; then
+    echo "    [cache hit] $(basename "${gh_tgz}")"
+    tar -xzf "${gh_tgz}" -C "${CACHE_DIR}" "${gh_stem}/lib/${gh_inner_lib}" "${gh_stem}/LICENSE"
+    cp -L "${CACHE_DIR}/${gh_stem}/lib/${gh_inner_lib}" "${RESOURCES_DIR}/${out_lib_name}"
+    cp "${CACHE_DIR}/${gh_stem}/LICENSE" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE"
+    chmod 755 "${RESOURCES_DIR}/${out_lib_name}"
+    return 0
+  fi
+
+  if [[ ! -s "${nuget_pkg}" ]]; then
+    echo "    [download]  ${nuget_url}"
+    if curl -fL --retry 3 --retry-delay 2 -o "${nuget_pkg}.part" "${nuget_url}"; then
+      mv "${nuget_pkg}.part" "${nuget_pkg}"
+    else
+      rm -f "${nuget_pkg}.part"
+      echo "    [fallback]  ${gh_url}"
+      download_file "${gh_url}" "${gh_tgz}"
+      tar -xzf "${gh_tgz}" -C "${CACHE_DIR}" "${gh_stem}/lib/${gh_inner_lib}" "${gh_stem}/LICENSE"
+      cp -L "${CACHE_DIR}/${gh_stem}/lib/${gh_inner_lib}" "${RESOURCES_DIR}/${out_lib_name}"
+      cp "${CACHE_DIR}/${gh_stem}/LICENSE" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE"
+      chmod 755 "${RESOURCES_DIR}/${out_lib_name}"
+      return 0
+    fi
+  else
+    echo "    [cache hit] $(basename "${nuget_pkg}")"
+  fi
+
+  python3 - "${nuget_pkg}" "runtimes/${nuget_rid}/native/${out_lib_name}" "${RESOURCES_DIR}/${out_lib_name}" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE" <<'PY'
+import os, shutil, sys, zipfile
+
+nupkg, entry_lib, dst_lib, dst_lic = sys.argv[1:5]
+with zipfile.ZipFile(nupkg, "r") as zf:
+    with zf.open(entry_lib) as src, open(dst_lib, "wb") as out:
+        shutil.copyfileobj(src, out)
+    lic_entry = next((n for n in ("LICENSE", "LICENSE.txt") if n in zf.namelist()), None)
+    if not lic_entry:
+        raise RuntimeError(f"LICENSE file not found inside {nupkg}")
+    with zf.open(lic_entry) as src, open(dst_lic, "wb") as out:
+        shutil.copyfileobj(src, out)
+os.chmod(dst_lib, 0o755)
+PY
+}
+
 relocate_macos_deps() {
   local expected_arch="$1"
   local search_roots="$2"
@@ -179,7 +235,6 @@ PY
 case "${TARGET}" in
   aarch64-apple-darwin)
     PDFIUM_ARCHIVE="${CACHE_DIR}/pdfium-mac-arm64.tgz"
-    ORT_ARCHIVE="${CACHE_DIR}/onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}.tgz"
 
     download_file "${PDFIUM_BASE_URL}/pdfium-mac-arm64.tgz" "${PDFIUM_ARCHIVE}"
     tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" ./lib/libpdfium.dylib ./LICENSE 2>/dev/null || \
@@ -188,10 +243,7 @@ case "${TARGET}" in
     cp "${CACHE_DIR}/LICENSE" "${RESOURCES_DIR}/licenses/PDFium-LICENSE"
     install_name_tool -id "@rpath/libpdfium.dylib" "${RESOURCES_DIR}/libpdfium.dylib"
 
-    download_file "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}.tgz" "${ORT_ARCHIVE}"
-    tar -xzf "${ORT_ARCHIVE}" -C "${CACHE_DIR}" "onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.${ONNXRUNTIME_VERSION}.dylib" "onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}/LICENSE"
-    cp "${CACHE_DIR}/onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.${ONNXRUNTIME_VERSION}.dylib" "${RESOURCES_DIR}/libonnxruntime.dylib"
-    cp "${CACHE_DIR}/onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}/LICENSE" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE"
+    stage_onnxruntime "osx-arm64" "libonnxruntime.dylib" "onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}" "libonnxruntime.${ONNXRUNTIME_VERSION}.dylib"
     install_name_tool -id "@rpath/libonnxruntime.dylib" "${RESOURCES_DIR}/libonnxruntime.dylib"
 
     DJVU_PREFIX="$(brew --prefix djvulibre 2>/dev/null || echo "/opt/homebrew/opt/djvulibre")"
@@ -208,7 +260,6 @@ case "${TARGET}" in
 
   x86_64-apple-darwin)
     PDFIUM_ARCHIVE="${CACHE_DIR}/pdfium-mac-x64.tgz"
-    ORT_ARCHIVE="${CACHE_DIR}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}.tgz"
 
     download_file "${PDFIUM_BASE_URL}/pdfium-mac-x64.tgz" "${PDFIUM_ARCHIVE}"
     tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" ./lib/libpdfium.dylib ./LICENSE 2>/dev/null || \
@@ -217,10 +268,7 @@ case "${TARGET}" in
     cp "${CACHE_DIR}/LICENSE" "${RESOURCES_DIR}/licenses/PDFium-LICENSE"
     install_name_tool -id "@rpath/libpdfium.dylib" "${RESOURCES_DIR}/libpdfium.dylib"
 
-    download_file "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}.tgz" "${ORT_ARCHIVE}"
-    tar -xzf "${ORT_ARCHIVE}" -C "${CACHE_DIR}" "onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.${ONNXRUNTIME_VERSION}.dylib" "onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}/LICENSE"
-    cp "${CACHE_DIR}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.${ONNXRUNTIME_VERSION}.dylib" "${RESOURCES_DIR}/libonnxruntime.dylib"
-    cp "${CACHE_DIR}/onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}/LICENSE" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE"
+    stage_onnxruntime "osx-x64" "libonnxruntime.dylib" "onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}" "libonnxruntime.${ONNXRUNTIME_VERSION}.dylib"
     install_name_tool -id "@rpath/libonnxruntime.dylib" "${RESOURCES_DIR}/libonnxruntime.dylib"
 
     if [[ -x "/usr/local/opt/djvulibre/bin/ddjvu" ]] && file "/usr/local/opt/djvulibre/bin/ddjvu" | grep -q "x86_64"; then
@@ -264,7 +312,6 @@ case "${TARGET}" in
 
   x86_64-unknown-linux-gnu)
     PDFIUM_ARCHIVE="${CACHE_DIR}/pdfium-linux-x64.tgz"
-    ORT_ARCHIVE="${CACHE_DIR}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
 
     download_file "${PDFIUM_BASE_URL}/pdfium-linux-x64.tgz" "${PDFIUM_ARCHIVE}"
     tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" ./lib/libpdfium.so ./LICENSE 2>/dev/null || \
@@ -272,10 +319,7 @@ case "${TARGET}" in
     cp "${CACHE_DIR}/lib/libpdfium.so" "${RESOURCES_DIR}/libpdfium.so"
     cp "${CACHE_DIR}/LICENSE" "${RESOURCES_DIR}/licenses/PDFium-LICENSE"
 
-    download_file "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz" "${ORT_ARCHIVE}"
-    tar -xzf "${ORT_ARCHIVE}" -C "${CACHE_DIR}" "onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so.${ONNXRUNTIME_VERSION}" "onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/LICENSE"
-    cp -L "${CACHE_DIR}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so.${ONNXRUNTIME_VERSION}" "${RESOURCES_DIR}/libonnxruntime.so"
-    cp "${CACHE_DIR}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/LICENSE" "${RESOURCES_DIR}/licenses/ONNXRuntime-LICENSE"
+    stage_onnxruntime "linux-x64" "libonnxruntime.so" "onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}" "libonnxruntime.so.${ONNXRUNTIME_VERSION}"
 
     for tool in ddjvu djvused djvutxt; do
       tool_path="$(command -v "${tool}" || true)"
