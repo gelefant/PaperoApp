@@ -10,13 +10,18 @@ pub fn apply_pragmas(conn: &Connection, read_only: bool) -> Result<()> {
         PRAGMA foreign_keys = ON;
         PRAGMA temp_store = MEMORY;
         PRAGMA busy_timeout = 5000;
+        PRAGMA mmap_size = 134217728;
         ",
     )?;
-    if !read_only {
+    if read_only {
+        conn.execute_batch("PRAGMA cache_size = -4096;")?;
+    } else {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -8192;
+            PRAGMA wal_autocheckpoint = 2000;
             ",
         )?;
     }
@@ -110,6 +115,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         tx.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![4i64, now],
+        )?;
+        tx.commit()?;
+    }
+
+    if current_version < 5 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_docs_updated_at ON documents(updated_at DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS idx_passages_doc_page ON passages(document_id, page_ord, chunk_index);
+             CREATE INDEX IF NOT EXISTS idx_metadata_candidates_doc ON metadata_candidates(document_id);
+             CREATE INDEX IF NOT EXISTS idx_index_jobs_stage_status ON index_jobs(stage, status, priority, id);
+             UPDATE index_jobs SET status = 'queued', last_error = NULL WHERE stage = 'metadata' AND status = 'failed';",
+        )?;
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![5i64, now],
         )?;
         tx.commit()?;
     }

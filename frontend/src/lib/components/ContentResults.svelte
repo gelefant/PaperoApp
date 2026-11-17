@@ -357,6 +357,7 @@
   .rows {
     overflow-y: auto;
     flex: 1;
+    contain: content;
   }
   .doc-group {
     border-bottom: 1px solid var(--border);

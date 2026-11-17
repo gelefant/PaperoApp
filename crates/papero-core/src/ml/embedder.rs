@@ -154,11 +154,30 @@ impl OnnxEmbedder {
     }
 
     fn embed_raw_batch(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        const EMBED_BATCH_SIZE: usize = 4;
-        let mut all_embeddings = Vec::with_capacity(inputs.len());
-        for chunk in inputs.chunks(EMBED_BATCH_SIZE) {
-            let chunk_embs = self.embed_chunk(chunk)?;
-            all_embeddings.extend(chunk_embs);
+        const EMBED_BATCH_SIZE: usize = 8;
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if inputs.len() == 1 {
+            return self.embed_chunk(inputs);
+        }
+
+        // Sort inputs by byte length before batching so short passages are grouped together
+        // rather than padded up to the longest passage (up to 512 tokens) in the batch.
+        let mut order: Vec<usize> = (0..inputs.len()).collect();
+        order.sort_by_key(|&idx| inputs[idx].len());
+
+        let mut all_embeddings: Vec<Vec<f32>> = vec![Vec::new(); inputs.len()];
+        let mut chunk_buf: Vec<String> = Vec::with_capacity(EMBED_BATCH_SIZE);
+        for idx_chunk in order.chunks(EMBED_BATCH_SIZE) {
+            chunk_buf.clear();
+            for &orig_idx in idx_chunk {
+                chunk_buf.push(inputs[orig_idx].clone());
+            }
+            let chunk_embs = self.embed_chunk(&chunk_buf)?;
+            for (&orig_idx, emb) in idx_chunk.iter().zip(chunk_embs) {
+                all_embeddings[orig_idx] = emb;
+            }
         }
         Ok(all_embeddings)
     }

@@ -197,6 +197,7 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+    contain: content;
   }
   .group-card {
     border: 1px solid var(--border);

@@ -82,7 +82,8 @@ impl MlWorkerClient {
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+            cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
         }
 
         let mut child = cmd
@@ -208,8 +209,37 @@ pub fn find_spec(profile: ModelProfile, role: ModelRole) -> Result<crate::ml::re
         .ok_or_else(|| CoreError::Config(format!("missing model spec for {:?}", role)))
 }
 
+fn lower_worker_process_priority() {
+    let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
+    #[cfg(target_os = "macos")]
+    {
+        // QOS_CLASS_UTILITY (0x11) tells XNU to schedule this worker and the intra-op pthreads
+        // spawned by ONNX Runtime onto Efficiency cores / low-power P-states rather than blasting fans.
+        const QOS_CLASS_UTILITY: u32 = 0x11;
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        // SAFETY: Standard libsystem_pthread call setting the calling thread's QoS class.
+        unsafe {
+            let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn nice(inc: i32) -> i32;
+        }
+        // SAFETY: Standard libc `nice` call lowering background worker scheduling priority.
+        unsafe {
+            let _ = nice(10);
+        }
+    }
+}
+
 /// Stdio worker loop invoked via `<binary> --ml-worker`.
 pub fn run_ml_worker_stdio() -> Result<()> {
+    lower_worker_process_priority();
+
     let stdin_raw = io::stdin();
     let stdout_raw = io::stdout();
     let mut reader = BufReader::new(stdin_raw.lock());

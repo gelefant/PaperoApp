@@ -1,8 +1,5 @@
-use crate::state::AppState;
+use crate::state::{read_file_range_at, AppState, ViewerFileError};
 use http::{header, Request, Response, StatusCode};
-use papero_core::db::repos::docs::get_file_location;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,27 +101,19 @@ fn serve_pdf_range(
     file_id: i64,
     request: &Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
-    let loc = {
-        let r = state.db.reader();
-        match get_file_location(&r, file_id) {
-            Ok(Some(l)) => l,
-            Ok(None) => return error_response(StatusCode::NOT_FOUND, "file not found"),
-            Err(e) => return error_response(StatusCode::FORBIDDEN, &e.to_string()),
+    let cached = match state.get_or_open_viewer_file(file_id) {
+        Ok(c) => c,
+        Err(ViewerFileError::NotFound) => return error_response(StatusCode::NOT_FOUND, "file not found"),
+        Err(ViewerFileError::Unreachable) => {
+            return error_response(StatusCode::NOT_FOUND, "source folder unreachable")
+        }
+        Err(ViewerFileError::Forbidden(msg)) => return error_response(StatusCode::FORBIDDEN, &msg),
+        Err(ViewerFileError::Io(msg)) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
         }
     };
 
-    if !loc.is_available || !loc.abs_path.exists() {
-        return error_response(StatusCode::NOT_FOUND, "source folder unreachable");
-    }
-
-    let mut file = match File::open(&loc.abs_path) {
-        Ok(f) => f,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let total_len = match file.metadata() {
-        Ok(m) => m.len(),
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
+    let total_len = cached.len;
 
     if let Some(range_val) = request
         .headers()
@@ -132,15 +121,17 @@ fn serve_pdf_range(
         .and_then(|v| v.to_str().ok())
     {
         match parse_byte_range(range_val, total_len) {
-            Ok(Some(range)) => {
-                let len = (range.end - range.start + 1) as usize;
-                let mut buf = vec![0u8; len];
-                if let Err(e) = file
-                    .seek(SeekFrom::Start(range.start))
-                    .and_then(|_| file.read_exact(&mut buf))
-                {
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+            Ok(Some(mut range)) => {
+                // Cap open-ended probes (`Range: bytes=0-`) on large PDFs to 2 MB so the WebView
+                // never buffers a 200 MB book into RAM before switching to 64 KB range chunks.
+                if range_val.trim_end().ends_with('-') && total_len > 2 * 1024 * 1024 {
+                    range.end = (range.start + 2 * 1024 * 1024 - 1).min(total_len - 1);
                 }
+                let len = (range.end - range.start + 1) as usize;
+                let buf = match read_file_range_at(&cached.file, range.start, len) {
+                    Ok(b) => b,
+                    Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                };
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(header::CONTENT_TYPE, "application/pdf")
@@ -186,10 +177,10 @@ fn serve_pdf_range(
             .unwrap();
     }
 
-    let mut full = Vec::with_capacity(total_len as usize);
-    if let Err(e) = file.read_to_end(&mut full) {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
-    }
+    let full = match read_file_range_at(&cached.file, 0, total_len as usize) {
+        Ok(b) => b,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/pdf")
@@ -210,18 +201,17 @@ fn serve_djvu_page(
     page_ord: u32,
     dpi: u32,
 ) -> Response<Vec<u8>> {
-    let loc = {
-        let r = state.db.reader();
-        match get_file_location(&r, file_id) {
-            Ok(Some(l)) => l,
-            Ok(None) => return error_response(StatusCode::NOT_FOUND, "file not found"),
-            Err(e) => return error_response(StatusCode::FORBIDDEN, &e.to_string()),
+    let info = match state.get_viewer_stream_info(file_id) {
+        Ok(i) => i,
+        Err(ViewerFileError::NotFound) => return error_response(StatusCode::NOT_FOUND, "file not found"),
+        Err(ViewerFileError::Unreachable) => {
+            return error_response(StatusCode::NOT_FOUND, "source folder unreachable")
+        }
+        Err(ViewerFileError::Forbidden(msg)) => return error_response(StatusCode::FORBIDDEN, &msg),
+        Err(ViewerFileError::Io(msg)) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
         }
     };
-
-    if !loc.is_available || !loc.abs_path.exists() {
-        return error_response(StatusCode::NOT_FOUND, "source folder unreachable");
-    }
 
     let ddjvu_bin = state
         .config
@@ -231,8 +221,8 @@ fn serve_djvu_page(
         .clone();
 
     match state.djvu_cache.render_page_png(
-        &loc.abs_path,
-        &loc.blake3_hash,
+        &info.abs_path,
+        &info.blake3_hash,
         page_ord,
         dpi,
         ddjvu_bin.as_deref(),

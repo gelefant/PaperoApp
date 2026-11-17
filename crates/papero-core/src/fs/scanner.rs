@@ -1,8 +1,8 @@
 use crate::db::repos::archive::{apply_restored_archive, archive_if_manual, load_archive};
 use crate::db::repos::docs::{
     count_files_for_document, create_heuristic_document, enqueue_index_job, get_file_passage_ids,
-    insert_file_record, load_all_known_hashes, load_known_files_for_roots,
-    record_level1_identical_copy, update_file_location, KnownFileRecord, NewFileRecord,
+    insert_file_record, load_all_known_hashes, record_level1_identical_copy, update_file_location,
+    KnownFileRecord, NewFileRecord,
 };
 use crate::db::repos::roots::{
     count_files_in_root, list_source_roots, mark_root_scanned,
@@ -61,6 +61,10 @@ impl ScanControl {
 
     pub fn cancel(&self) {
         self.state.store(STATE_CANCELLED, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == STATE_PAUSED
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -152,25 +156,20 @@ pub fn rescan_sources(
         return Ok(summary);
     }
 
-    let reachable_ids: Vec<String> = reachable_roots.iter().map(|r| r.id.clone()).collect();
+    let reachable_set: HashSet<&str> = reachable_roots.iter().map(|r| r.id.as_str()).collect();
 
-    // Step 2: Preload known state in one query.
-    let (known_for_reachable, all_known_files) = {
+    // Step 2: Preload all known files in a single SQLite scan (deriving reachable subset in RAM).
+    let all_known_files = {
         let r = db.reader();
-        (
-            load_known_files_for_roots(&r, &reachable_ids)?,
-            load_all_known_hashes(&r)?,
-        )
+        load_all_known_hashes(&r)?
     };
 
-    let mut known_by_path: HashMap<(String, String), KnownFileRecord> =
-        HashMap::with_capacity(known_for_reachable.len());
-    for rec in known_for_reachable {
-        known_by_path.insert((rec.root_id.clone(), rec.rel_path.clone()), rec);
-    }
-
+    let mut known_by_path: HashMap<(String, String), KnownFileRecord> = HashMap::new();
     let mut known_by_hash: HashMap<String, Vec<KnownFileRecord>> = HashMap::new();
     for rec in all_known_files {
+        if reachable_set.contains(rec.root_id.as_str()) {
+            known_by_path.insert((rec.root_id.clone(), rec.rel_path.clone()), rec.clone());
+        }
         known_by_hash
             .entry(rec.blake3_hash.clone())
             .or_default()
@@ -268,17 +267,49 @@ pub fn rescan_sources(
         }
     }
 
-    // Step 4: Compute BLAKE3 only for new or stat-changed files (parallelized).
-    let hashed: Vec<HashedEntry> = to_hash
-        .into_par_iter()
-        .map(|entry| {
-            let res = compute_blake3_hex(&entry.full_path).map_err(|e| e.to_string());
-            HashedEntry {
-                entry,
-                blake3_hash: res,
-            }
+    // Step 4: Compute BLAKE3 only for new or stat-changed files on a bounded low-priority I/O pool.
+    let hashed: Vec<HashedEntry> = if to_hash.is_empty() {
+        Vec::new()
+    } else {
+        let io_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 4))
+            .unwrap_or(2);
+        let hash_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(io_threads)
+            .start_handler(|_| {
+                let _ = thread_priority::set_current_thread_priority(
+                    thread_priority::ThreadPriority::Min,
+                );
+            })
+            .build()
+            .map_err(|e| CoreError::Extract(format!("failed building hash pool: {e}")))?;
+
+        hash_pool.install(|| {
+            to_hash
+                .into_par_iter()
+                .map(|entry| {
+                    if ctrl.is_cancelled() {
+                        return HashedEntry {
+                            entry,
+                            blake3_hash: Err("cancelled".to_string()),
+                        };
+                    }
+                    let res = compute_blake3_hex(&entry.full_path).map_err(|e| e.to_string());
+                    HashedEntry {
+                        entry,
+                        blake3_hash: res,
+                    }
+                })
+                .collect()
         })
-        .collect();
+    };
+
+    if ctrl.is_cancelled() {
+        summary.status = "cancelled".to_string();
+        let w = db.writer();
+        finish_scan_run(&w, &summary)?;
+        return Ok(summary);
+    }
 
     // Step 5: Compute missing paths on REACHABLE roots only.
     let mut missing_by_path: HashMap<(String, String), KnownFileRecord> = HashMap::new();
@@ -531,9 +562,15 @@ pub fn rescan_sources(
 }
 
 pub fn compute_blake3_hex(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
+    // Use OS-mmapped BLAKE3 SIMD path for files >= 128 KB, falling back to 256 KB buffered reads.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() >= 128 * 1024 && hasher.update_mmap(path).is_ok() {
+            return Ok(hasher.finalize().to_hex().to_string());
+        }
+    }
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {

@@ -62,10 +62,31 @@ function ensureGlobalSelectionListeners(): void {
   document.addEventListener(
     'selectionchange',
     () => {
+      if (activeLayers.size === 0) return;
       const selection = document.getSelection();
       if (!selection || selection.rangeCount === 0) {
-        prevRange = null;
-        resetAllLayers();
+        if (prevRange !== null) {
+          prevRange = null;
+          resetAllLayers();
+        }
+        return;
+      }
+
+      // Fast exit when typing or selecting inside regular inputs/UI outside viewer text layers
+      const anchorNode = selection.anchorNode;
+      const focusNode = selection.focusNode;
+      const anchorParent =
+        anchorNode instanceof HTMLElement ? anchorNode : anchorNode?.parentElement ?? null;
+      const focusParent =
+        focusNode instanceof HTMLElement ? focusNode : focusNode?.parentElement ?? null;
+      if (
+        !anchorParent?.closest('.textLayer, .djvu-text-layer') &&
+        !focusParent?.closest('.textLayer, .djvu-text-layer')
+      ) {
+        if (prevRange !== null) {
+          prevRange = null;
+          resetAllLayers();
+        }
         return;
       }
 
@@ -109,8 +130,10 @@ function ensureGlobalSelectionListeners(): void {
         anchorEl.parentElement &&
         parentLayer.contains(anchorEl.parentElement)
       ) {
-        endDiv.style.width = parentLayer.style.width || `${parentLayer.clientWidth}px`;
-        endDiv.style.height = parentLayer.style.height || `${parentLayer.clientHeight}px`;
+        const w = parentLayer.style.width || `${parentLayer.clientWidth}px`;
+        const h = parentLayer.style.height || `${parentLayer.clientHeight}px`;
+        endDiv.style.width = w;
+        endDiv.style.height = h;
         anchorEl.parentElement.insertBefore(endDiv, modifyStart ? anchorEl : anchorEl.nextSibling);
       }
       prevRange = range.cloneRange();

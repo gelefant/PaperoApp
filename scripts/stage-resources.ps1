@@ -79,6 +79,46 @@ if (Test-Path (Join-Path $ResourcesDir "DirectML.dll")) {
     throw "DirectML.dll must never be bundled (would exceed 40 MB budget)"
 }
 
+# 2b. Microsoft Visual C++ Redistributable CRT DLLs required by prebuilt onnxruntime.dll
+# (`onnxruntime.dll` 1.23+ dynamically imports vcruntime140.dll, vcruntime140_1.dll,
+# msvcp140.dll, msvcp140_1.dll and requires VS 2022 17.10+ >= 14.40 std::mutex ABI).
+$VcRedistCandidates = @()
+if ($env:VCToolsRedistDir -and (Test-Path $env:VCToolsRedistDir)) {
+    $VcRedistCandidates += @(Get-ChildItem -Path (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | ForEach-Object { $_.FullName })
+}
+$VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path $VsWhere) {
+    $VsInstallPath = & $VsWhere -latest -products * -property installationPath 2>$null
+    if ($VsInstallPath -and (Test-Path (Join-Path $VsInstallPath "VC\Redist\MSVC"))) {
+        $VcRedistCandidates += @(Get-ChildItem -Path (Join-Path $VsInstallPath "VC\Redist\MSVC") -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | ForEach-Object {
+            Get-ChildItem -Path (Join-Path $_.FullName "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | ForEach-Object { $_.FullName }
+        })
+    }
+}
+if ($env:SystemRoot) {
+    $VcRedistCandidates += (Join-Path $env:SystemRoot "System32")
+}
+
+$RequiredVcDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll")
+$FoundVcDir = $null
+foreach ($cand in $VcRedistCandidates) {
+    if ($cand -and (Test-Path (Join-Path $cand "msvcp140.dll")) -and (Test-Path (Join-Path $cand "vcruntime140_1.dll"))) {
+        $FoundVcDir = $cand
+        break
+    }
+}
+if (-not $FoundVcDir) {
+    throw "Microsoft VC++ x64 Redistributable CRT DLLs (msvcp140.dll / vcruntime140_1.dll) not found."
+}
+Write-Host "    Using MSVC CRT runtime DLLs for onnxruntime from: $FoundVcDir"
+foreach ($dll in $RequiredVcDlls) {
+    $srcDll = Join-Path $FoundVcDir $dll
+    if (-not (Test-Path $srcDll)) {
+        throw "Required MSVC CRT DLL missing: $srcDll"
+    }
+    Copy-Item $srcDll (Join-Path $ResourcesDir $dll)
+}
+
 # 3. DjVuLibre standalone executables (ddjvu.exe, djvused.exe, djvutxt.exe) + non-system runtime DLLs
 $SearchDirs = @()
 if ($DjvuBinDir) { $SearchDirs += $DjvuBinDir }

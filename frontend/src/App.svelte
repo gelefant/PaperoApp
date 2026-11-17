@@ -66,10 +66,11 @@
   }
   const detachedBboxes = parseDetachedBboxes();
 
-  let roots = $state<SourceRoot[]>([]);
-  let documents = $state<DocumentListItem[]>([]);
-  let allDocuments = $state<DocumentListItem[]>([]);
+  let roots = $state.raw<SourceRoot[]>([]);
+  let documents = $state.raw<DocumentListItem[]>([]);
+  let allDocuments = $state.raw<DocumentListItem[]>([]);
   let query = $state('');
+  let committedContentQuery = $state('');
   let searchMode = $state<'content' | 'metadata'>('content');
   let metaFilter = $state<MetadataSearchFilter>({
     work_category: 'all',
@@ -77,23 +78,23 @@
     sort_by: 'updated',
     sort_dir: 'desc',
   });
-  let searchResults = $state<ContentSearchDocResult[] | null>(null);
+  let searchResults = $state.raw<ContentSearchDocResult[] | null>(null);
   let searchStats = $state<HybridSearchStats | null>(null);
   let mlStatus = $state<MlEnvironmentStatus | null>(null);
   let mlDownloadProgress = $state<DownloadProgressEvent | null>(null);
   let activeLeftView = $state<'library' | 'duplicates'>('library');
-  let duplicateGroups = $state<DuplicateGroupView[]>([]);
+  let duplicateGroups = $state.raw<DuplicateGroupView[]>([]);
   let scanningDedup = $state(false);
   let scanning = $state(false);
   let scanStatusText = $state('');
   let sidebarCollapsed = $state(false);
-  let mscTree = $state<MscTreeNode[]>([]);
-  let clusters = $state<TopicClusterView[]>([]);
-  let tags = $state<TagSummary[]>([]);
+  let mscTree = $state.raw<MscTreeNode[]>([]);
+  let clusters = $state.raw<TopicClusterView[]>([]);
+  let tags = $state.raw<TagSummary[]>([]);
   let knnBusy = $state(false);
   let clusteringBusy = $state(false);
   let settings = $state<UiSettingsPayload | null>(null);
-  let presets = $state<ExternalReaderPreset[]>([]);
+  let presets = $state.raw<ExternalReaderPreset[]>([]);
   let tabs = $state<ViewerTab[]>([]);
   let activeTabId = $state<string | null>(null);
   let contextTarget = $state<ContextTarget | null>(null);
@@ -116,6 +117,11 @@
   let lang = $derived(normalizeLang(settings?.ui_language));
   let unlistenFs: UnlistenFn | null = null;
   let unlistenBackup: UnlistenFn | null = null;
+  let appDestroyed = false;
+  let fsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let docsReqSeq = 0;
+  let searchReqSeq = 0;
+  let inspectorReqSeq = 0;
 
   $effect(() => {
     document.documentElement.dataset.theme = settings?.ui_theme ?? 'system';
@@ -138,10 +144,34 @@
   );
 
   let selectedDocId = $state<number | null>(null);
+
+  const catalogStats = $derived.by(() => {
+    const byDocId = new Map<number, DocumentListItem>();
+    const byFileId = new Map<number, DocumentListItem>();
+    const verifiedDocIds = new Set<number>();
+    let unverifiedCount = 0;
+    let unresolvedCount = 0;
+
+    for (const d of allDocuments) {
+      byDocId.set(d.document_id, d);
+      byFileId.set(d.file_id, d);
+      if (d.metadata_verified) {
+        verifiedDocIds.add(d.document_id);
+      } else {
+        unverifiedCount++;
+        if (!d.metadata_source || d.metadata_source === 'heuristic') {
+          unresolvedCount++;
+        }
+      }
+    }
+
+    return { byDocId, byFileId, verifiedDocIds, unverifiedCount, unresolvedCount };
+  });
+
   const selectedFileId = $derived(
     selectedDocId !== null
-      ? ((documents.find((d) => d.document_id === selectedDocId) ??
-          allDocuments.find((d) => d.document_id === selectedDocId))?.file_id ?? null)
+      ? ((catalogStats.byDocId.get(selectedDocId) ??
+          documents.find((d) => d.document_id === selectedDocId))?.file_id ?? null)
       : null
   );
   let inspectorOpen = $state(true);
@@ -151,9 +181,7 @@
   let fetchingBulkMeta = $state(false);
   let fetchStatusMsg = $state('');
 
-  const unverifiedDocsCount = $derived(
-    allDocuments.filter((d) => !d.metadata_verified).length
-  );
+  const unverifiedDocsCount = $derived(catalogStats.unverifiedCount);
 
   const hasNextUnverified = $derived(
     documents.some((d) => d.document_id !== selectedDocId && !d.metadata_verified)
@@ -162,9 +190,7 @@
   const displayedSearchResults = $derived.by(() => {
     if (searchResults === null) return null;
     if (activeVerifiedFilter === 'all') return searchResults;
-    const verifiedSet = new Set(
-      allDocuments.filter((d) => Boolean(d.metadata_verified)).map((d) => d.document_id)
-    );
+    const verifiedSet = catalogStats.verifiedDocIds;
     return searchResults.filter((r) =>
       activeVerifiedFilter === 'verified'
         ? verifiedSet.has(r.document_id)
@@ -172,11 +198,7 @@
     );
   });
 
-  const unresolvedMetaCount = $derived(
-    allDocuments.filter(
-      (d) => !d.metadata_verified && (!d.metadata_source || d.metadata_source === 'heuristic')
-    ).length
-  );
+  const unresolvedMetaCount = $derived(catalogStats.unresolvedCount);
 
   const pendingDuplicatesCount = $derived(
     duplicateGroups.filter((g) => g.status === 'pending' || g.status === 'info_merged').length
@@ -214,21 +236,38 @@
     );
   }
 
-  async function refreshDocuments() {
-    if (hasListFilterOrCustomSort()) {
-      const [filtered, all] = await Promise.all([
-        api.searchMetadata({
+  async function refreshDocuments(reloadAll = false) {
+    const seq = ++docsReqSeq;
+    const needAll = reloadAll || allDocuments.length === 0;
+    const filteredMode = hasListFilterOrCustomSort();
+
+    if (filteredMode) {
+      if (needAll) {
+        const [filtered, all] = await Promise.all([
+          api.searchMetadata({
+            ...metaFilter,
+            text: searchMode === 'metadata' ? query.trim() || null : null,
+          }),
+          api.listDocuments(),
+        ]);
+        if (seq !== docsReqSeq) return;
+        documents = filtered;
+        allDocuments = all;
+      } else {
+        const filtered = await api.searchMetadata({
           ...metaFilter,
           text: searchMode === 'metadata' ? query.trim() || null : null,
-        }),
-        api.listDocuments(),
-      ]);
-      documents = filtered;
-      allDocuments = all;
-    } else {
+        });
+        if (seq !== docsReqSeq) return;
+        documents = filtered;
+      }
+    } else if (needAll) {
       const all = await api.listDocuments();
+      if (seq !== docsReqSeq) return;
       documents = all;
       allDocuments = all;
+    } else {
+      documents = allDocuments;
     }
   }
 
@@ -275,12 +314,12 @@
       metaFilter = nextFilter;
     }
 
-    await refreshDocuments();
+    await refreshDocuments(true);
     const allLibraryDocs = allDocuments;
 
     // Close viewer tabs pointing to files that were removed
     if (tabs.length > 0) {
-      const validFileIds = new Set(allLibraryDocs.map((d) => d.file_id));
+      const validFileIds = catalogStats.byFileId;
       const remainingTabs = tabs.filter((t) => validFileIds.has(t.fileId));
       if (remainingTabs.length !== tabs.length) {
         tabs = remainingTabs;
@@ -291,7 +330,7 @@
     }
 
     if (selectedDocId !== null) {
-      if (allLibraryDocs.some((d) => d.document_id === selectedDocId)) {
+      if (catalogStats.byDocId.has(selectedDocId) || allLibraryDocs.some((d) => d.document_id === selectedDocId)) {
         await loadInspectorMetadata(selectedDocId);
       } else {
         selectedDocId = null;
@@ -325,7 +364,7 @@
     try {
       const rep = await api.runKnnMscProposals(7);
       scanStatusText = `k-NN MSC: ${rep.proposed_count} proposte create (su ${rep.unlabeled_docs} senza MSC, ${rep.labeled_docs} confermati).`;
-      await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+      await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
     } catch (e) {
       scanStatusText = `Errore k-NN MSC: ${String(e)}`;
     } finally {
@@ -335,7 +374,7 @@
 
   async function handleConfirmMsc(documentId: number, mscCode: string | null) {
     await api.confirmMscClassification(documentId, mscCode);
-    await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
     if (selectedDocId === documentId) {
       await loadInspectorMetadata(documentId);
     }
@@ -343,7 +382,7 @@
 
   async function handleRejectMsc(documentId: number) {
     await api.rejectMscProposal(documentId);
-    await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
     if (selectedDocId === documentId) {
       await loadInspectorMetadata(documentId);
     }
@@ -354,7 +393,7 @@
     try {
       const rep = await api.runTopicClustering(null);
       scanStatusText = `Gruppi tematici: ${rep.clusters_created} cluster su ${rep.documents_clustered} documenti (silhouette ${rep.silhouette_score.toFixed(2)}).`;
-      await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+      await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
     } catch (e) {
       scanStatusText = `Errore clustering: ${String(e)}`;
     } finally {
@@ -369,17 +408,17 @@
 
   async function handleSetDocCluster(documentId: number, clusterId: number) {
     await api.setDocumentCluster(documentId, clusterId);
-    await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
   }
 
   async function handleRemoveDocCluster(documentId: number, clusterId: number) {
     await api.removeDocumentCluster(documentId, clusterId);
-    await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
   }
 
   async function handleAddDocTag(documentId: number, tagName: string) {
     await api.addDocumentTag(documentId, tagName);
-    await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
     if (selectedDocId === documentId) {
       await loadInspectorMetadata(documentId);
     }
@@ -387,20 +426,25 @@
 
   async function handleRemoveDocTag(documentId: number, tagName: string) {
     await api.removeDocumentTag(documentId, tagName);
-    await Promise.all([refreshDocuments(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
     if (selectedDocId === documentId) {
       await loadInspectorMetadata(documentId);
     }
   }
 
   async function loadInspectorMetadata(docId: number) {
+    const seq = ++inspectorReqSeq;
     selectedDocId = docId;
     loadingMeta = true;
     fetchStatusMsg = '';
     try {
-      selectedMeta = await api.getDocumentMetadata(docId);
+      const meta = await api.getDocumentMetadata(docId);
+      if (seq !== inspectorReqSeq) return;
+      selectedMeta = meta;
     } finally {
-      loadingMeta = false;
+      if (seq === inspectorReqSeq) {
+        loadingMeta = false;
+      }
     }
   }
 
@@ -477,10 +521,23 @@
       wizardOpen = true;
     }
     await refreshLibrary();
-    unlistenFs = await listen('library-fs-updated', () => {
-      refreshLibrary();
+    if (appDestroyed) return;
+    const unFs = await listen('library-fs-updated', () => {
+      if (appDestroyed) return;
+      if (fsRefreshTimer) clearTimeout(fsRefreshTimer);
+      fsRefreshTimer = setTimeout(() => {
+        fsRefreshTimer = null;
+        if (!appDestroyed) void refreshLibrary();
+      }, 250);
     });
-    unlistenBackup = await listen<BackupReport>('papero://backup-updated', async (ev) => {
+    if (appDestroyed) {
+      unFs();
+      return;
+    }
+    unlistenFs = unFs;
+
+    const unBk = await listen<BackupReport>('papero://backup-updated', async (ev) => {
+      if (appDestroyed) return;
       try {
         settings = await api.getUiSettings();
         const rep = ev.payload;
@@ -496,9 +553,19 @@
         // Ignore transient refresh race
       }
     });
+    if (appDestroyed) {
+      unBk();
+      return;
+    }
+    unlistenBackup = unBk;
   });
 
   onDestroy(() => {
+    appDestroyed = true;
+    if (fsRefreshTimer) {
+      clearTimeout(fsRefreshTimer);
+      fsRefreshTimer = null;
+    }
     unlistenFs?.();
     unlistenBackup?.();
   });
@@ -596,6 +663,7 @@
   }
 
   async function handleSearch(q: string) {
+    const seq = ++searchReqSeq;
     llmAnswer = null;
     llmError = '';
     llmPreview = null;
@@ -608,6 +676,7 @@
     }
     const trimmed = q.trim();
     if (!trimmed) {
+      committedContentQuery = '';
       searchResults = null;
       searchStats = null;
       return;
@@ -620,6 +689,8 @@
       null,
       activeWorkCategory
     );
+    if (seq !== searchReqSeq) return;
+    committedContentQuery = trimmed;
     searchResults = resp.results;
     searchStats = resp.stats;
     await refreshLlmPreview();
@@ -688,7 +759,10 @@
     if (selectedDocId === documentId) {
       selectedMeta = updated;
     }
-    await refreshDocuments();
+    allDocuments = allDocuments.map((d) =>
+      d.document_id === documentId ? { ...d, metadata_verified: verified } : d
+    );
+    await refreshDocuments(false);
 
     const shouldAdvance =
       verified &&
@@ -1082,7 +1156,7 @@
   async function handleSaveDocMetadata(edit: ManualMetadataEdit, lockedFields?: string[]) {
     selectedMeta = await api.saveDocumentMetadata(edit, lockedFields);
     await Promise.all([
-      refreshDocuments(),
+      refreshDocuments(true),
       refreshDuplicates(),
       refreshTaxonomy(),
       refreshLlmPreview(),
@@ -1159,7 +1233,7 @@
         fetchStatusMsg = 'Nessuna corrispondenza trovata con i campi inseriti. Prova ad aggiungere o precisare Titolo/Autore.';
       }
       await Promise.all([
-        refreshDocuments(),
+        refreshDocuments(true),
         refreshDuplicates(),
         refreshTaxonomy(),
         refreshLlmPreview(),
@@ -1191,7 +1265,7 @@
       }
       selectedMeta = await api.getDocumentMetadata(documentId);
       fetchStatusMsg = msg;
-      await Promise.all([refreshDocuments(), refreshDuplicates(), refreshTaxonomy()]);
+      await Promise.all([refreshDocuments(true), refreshDuplicates(), refreshTaxonomy()]);
       return outcome;
     } catch (e) {
       fetchStatusMsg = `Errore ricerca metadati: ${e}`;
@@ -1204,6 +1278,8 @@
     if (fetchingBulkMeta) return;
     fetchingBulkMeta = true;
     let lastRefreshUpdated = 0;
+    let lastRefreshAt = 0;
+    let refreshInFlight = false;
     scanStatusText =
       lang === 'en'
         ? 'Starting bulk bibliographic metadata lookup…'
@@ -1215,9 +1291,18 @@
             lang === 'en'
               ? `Metadata (${ev.current}/${ev.total}): "${ev.current_title}" — ${ev.updated} updated, ${ev.candidates} pending review…`
               : `Metadati (${ev.current}/${ev.total}): «${ev.current_title}» — ${ev.updated} aggiornati, ${ev.candidates} da confermare…`;
-          if (ev.updated - lastRefreshUpdated >= 3) {
+          const now = Date.now();
+          if (
+            !refreshInFlight &&
+            ev.updated - lastRefreshUpdated >= 5 &&
+            now - lastRefreshAt >= 2500
+          ) {
             lastRefreshUpdated = ev.updated;
-            void refreshDocuments();
+            lastRefreshAt = now;
+            refreshInFlight = true;
+            void refreshDocuments(true).finally(() => {
+              refreshInFlight = false;
+            });
           }
         }
       }, true);
@@ -1247,7 +1332,7 @@
   async function handleConfirmCandidate(documentId: number, candidateId: number) {
     selectedMeta = await api.confirmCandidate(documentId, candidateId);
     fetchStatusMsg = 'Candidato confermato e applicato.';
-    await Promise.all([refreshDocuments(), refreshDuplicates(), refreshTaxonomy()]);
+    await Promise.all([refreshDocuments(true), refreshDuplicates(), refreshTaxonomy()]);
   }
 
   async function handleDismissCandidate(candidateId: number) {
@@ -1386,7 +1471,9 @@
       {inspectorOpen}
       onSearch={handleSearch}
       onClearSearch={async () => {
+        searchReqSeq++;
         query = '';
+        committedContentQuery = '';
         searchResults = null;
         searchStats = null;
         await refreshDocuments();
@@ -1499,7 +1586,7 @@
         {:else if displayedSearchResults !== null}
           <ContentResults
             {lang}
-            {query}
+            query={committedContentQuery || query}
             results={displayedSearchResults}
             {searchStats}
             workCategory={activeWorkCategory}
@@ -1610,9 +1697,7 @@
             onRemoveTag={handleRemoveDocTag}
             onOpenInViewer={() => {
               if (selectedFileId !== null && selectedMeta) {
-                const doc =
-                  documents.find((d) => d.file_id === selectedFileId) ??
-                  allDocuments.find((d) => d.file_id === selectedFileId);
+                const doc = catalogStats.byFileId.get(selectedFileId);
                 openInViewer(selectedFileId, selectedMeta.title, doc?.format ?? 'pdf', 1);
               }
             }}
@@ -1628,9 +1713,7 @@
       {presets}
       onClose={() => (contextTarget = null)}
       onOpenInternal={(fid, page) => {
-        const doc =
-          documents.find((d) => d.file_id === fid) ??
-          allDocuments.find((d) => d.file_id === fid);
+        const doc = catalogStats.byFileId.get(fid);
         openInViewer(fid, doc?.title ?? `File #${fid}`, doc?.format ?? 'pdf', page ?? 1);
       }}
       onOpenExternal={(fid, page, tpl) => api.openFileExternal(fid, page, tpl)}

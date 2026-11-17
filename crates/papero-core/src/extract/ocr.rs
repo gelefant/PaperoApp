@@ -1,4 +1,4 @@
-use crate::config::{resolve_external_tool, AppConfig};
+use crate::config::{configure_background_command, resolve_external_tool, AppConfig};
 use crate::db::repos::docs::{
     enqueue_index_job, get_file_location, get_file_non_alt_passage_ids,
     replace_file_ocr_pages_and_passages, set_file_ocr_status, FilePageInsert, PassageInsert,
@@ -7,7 +7,7 @@ use crate::db::Database;
 use crate::dedup::{compute_minhash, pack_minhash};
 use crate::error::{CoreError, Result};
 use crate::extract::chunker::chunk_document;
-use crate::extract::pdf::bind_pdfium;
+use crate::extract::pdf::lock_cached_pdfium;
 use crate::extract::types::{
     ExtractedDocument, ExtractedPage, ExtractedSpan, NormalizedRect,
 };
@@ -78,7 +78,9 @@ pub fn detect_tesseract(
 ) -> OcrEnvironmentStatus {
     let bin = resolve_external_tool(explicit_bin, "tesseract");
 
-    let ver_out = match Command::new(&bin)
+    let mut ver_cmd = Command::new(&bin);
+    configure_background_command(&mut ver_cmd);
+    let ver_out = match ver_cmd
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -134,7 +136,9 @@ pub fn detect_tesseract(
 }
 
 fn query_installed_languages(bin: &str) -> Vec<String> {
-    let Ok(out) = Command::new(bin)
+    let mut cmd = Command::new(bin);
+    configure_background_command(&mut cmd);
+    let Ok(out) = cmd
         .arg("--list-langs")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -650,55 +654,73 @@ fn run_ocr_pdf<F>(
 where
     F: FnMut(OcrProgressEvent),
 {
-    let pdfium = bind_pdfium(pdfium_lib_path)?;
-    let doc = pdfium
-        .load_pdf_from_file(pdf_path, None)
-        .map_err(|e| CoreError::CorruptFile(format!("{}: {e:?}", pdf_path.display())))?;
-
-    let total_pages = doc.pages().len() as u32;
+    let total_pages = {
+        let pdfium = lock_cached_pdfium(pdfium_lib_path)?;
+        let doc = pdfium
+            .load_pdf_from_file(pdf_path, None)
+            .map_err(|e| CoreError::CorruptFile(format!("{}: {e:?}", pdf_path.display())))?;
+        doc.pages().len() as u32
+    };
     let mut pages = Vec::with_capacity(total_pages as usize);
 
-    for (idx, page) in doc.pages().iter().enumerate() {
+    for batch_start in (0..total_pages).step_by(4) {
         if let Some(ctrl) = control {
             ctrl.wait_if_paused()?;
         }
-        let page_ord = (idx as u32) + 1;
-        progress_cb(OcrProgressEvent {
-            file_id,
-            page_ord,
-            total_pages,
-        });
+        let batch_end = (batch_start + 4).min(total_pages);
+        let mut rendered_batch = Vec::with_capacity((batch_end - batch_start) as usize);
+        {
+            let pdfium = lock_cached_pdfium(pdfium_lib_path)?;
+            let doc = pdfium
+                .load_pdf_from_file(pdf_path, None)
+                .map_err(|e| CoreError::CorruptFile(format!("{}: {e:?}", pdf_path.display())))?;
+            for idx in batch_start..batch_end {
+                let page_ord = idx + 1;
+                let page = doc.pages().get(idx as u16).map_err(|e| {
+                    CoreError::Extract(format!("PDFium OCR get page p.{page_ord}: {e:?}"))
+                })?;
+                let width_pts = page.width().value;
+                let height_pts = page.height().value;
+                let printed_label = page
+                    .label()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let target_w = ((width_pts / 72.0) * (dpi as f32))
+                    .round()
+                    .clamp(300.0, 6000.0) as Pixels;
+                let bitmap = page
+                    .render_with_config(&PdfRenderConfig::new().set_target_width(target_w))
+                    .map_err(|e| {
+                        CoreError::Extract(format!("PDFium OCR raster p.{page_ord}: {e:?}"))
+                    })?;
+                let bw = bitmap.width() as u32;
+                let bh = bitmap.height() as u32;
+                let rgba = bitmap.as_rgba_bytes();
+                let tmp_png_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.png"));
+                let guard = TempOcrFile::new(tmp_png_path.clone());
+                write_rgba_png(&tmp_png_path, bw, bh, &rgba)?;
+                rendered_batch.push((page_ord, width_pts, height_pts, printed_label, tmp_png_path, guard));
+            }
+        }
 
-        let width_pts = page.width().value;
-        let height_pts = page.height().value;
-        let printed_label = page
-            .label()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        let target_w = ((width_pts / 72.0) * (dpi as f32))
-            .round()
-            .clamp(300.0, 6000.0) as Pixels;
-        let bitmap = page
-            .render_with_config(&PdfRenderConfig::new().set_target_width(target_w))
-            .map_err(|e| CoreError::Extract(format!("PDFium OCR raster p.{page_ord}: {e:?}")))?;
-
-        let bw = bitmap.width() as u32;
-        let bh = bitmap.height() as u32;
-        let rgba = bitmap.as_rgba_bytes();
-
-        let tmp_png_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.png"));
-        let _guard = TempOcrFile::new(tmp_png_path.clone());
-        write_rgba_png(&tmp_png_path, bw, bh, &rgba)?;
-
-        let tsv = invoke_tesseract_tsv(tesseract_bin, &tmp_png_path, lang_arg, dpi)?;
-        pages.push(parse_tesseract_tsv(
-            &tsv,
-            page_ord,
-            width_pts,
-            height_pts,
-            printed_label,
-        )?);
+        for (page_ord, width_pts, height_pts, printed_label, tmp_png_path, _guard) in rendered_batch {
+            if let Some(ctrl) = control {
+                ctrl.wait_if_paused()?;
+            }
+            progress_cb(OcrProgressEvent {
+                file_id,
+                page_ord,
+                total_pages,
+            });
+            let tsv = invoke_tesseract_tsv(tesseract_bin, &tmp_png_path, lang_arg, dpi)?;
+            pages.push(parse_tesseract_tsv(
+                &tsv,
+                page_ord,
+                width_pts,
+                height_pts,
+                printed_label,
+            )?);
+        }
     }
 
     Ok(pages)
@@ -723,7 +745,9 @@ where
     let djvused = resolve_external_tool(djvused_bin, "djvused");
     let ddjvu = resolve_external_tool(ddjvu_bin, "ddjvu");
 
-    let count_out = Command::new(&djvused)
+    let mut count_cmd = Command::new(&djvused);
+    configure_background_command(&mut count_cmd);
+    let count_out = count_cmd
         .arg(djvu_path)
         .arg("-u")
         .arg("-e")
@@ -760,7 +784,9 @@ where
         let tmp_pnm_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.pnm"));
         let _guard = TempOcrFile::new(tmp_pnm_path.clone());
 
-        let ddjvu_out = Command::new(&ddjvu)
+        let mut ddjvu_cmd = Command::new(&ddjvu);
+        configure_background_command(&mut ddjvu_cmd);
+        let ddjvu_out = ddjvu_cmd
             .arg("-format=pnm")
             .arg(format!("-page={page_ord}"))
             .arg(format!("-scale={dpi}"))
@@ -809,6 +835,7 @@ fn invoke_tesseract_tsv(
     dpi: u32,
 ) -> Result<String> {
     let mut cmd = Command::new(tesseract_bin);
+    configure_background_command(&mut cmd);
     cmd.arg(image_path).arg("stdout");
     if !lang_arg.trim().is_empty() {
         cmd.arg("-l").arg(lang_arg);

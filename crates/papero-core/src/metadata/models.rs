@@ -473,13 +473,27 @@ pub fn clean_author_surname(raw: &str) -> Option<String> {
         return None;
     }
 
-    let candidate = cleaned.split_whitespace().last().unwrap_or("");
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    let candidate = words.last().copied().unwrap_or("");
     let trimmed: String = candidate
         .chars()
         .filter(|c| c.is_alphabetic() || *c == '-' || *c == '\'')
         .collect();
     let trimmed = trimmed.trim_matches(['-', '\'']);
     if trimmed.chars().count() >= 2 {
+        if words.len() >= 2 {
+            let prev_raw = words[words.len() - 2];
+            let prev_clean: String = prev_raw
+                .chars()
+                .filter(|c| c.is_alphabetic() || *c == '\'')
+                .collect();
+            if matches!(
+                prev_clean.to_ascii_lowercase().as_str(),
+                "de" | "del" | "della" | "di" | "da" | "du" | "van" | "von" | "der" | "den" | "la" | "le"
+            ) {
+                return Some(format!("{prev_clean} {trimmed}"));
+            }
+        }
         Some(trimmed.to_string())
     } else {
         None

@@ -73,6 +73,12 @@ impl CrossrefClient {
             }
         }
 
+        if let Some(isbn) = ids.isbn.as_deref() {
+            if let Some(hit) = self.lookup_isbn(db, isbn).await? {
+                return Ok(vec![hit]);
+            }
+        }
+
         let surname = ids
             .heuristic_first_author
             .as_deref()
@@ -246,6 +252,90 @@ impl CrossrefClient {
                     record: rec,
                 }));
             }
+        }
+        Ok(None)
+    }
+
+    /// Resolves a monograph/book by normalized ISBN via Crossref `filter=isbn:<isbn>`.
+    /// Prefers full book/monograph records over individual book-chapter records sharing the ISBN.
+    pub async fn lookup_isbn(
+        &self,
+        db: &Database,
+        isbn: &str,
+    ) -> Result<Option<CandidateMatch>> {
+        let clean_isbn: String = isbn
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == 'X' || *c == 'x')
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        if clean_isbn.len() != 10 && clean_isbn.len() != 13 {
+            return Ok(None);
+        }
+        let cache_key = format!("isbn:{clean_isbn}");
+        let body = if let Some(c) = load_http_cache(db, "crossref", &cache_key)? {
+            if c.status_code >= 400 {
+                return Ok(None);
+            }
+            c.body
+        } else {
+            self.list_limiter.acquire().await;
+            let filter_val = format!("isbn:{clean_isbn}");
+            let mut query_pairs = vec![("filter", filter_val.as_str()), ("rows", "5")];
+            if let Some(mail) = &self.polite_email {
+                query_pairs.push(("mailto", mail.as_str()));
+            }
+            let req_url = url::Url::parse_with_params(CROSSREF_API, &query_pairs)
+                .map_err(|e| CoreError::Network(format!("crossref isbn url: {e}")))?;
+            let Ok(resp) = self.http.get(req_url).send().await else {
+                return Ok(None);
+            };
+            let hdrs = resp.headers().clone();
+            let limit_h = hdrs.get("x-rate-limit-limit").and_then(|v| v.to_str().ok());
+            let int_h = hdrs.get("x-rate-limit-interval").and_then(|v| v.to_str().ok());
+            let type_h = hdrs.get("x-rate-limit-type").and_then(|v| v.to_str().ok());
+            self.list_limiter
+                .adapt_from_headers(limit_h, int_h, type_h)
+                .await;
+            let status = resp.status().as_u16();
+            let Ok(text) = resp.text().await else {
+                return Ok(None);
+            };
+            if status < 400 || status == 404 {
+                store_http_cache(db, "crossref", &cache_key, status, &text)?;
+            }
+            if status >= 400 {
+                return Ok(None);
+            }
+            text
+        };
+
+        let Ok(v) = serde_json::from_str::<Value>(&body) else {
+            return Ok(None);
+        };
+        let Some(items) = v
+            .get("message")
+            .and_then(|m| m.get("items"))
+            .and_then(Value::as_array)
+        else {
+            return Ok(None);
+        };
+
+        let mut parsed_books: Vec<BibliographicRecord> = items
+            .iter()
+            .filter_map(parse_crossref_work)
+            .filter(|rec| rec.work_type == WorkType::Book)
+            .collect();
+        // Prefer book record with explicit authors over editor-only/anonymous metadata if multiple exist
+        parsed_books.sort_by_key(|r| std::cmp::Reverse(r.authors.len()));
+        if let Some(mut rec) = parsed_books.into_iter().next() {
+            if rec.isbn.is_none() {
+                rec.isbn = Some(clean_isbn);
+            }
+            return Ok(Some(CandidateMatch {
+                score: 0.99,
+                source: "crossref".to_string(),
+                record: rec,
+            }));
         }
         Ok(None)
     }

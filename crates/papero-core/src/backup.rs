@@ -278,6 +278,7 @@ pub fn create_backup_bundle_with_bm25(
     bm25: Option<&Bm25Index>,
     dest_file: &Path,
 ) -> Result<BackupReport> {
+    let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
     if let Some(parent) = dest_file.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -292,12 +293,22 @@ pub fn create_backup_bundle_with_bm25(
     let _cleanup = StagingCleanup(Some(tmp_dir.clone()));
 
     let snap_db_path = tmp_dir.join("papero.db");
-    {
+    if paths.db_path.exists() {
+        // Open a dedicated read-only connection so copying a large DB never holds a UI reader-pool mutex.
+        let src_conn = Connection::open_with_flags(
+            &paths.db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let _ = src_conn.busy_timeout(Duration::from_secs(10));
+        let mut dst_conn = Connection::open(&snap_db_path)?;
+        let backup = Backup::new(&src_conn, &mut dst_conn)?;
+        backup.run_to_completion(1024, Duration::from_millis(2), None)?;
+    } else {
         let src_conn = db.reader();
         let _ = src_conn.busy_timeout(Duration::from_secs(10));
         let mut dst_conn = Connection::open(&snap_db_path)?;
         let backup = Backup::new(&src_conn, &mut dst_conn)?;
-        backup.run_to_completion(4096, Duration::from_millis(1), None)?;
+        backup.run_to_completion(1024, Duration::from_millis(2), None)?;
     }
 
     let mut cfg = AppConfig::load_or_default(&paths.config_path)?;

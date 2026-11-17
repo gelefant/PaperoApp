@@ -2,6 +2,7 @@ use papero_core::backup::{
     apply_pending_restore_if_ready, create_backup_bundle_with_bm25, BackupReport,
 };
 use papero_core::config::{init_logging, AppConfig, AppPaths, WorkerGuard};
+use papero_core::db::repos::docs::{get_file_stream_info, FileStreamInfo};
 use papero_core::db::repos::roots::{
     list_source_roots, prune_orphaned_catalog_entities, reconcile_source_roots_with_local_map,
 };
@@ -15,12 +16,79 @@ use papero_core::index::worker::run_extract_bm25_queue;
 use papero_core::metadata::WaterfallClients;
 use papero_core::ml::{LazyModelSlot, ModelProfile, OnnxEmbedder, OnnxReranker};
 use papero_core::viewer::djvu_cache::DjvuCache;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Notify;
+
+const VIEWER_FILE_CACHE_CAPACITY: usize = 8;
+
+#[derive(Clone)]
+pub struct CachedViewerFile {
+    pub file: Arc<std::fs::File>,
+    pub len: u64,
+}
+
+#[derive(Debug)]
+pub enum ViewerFileError {
+    NotFound,
+    Unreachable,
+    Forbidden(String),
+    Io(String),
+}
+
+/// Thread-safe positional file read (`pread` on Unix, `seek_read` on Windows) so concurrent
+/// PDF.js range requests share one cached `Arc<File>` without reopening or locking SQLite.
+pub fn read_file_range_at(
+    file: &std::fs::File,
+    start: u64,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        let offset = start + filled as u64;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(file, &mut buf[filled..], offset)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(file, &mut buf[filled..], offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF while reading PDF byte range",
+            ));
+        }
+        filled += n;
+    }
+    Ok(buf)
+}
+
+/// RAII guard that pauses background vector embedding while an interactive scan or bulk metadata
+/// synchronization is running, automatically resuming when the last foreground batch finishes.
+pub struct EmbedPauseGuard(Arc<AppState>);
+
+impl Drop for EmbedPauseGuard {
+    fn drop(&mut self) {
+        if self.0.embed_pause_depth.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.current_embed_control().resume();
+        }
+    }
+}
+
+/// RAII guard marking `metadata_batch_active` while a metadata batch loop runs.
+pub struct MetadataBatchActiveGuard(Arc<AppState>);
+
+impl Drop for MetadataBatchActiveGuard {
+    fn drop(&mut self) {
+        self.0.metadata_batch_active.store(false, Ordering::SeqCst);
+    }
+}
 
 pub struct AppState {
     pub paths: AppPaths,
@@ -32,9 +100,18 @@ pub struct AppState {
     pub embedder_slot: Arc<LazyModelSlot<OnnxEmbedder>>,
     pub reranker_slot: Arc<LazyModelSlot<OnnxReranker>>,
     pub djvu_cache: Arc<DjvuCache>,
+    pub viewer_file_cache: Mutex<VecDeque<(i64, CachedViewerFile)>>,
     pub clients: RwLock<Arc<WaterfallClients>>,
     pub scan_control: Mutex<Option<Arc<ScanControl>>>,
+    pub metadata_run_mutex: Arc<tokio::sync::Mutex<()>>,
     pub metadata_batch_cancel: Arc<AtomicBool>,
+    pub bg_metadata_cancel: Arc<AtomicBool>,
+    pub metadata_cancel_notify: Arc<Notify>,
+    pub metadata_batch_active: Arc<AtomicBool>,
+    pub embed_control: Mutex<Arc<ScanControl>>,
+    pub embed_pause_depth: AtomicUsize,
+    pub embed_worker_running: Arc<AtomicBool>,
+    pub embed_worker_reschedule: Arc<AtomicBool>,
     pub watcher: Mutex<Option<RootWatcher>>,
     pub watcher_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub app_handle: Mutex<Option<AppHandle>>,
@@ -57,7 +134,7 @@ impl AppState {
             tracing::info!("applied pending backup restore on startup");
         }
         let config = AppConfig::load_or_default(&paths.config_path)?;
-        let db = Arc::new(Database::open(&paths.db_path, 4)?);
+        let db = Arc::new(Database::open(&paths.db_path, 8)?);
         let bm25 = Arc::new(Bm25Index::open_or_create(&paths.tantivy_dir)?);
         {
             let w = db.writer();
@@ -94,9 +171,18 @@ impl AppState {
             embedder_slot: Arc::new(LazyModelSlot::new()),
             reranker_slot: Arc::new(LazyModelSlot::new()),
             djvu_cache,
+            viewer_file_cache: Mutex::new(VecDeque::with_capacity(VIEWER_FILE_CACHE_CAPACITY)),
             clients: RwLock::new(clients),
             scan_control: Mutex::new(None),
+            metadata_run_mutex: Arc::new(tokio::sync::Mutex::new(())),
             metadata_batch_cancel: Arc::new(AtomicBool::new(false)),
+            bg_metadata_cancel: Arc::new(AtomicBool::new(false)),
+            metadata_cancel_notify: Arc::new(Notify::new()),
+            metadata_batch_active: Arc::new(AtomicBool::new(false)),
+            embed_control: Mutex::new(Arc::new(ScanControl::new())),
+            embed_pause_depth: AtomicUsize::new(0),
+            embed_worker_running: Arc::new(AtomicBool::new(false)),
+            embed_worker_reschedule: Arc::new(AtomicBool::new(false)),
             watcher: Mutex::new(None),
             watcher_task: Mutex::new(None),
             app_handle: Mutex::new(None),
@@ -107,9 +193,61 @@ impl AppState {
         })
     }
 
+    pub fn current_embed_control(&self) -> Arc<ScanControl> {
+        self.embed_control
+            .lock()
+            .expect("embed_control poisoned")
+            .clone()
+    }
+
+    pub fn reset_embed_control(&self) -> Arc<ScanControl> {
+        let next = Arc::new(ScanControl::new());
+        if self.embed_pause_depth.load(Ordering::SeqCst) > 0 {
+            next.pause();
+        }
+        let mut slot = self.embed_control.lock().expect("embed_control poisoned");
+        *slot = Arc::clone(&next);
+        next
+    }
+
+    pub fn cancel_embed_worker(&self) {
+        self.embed_worker_reschedule.store(false, Ordering::SeqCst);
+        let mut slot = self.embed_control.lock().expect("embed_control poisoned");
+        slot.cancel();
+        let next = Arc::new(ScanControl::new());
+        if self.embed_pause_depth.load(Ordering::SeqCst) > 0 {
+            next.pause();
+        }
+        *slot = next;
+    }
+
+    pub fn pause_embed_for_batch(state: &Arc<Self>) -> EmbedPauseGuard {
+        if state.embed_pause_depth.fetch_add(1, Ordering::SeqCst) == 0 {
+            state.current_embed_control().pause();
+        }
+        EmbedPauseGuard(Arc::clone(state))
+    }
+
+    pub fn mark_metadata_batch_active(state: &Arc<Self>) -> MetadataBatchActiveGuard {
+        state.metadata_batch_active.store(true, Ordering::SeqCst);
+        MetadataBatchActiveGuard(Arc::clone(state))
+    }
+
+    pub fn is_foreground_batch_active(&self) -> bool {
+        let scan_busy = self
+            .scan_control
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        scan_busy || self.metadata_batch_active.load(Ordering::SeqCst)
+    }
+
     pub fn stop_background_activity(&self) {
         self.auto_backup_dirty.store(false, Ordering::SeqCst);
         self.metadata_batch_cancel.store(true, Ordering::SeqCst);
+        self.bg_metadata_cancel.store(true, Ordering::SeqCst);
+        self.metadata_cancel_notify.notify_waiters();
+        self.cancel_embed_worker();
         if let Ok(g) = self.scan_control.lock() {
             if let Some(ctrl) = g.as_ref() {
                 ctrl.cancel();
@@ -123,8 +261,73 @@ impl AppState {
         if let Ok(mut w) = self.watcher.lock() {
             *w = None;
         }
+        self.invalidate_viewer_file_cache();
         self.embedder_slot.unload();
         self.reranker_slot.unload();
+    }
+
+    pub fn invalidate_viewer_file_cache(&self) {
+        if let Ok(mut guard) = self.viewer_file_cache.lock() {
+            guard.clear();
+        }
+    }
+
+    pub fn get_viewer_stream_info(
+        &self,
+        file_id: i64,
+    ) -> std::result::Result<FileStreamInfo, ViewerFileError> {
+        let info = {
+            let r = self.db.reader();
+            match get_file_stream_info(&r, file_id) {
+                Ok(Some(i)) => i,
+                Ok(None) => return Err(ViewerFileError::NotFound),
+                Err(e) => return Err(ViewerFileError::Forbidden(e.to_string())),
+            }
+        };
+        if !info.is_available || !info.abs_path.exists() {
+            return Err(ViewerFileError::Unreachable);
+        }
+        Ok(info)
+    }
+
+    pub fn get_or_open_viewer_file(
+        &self,
+        file_id: i64,
+    ) -> std::result::Result<CachedViewerFile, ViewerFileError> {
+        if let Ok(mut guard) = self.viewer_file_cache.lock() {
+            if let Some(pos) = guard.iter().position(|(id, _)| *id == file_id) {
+                let entry = if pos == 0 {
+                    guard[0].1.clone()
+                } else {
+                    let item = guard.remove(pos).unwrap();
+                    let cloned = item.1.clone();
+                    guard.push_front(item);
+                    cloned
+                };
+                return Ok(entry);
+            }
+        }
+
+        let info = self.get_viewer_stream_info(file_id)?;
+        let file = std::fs::File::open(&info.abs_path)
+            .map_err(|e| ViewerFileError::Io(e.to_string()))?;
+        let len = file
+            .metadata()
+            .map_err(|e| ViewerFileError::Io(e.to_string()))?
+            .len();
+        let entry = CachedViewerFile {
+            file: Arc::new(file),
+            len,
+        };
+        if let Ok(mut guard) = self.viewer_file_cache.lock() {
+            if let Some(pos) = guard.iter().position(|(id, _)| *id == file_id) {
+                guard.remove(pos);
+            } else if guard.len() >= VIEWER_FILE_CACHE_CAPACITY {
+                guard.pop_back();
+            }
+            guard.push_front((file_id, entry.clone()));
+        }
+        Ok(entry)
     }
 
     pub fn refresh_watcher(state: &Arc<Self>, handle: Option<AppHandle>) {
@@ -178,12 +381,7 @@ impl AppState {
             while rx.recv().await.is_some() {
                 tokio::time::sleep(Duration::from_millis(350)).await;
                 while rx.try_recv().is_ok() {}
-                let manual_busy = st
-                    .scan_control
-                    .lock()
-                    .map(|g| g.is_some())
-                    .unwrap_or(false);
-                if manual_busy {
+                if st.is_foreground_batch_active() {
                     continue;
                 }
                 let db = Arc::clone(&st.db);
@@ -199,6 +397,7 @@ impl AppState {
                 .await
                 .unwrap_or(false);
                 if has_changes {
+                    st.invalidate_viewer_file_cache();
                     st.schedule_auto_backup();
                     if let Ok(g) = st.app_handle.lock() {
                         if let Some(app) = g.as_ref() {
@@ -292,6 +491,15 @@ impl AppState {
                     }
                 }
 
+                // Defer automatic backup compression until active rescans or bulk metadata runs settle
+                // so a 300-book import never re-compresses ~900 MB repeatedly mid-sync.
+                let defer_start = tokio::time::Instant::now();
+                while state.is_foreground_batch_active()
+                    && defer_start.elapsed() < Duration::from_secs(3600)
+                {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+
                 if !state.auto_backup_dirty.swap(false, Ordering::SeqCst) {
                     continue;
                 }
@@ -379,9 +587,18 @@ impl AppState {
             embedder_slot: Arc::new(LazyModelSlot::new()),
             reranker_slot: Arc::new(LazyModelSlot::new()),
             djvu_cache,
+            viewer_file_cache: Mutex::new(VecDeque::with_capacity(VIEWER_FILE_CACHE_CAPACITY)),
             clients: RwLock::new(clients),
             scan_control: Mutex::new(None),
+            metadata_run_mutex: Arc::new(tokio::sync::Mutex::new(())),
             metadata_batch_cancel: Arc::new(AtomicBool::new(false)),
+            bg_metadata_cancel: Arc::new(AtomicBool::new(false)),
+            metadata_cancel_notify: Arc::new(Notify::new()),
+            metadata_batch_active: Arc::new(AtomicBool::new(false)),
+            embed_control: Mutex::new(Arc::new(ScanControl::new())),
+            embed_pause_depth: AtomicUsize::new(0),
+            embed_worker_running: Arc::new(AtomicBool::new(false)),
+            embed_worker_reschedule: Arc::new(AtomicBool::new(false)),
             watcher: Mutex::new(None),
             watcher_task: Mutex::new(None),
             app_handle: Mutex::new(None),

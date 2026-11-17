@@ -139,7 +139,12 @@ where
         _ => None,
     };
 
-    let allowed_pids = if root_ids.is_some() || cat_filter.is_some() {
+    let vector_can_run = ctx
+        .as_ref()
+        .is_some_and(|c| c.vector_index.is_some_and(|v| !v.is_empty()) && c.embedder_slot.is_some());
+
+    // Only build the compact passage bitset when the vector branch will actually run with a filter!
+    let allowed_pids = if vector_can_run && (root_ids.is_some() || cat_filter.is_some()) {
         Some(fetch_allowed_passage_ids(conn, root_ids, cat_filter)?)
     } else {
         None
@@ -173,9 +178,14 @@ where
     });
 
     let (mut bm25_hits, bm25_ms) = (bm25_res.0?, bm25_res.1);
-    if cat_filter.is_some() {
+    if let Some(cat) = cat_filter {
         if let Some(ref allowed) = allowed_pids {
-            bm25_hits.retain(|h| allowed.contains(&h.passage_id));
+            bm25_hits.retain(|h| allowed.contains(h.passage_id));
+            bm25_hits.truncate(top_n);
+        } else if !bm25_hits.is_empty() {
+            // Filter the <= 300 BM25 hits by document `work_type` without scanning all 200k passages!
+            let allowed_docs = fetch_matching_doc_ids_for_hits(conn, &bm25_hits, cat)?;
+            bm25_hits.retain(|h| allowed_docs.contains(&(h.document_id as i64)));
             bm25_hits.truncate(top_n);
         }
     }
@@ -298,10 +308,41 @@ where
     })
 }
 
+struct PassageBitSet {
+    words: Vec<u64>,
+}
+
+impl PassageBitSet {
+    fn new() -> Self {
+        Self { words: Vec::new() }
+    }
+
+    #[inline]
+    fn insert(&mut self, pid: u64) {
+        let word_idx = (pid >> 6) as usize;
+        if word_idx >= self.words.len() {
+            // Avoid absurd allocations if a corrupt ID ever exceeded reasonable bounds
+            if word_idx > 16_777_216 {
+                return;
+            }
+            self.words.resize((word_idx + 1).next_power_of_two().max(64), 0);
+        }
+        self.words[word_idx] |= 1u64 << (pid & 63);
+    }
+
+    #[inline]
+    fn contains(&self, pid: u64) -> bool {
+        let word_idx = (pid >> 6) as usize;
+        self.words
+            .get(word_idx)
+            .is_some_and(|&w| (w & (1u64 << (pid & 63))) != 0)
+    }
+}
+
 fn run_vector_branch<FE, FR>(
     query: &str,
     top_n: usize,
-    allowed_pids: Option<&HashSet<u64>>,
+    allowed_pids: Option<&PassageBitSet>,
     ctx: Option<&mut HybridSearchContext<'_, FE, FR>>,
 ) -> (Vec<VectorHit>, f64, f64, bool)
 where
@@ -337,7 +378,7 @@ where
     let t_vec = Instant::now();
     let hits = match allowed_pids {
         Some(allowed) => vindex
-            .filtered_search(&query_vec, top_n, |pid| allowed.contains(&pid))
+            .filtered_search(&query_vec, top_n, |pid| allowed.contains(pid))
             .unwrap_or_default(),
         None => vindex.search(&query_vec, top_n).unwrap_or_default(),
     };
@@ -395,14 +436,50 @@ pub(crate) struct HydratedPassage {
     pub is_available: bool,
 }
 
+fn fetch_matching_doc_ids_for_hits(
+    conn: &Connection,
+    hits: &[Bm25Hit],
+    work_category: &str,
+) -> Result<HashSet<i64>> {
+    let mut doc_ids: Vec<i64> = hits.iter().map(|h| h.document_id as i64).collect();
+    doc_ids.sort_unstable();
+    doc_ids.dedup();
+    if doc_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let cat_clause = match work_category {
+        "book" => "work_type = 'book'",
+        "paper" => "work_type != 'book'",
+        _ => "1 = 1",
+    };
+    let mut allowed = HashSet::with_capacity(doc_ids.len());
+    for chunk in doc_ids.chunks(500) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id FROM documents WHERE id IN ({placeholders}) AND {cat_clause}");
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0))?;
+        for r in rows {
+            allowed.insert(r?);
+        }
+    }
+    Ok(allowed)
+}
+
 fn fetch_allowed_passage_ids(
     conn: &Connection,
     roots: Option<&[String]>,
     work_category: Option<&str>,
-) -> Result<HashSet<u64>> {
+) -> Result<PassageBitSet> {
     if let Some(r) = roots {
         if r.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(PassageBitSet::new());
         }
     }
     let cat_clause = match work_category {
@@ -411,7 +488,7 @@ fn fetch_allowed_passage_ids(
         _ => "1 = 1",
     };
 
-    let mut set = HashSet::new();
+    let mut set = PassageBitSet::new();
     if let Some(root_list) = roots {
         let placeholders = root_list
             .iter()
@@ -419,11 +496,14 @@ fn fetch_allowed_passage_ids(
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(",");
+        // Uses covering index `idx_passages_file_page(file_id, page_ord)` without reading passage heap pages!
         let sql = format!(
             "SELECT p.id FROM passages p
-             JOIN files f ON f.id = p.file_id
-             JOIN documents d ON d.id = p.document_id
-             WHERE f.root_id IN ({placeholders}) AND {cat_clause}"
+             WHERE p.file_id IN (
+                 SELECT f.id FROM files f
+                 JOIN documents d ON d.id = f.document_id
+                 WHERE f.root_id IN ({placeholders}) AND {cat_clause}
+             )"
         );
         let mut stmt = conn.prepare(&sql)?;
         let refs: Vec<&dyn rusqlite::ToSql> =
@@ -433,10 +513,10 @@ fn fetch_allowed_passage_ids(
             set.insert(r? as u64);
         }
     } else {
+        // Uses covering index `idx_passages_doc(document_id)` without reading passage heap pages!
         let sql = format!(
             "SELECT p.id FROM passages p
-             JOIN documents d ON d.id = p.document_id
-             WHERE {cat_clause}"
+             WHERE p.document_id IN (SELECT d.id FROM documents d WHERE {cat_clause})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;

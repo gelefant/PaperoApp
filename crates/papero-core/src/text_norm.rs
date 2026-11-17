@@ -22,6 +22,9 @@ fn is_ot1_spacing_accent(ch: char) -> bool {
 /// strips soft hyphens, and collapses standalone OT1 LaTeX spacing accents (`Poincar´e -> Poincare`,
 /// `H¨ormander -> Hormander`, `Poincar ´ e -> Poincare`) while preserving original letter case.
 pub fn clean_ot1_and_ligatures_preserve_case(input: &str) -> String {
+    if input.is_ascii() {
+        return input.to_string();
+    }
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len() + 8);
     let mut i = 0usize;
@@ -98,6 +101,10 @@ pub fn clean_ot1_and_ligatures_preserve_case(input: &str) -> String {
 ///    (`Erdős -> Erdos`, `Čech -> Cech`, `Poincaré -> Poincare`, `Hölder -> Holder`).
 /// 4. Lowercases the result.
 pub fn normalize_math_text(input: &str) -> String {
+    // Fast path for >98% of tokens (pure ASCII without backticks): single allocation, no NFD/Vec<char>.
+    if input.bytes().all(|b| b < 0x80 && b != b'`') {
+        return input.to_ascii_lowercase();
+    }
     let expanded = clean_ot1_and_ligatures_preserve_case(input);
     let mut pre = String::with_capacity(expanded.len());
     for ch in expanded.chars() {

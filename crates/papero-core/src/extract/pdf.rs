@@ -4,7 +4,38 @@ use crate::extract::types::{
     ExtractedDocument, ExtractedPage, ExtractedSpan, NormalizedRect, OutlineItem,
 };
 use pdfium_render::prelude::*;
+use std::ops::Deref;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+
+struct ExclusivePdfium(Pdfium);
+
+// SAFETY: `ExclusivePdfium` is stored exclusively inside `PDFIUM_INSTANCE` and only ever accessed
+// while holding its `MutexGuard`, enforcing strictly single-threaded access to PDFium's C++ library
+// state and preventing `FPDF_DestroyLibrary` from tearing down global state across worker threads.
+unsafe impl Send for ExclusivePdfium {}
+
+static PDFIUM_INSTANCE: Mutex<Option<ExclusivePdfium>> = Mutex::new(None);
+
+pub struct PdfiumGuard(MutexGuard<'static, Option<ExclusivePdfium>>);
+
+impl Deref for PdfiumGuard {
+    type Target = Pdfium;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.as_ref().expect("pdfium Mutex initialized").0
+    }
+}
+
+/// Acquires exclusive access to the process-lifetime `Pdfium` instance so `FPDF_InitLibrary`
+/// runs at most once and concurrent Rayon/Tokio threads never race inside PDFium C++ globals.
+pub fn lock_cached_pdfium(explicit_path: Option<&Path>) -> Result<PdfiumGuard> {
+    let mut guard = PDFIUM_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(ExclusivePdfium(bind_pdfium(explicit_path)?));
+    }
+    Ok(PdfiumGuard(guard))
+}
 
 /// Raw character + bottom-left point coordinates extracted from PDFium.
 #[derive(Debug, Clone)]
@@ -65,7 +96,7 @@ pub fn bind_pdfium(explicit_path: Option<&Path>) -> Result<Pdfium> {
 /// Extracts pages, labels, normalized top-left line bounding boxes, bookmarks, and metadata
 /// from a PDF file using PDFium.
 pub fn extract_pdf(path: &Path, pdfium_lib_path: Option<&Path>) -> Result<ExtractedDocument> {
-    let pdfium = bind_pdfium(pdfium_lib_path)?;
+    let pdfium = lock_cached_pdfium(pdfium_lib_path)?;
     let doc = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|err| classify_pdfium_load_error(path, err))?;
@@ -74,6 +105,7 @@ pub fn extract_pdf(path: &Path, pdfium_lib_path: Option<&Path>) -> Result<Extrac
     let mut pages = Vec::with_capacity(page_count as usize);
     let mut has_text_layer = false;
     let mut page1_link_uris: Vec<String> = Vec::new();
+    let mut char_boxes: Vec<PdfCharBox> = Vec::with_capacity(4096);
 
     for (idx, page) in doc.pages().iter().enumerate() {
         let page_ord = (idx as u32) + 1;
@@ -85,7 +117,7 @@ pub fn extract_pdf(path: &Path, pdfium_lib_path: Option<&Path>) -> Result<Extrac
             collect_page_identifier_links(&page, &mut page1_link_uris);
         }
 
-        let mut char_boxes = Vec::new();
+        char_boxes.clear();
         let mut raw_text = String::new();
         if let Ok(text_page) = page.text() {
             raw_text = text_page.all();
@@ -148,7 +180,7 @@ pub fn extract_pdf_front_matter(
     path: &Path,
     pdfium_lib_path: Option<&Path>,
 ) -> Result<ExtractedDocument> {
-    let pdfium = bind_pdfium(pdfium_lib_path)?;
+    let pdfium = lock_cached_pdfium(pdfium_lib_path)?;
     let doc = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|err| classify_pdfium_load_error(path, err))?;
@@ -174,7 +206,7 @@ pub fn extract_pdf_front_matter(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        if page_ord <= 2 {
+        if page_ord <= 3 {
             collect_page_identifier_links(&page, &mut page1_link_uris);
         }
 
@@ -182,7 +214,7 @@ pub fn extract_pdf_front_matter(
         let mut raw_text = String::new();
         if let Ok(text_page) = page.text() {
             raw_text = text_page.all();
-            if page_ord <= 2 {
+            if page_ord <= 3 {
                 let mut char_boxes = Vec::new();
                 for ch in text_page.chars().iter() {
                     if let Some(unicode) = ch.unicode_char() {

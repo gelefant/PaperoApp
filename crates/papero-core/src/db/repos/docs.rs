@@ -582,7 +582,7 @@ pub fn list_documents_for_ui(conn: &Connection) -> Result<Vec<DocumentListItem>>
                         SELECT family_name, given_name
                         FROM document_authors
                         WHERE document_id = d.id
-                        ORDER BY CASE WHEN role = 'author' THEN 0 ELSE 1 END, position ASC
+                        ORDER BY role ASC, position ASC
                      )),
                     NULLIF(d.authors_norm_summary, ''),
                     ''
@@ -625,6 +625,44 @@ pub fn list_documents_for_ui(conn: &Connection) -> Result<Vec<DocumentListItem>>
         out.push(r?);
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct FileStreamInfo {
+    pub file_id: i64,
+    pub abs_path: std::path::PathBuf,
+    pub blake3_hash: String,
+    pub is_available: bool,
+}
+
+/// Fast lightweight lookup for PDF range / DjVu viewer streaming (omitting `outline_json` and `JOIN documents`).
+pub fn get_file_stream_info(conn: &Connection, file_id: i64) -> Result<Option<FileStreamInfo>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT sr.root_path, f.rel_path, f.blake3_hash, f.is_available
+         FROM files f
+         JOIN source_roots sr ON sr.id = f.root_id
+         WHERE f.id = ?1",
+    )?;
+    let row = stmt
+        .query_row(params![file_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        })
+        .optional()?;
+    let Some((root_path, rel_path, blake3_hash, is_available)) = row else {
+        return Ok(None);
+    };
+    let abs_path = resolve_rel_path(std::path::Path::new(&root_path), &rel_path)?;
+    Ok(Some(FileStreamInfo {
+        file_id,
+        abs_path,
+        blake3_hash,
+        is_available,
+    }))
 }
 
 pub fn get_file_location(conn: &Connection, file_id: i64) -> Result<Option<FileLocation>> {

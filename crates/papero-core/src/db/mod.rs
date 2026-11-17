@@ -68,12 +68,21 @@ impl Database {
     }
 
     /// Acquires a read-only connection from the reader pool (falls back to writer for `:memory:`).
+    /// Prefers an uncontended reader via `try_lock()` so a long background query on one slot
+    /// never stalls UI reads when other slots are idle.
     pub fn reader(&self) -> MutexGuard<'_, Connection> {
         if self.readers.is_empty() {
             return self.writer();
         }
-        let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[idx]
+        let len = self.readers.len();
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % len;
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            if let Ok(guard) = self.readers[idx].try_lock() {
+                return guard;
+            }
+        }
+        self.readers[start]
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }

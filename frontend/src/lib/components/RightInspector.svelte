@@ -98,6 +98,9 @@
   let altFormulaFeedback = $state('');
   let altFileInput: HTMLInputElement | undefined = $state();
   let saving = $state(false);
+  const currentCluster = $derived(
+    meta ? (clusters.find((c) => c.document_ids.includes(meta.document_id)) ?? null) : null
+  );
 
   const ANCHOR_LABELS: Record<string, string> = {
     title: 'Titolo',
@@ -466,7 +469,6 @@
     {/if}
 
     {#if clusters.length > 0 && onSetCluster && onRemoveCluster}
-      {@const currentCluster = clusters.find((c) => c.document_ids.includes(meta.document_id))}
       <div class="tax-box">
         <span class="tax-label">Gruppo Tematico</span>
         <select

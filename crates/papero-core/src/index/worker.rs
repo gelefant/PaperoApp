@@ -66,16 +66,31 @@ pub fn run_extract_bm25_queue(
         .build()
         .map_err(|e| CoreError::Extract(format!("failed to build worker pool: {e}")))?;
 
-    for chunk in jobs.chunks(25) {
+    struct PreparedExtractOutput {
+        page_count: u32,
+        has_text_layer: bool,
+        outline_json: Option<String>,
+        page_inserts: Vec<FilePageInsert>,
+        passage_inserts: Vec<PassageInsert>,
+        ids: crate::metadata::models::ExtractedIdentifiers,
+        minhash_blob: Option<Vec<u8>>,
+    }
+
+    // Process in compact batches of 8 files and drop each `ExtractedDocument` (pages/spans/raw_text)
+    // immediately inside the worker closure so 600-page books never accumulate 25x in RAM!
+    for chunk in jobs.chunks(8) {
         ctrl.wait_if_paused()?;
 
         let results: Vec<_> = pool.install(|| {
             use rayon::prelude::*;
             chunk
                 .par_iter()
-                .map(|job| {
+                .map(|job| -> Result<PreparedExtractOutput> {
+                    if ctrl.is_cancelled() {
+                        return Err(CoreError::Cancelled);
+                    }
                     let full_path = resolve_rel_path(Path::new(&job.root_path), &job.rel_path)?;
-                    let doc = match job.format.as_str() {
+                    let extracted = match job.format.as_str() {
                         "pdf" => extract_pdf(&full_path, config.pdfium_lib_path.as_deref())?,
                         "djvu" => extract_djvu(&full_path, config.djvused_bin.as_deref())?,
                         other => {
@@ -84,68 +99,120 @@ pub fn run_extract_bm25_queue(
                             )));
                         }
                     };
-                    let chunks = chunk_document(
-                        &doc,
+                    let built_chunks = chunk_document(
+                        &extracted,
                         config.chunk_target_tokens,
                         config.chunk_overlap_tokens,
                     );
-                    Ok((doc, chunks))
+
+                    let first_pages: Vec<&str> = extracted
+                        .pages
+                        .iter()
+                        .take(4)
+                        .map(|p| p.raw_text.as_str())
+                        .collect();
+                    let last_page = extracted.pages.last().map(|p| p.raw_text.as_str());
+                    let stem = Path::new(&job.rel_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str());
+                    let ids = extract_identifiers_and_heuristics_with_front_pages(
+                        extracted.xmp_xml.as_deref(),
+                        extracted.doc_title.as_deref(),
+                        extracted.doc_author.as_deref(),
+                        &first_pages,
+                        last_page,
+                        extracted.page_count,
+                        stem,
+                        extracted.pages.first(),
+                        extracted.pages.get(1),
+                    );
+
+                    let full_text_for_minhash = extracted
+                        .pages
+                        .iter()
+                        .take(15)
+                        .map(|p| p.raw_text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let minhash_blob = compute_minhash(&full_text_for_minhash).map(|s| pack_minhash(&s));
+
+                    let page_inserts: Vec<FilePageInsert> = extracted
+                        .pages
+                        .iter()
+                        .map(|p| FilePageInsert {
+                            file_id: job.file_id,
+                            page_ord: p.page_ord,
+                            printed_label: p.printed_label.clone(),
+                            width_pts: p.width_pts,
+                            height_pts: p.height_pts,
+                            text_source: "native".to_string(),
+                        })
+                        .collect();
+
+                    let outline_json = if extracted.outline.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&extracted.outline).ok()
+                    };
+                    let page_count = extracted.page_count;
+                    let has_text_layer = extracted.has_text_layer;
+                    // Explicitly drop `extracted` (all raw_text + line spans) before building PassageInserts
+                    drop(extracted);
+
+                    let passage_inserts: Vec<PassageInsert> = built_chunks
+                        .into_iter()
+                        .map(|c| PassageInsert {
+                            document_id: job.document_id,
+                            file_id: job.file_id,
+                            page_ord: c.page_ord,
+                            printed_label: c.printed_label,
+                            chunk_index: c.chunk_index,
+                            is_alt_formula: false,
+                            token_count: c.token_count,
+                            text_content: c.text_content,
+                            bboxes_blob: c.bboxes_blob,
+                        })
+                        .collect();
+
+                    Ok(PreparedExtractOutput {
+                        page_count,
+                        has_text_layer,
+                        outline_json,
+                        page_inserts,
+                        passage_inserts,
+                        ids,
+                        minhash_blob,
+                    })
                 })
                 .collect()
         });
+
+        if ctrl.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
 
         let mut bm25_batch: Vec<Bm25Passage> = Vec::new();
         {
             let w = db.writer();
             for (job, res) in chunk.iter().zip(results) {
+                if matches!(res, Err(CoreError::Cancelled)) {
+                    return Err(CoreError::Cancelled);
+                }
                 report.processed += 1;
                 match res {
-                    Ok((extracted, built_chunks)) => {
-                        let page_inserts: Vec<FilePageInsert> = extracted
-                            .pages
-                            .iter()
-                            .map(|p| FilePageInsert {
-                                file_id: job.file_id,
-                                page_ord: p.page_ord,
-                                printed_label: p.printed_label.clone(),
-                                width_pts: p.width_pts,
-                                height_pts: p.height_pts,
-                                text_source: "native".to_string(),
-                            })
-                            .collect();
-
-                        let passage_inserts: Vec<PassageInsert> = built_chunks
-                            .iter()
-                            .map(|c| PassageInsert {
-                                document_id: job.document_id,
-                                file_id: job.file_id,
-                                page_ord: c.page_ord,
-                                printed_label: c.printed_label.clone(),
-                                chunk_index: c.chunk_index,
-                                is_alt_formula: false,
-                                token_count: c.token_count,
-                                text_content: c.text_content.clone(),
-                                bboxes_blob: c.bboxes_blob.clone(),
-                            })
-                            .collect();
-
-                        let outline_json = if extracted.outline.is_empty() {
-                            None
-                        } else {
-                            serde_json::to_string(&extracted.outline).ok()
-                        };
-
+                    Ok(prep) => {
                         let inserted_ids = replace_file_pages_and_passages(
                             &w,
                             job.file_id,
-                            extracted.page_count,
-                            extracted.has_text_layer,
-                            outline_json.as_deref(),
-                            &page_inserts,
-                            &passage_inserts,
+                            prep.page_count,
+                            prep.has_text_layer,
+                            prep.outline_json.as_deref(),
+                            &prep.page_inserts,
+                            &prep.passage_inserts,
                         )?;
 
-                        for (pid, p) in inserted_ids.into_iter().zip(passage_inserts) {
+                        // Move `text_content` directly into `Bm25Passage` without cloning!
+                        for (pid, p) in inserted_ids.into_iter().zip(prep.passage_inserts) {
                             bm25_batch.push(Bm25Passage {
                                 passage_id: pid,
                                 document_id: job.document_id as u64,
@@ -155,39 +222,9 @@ pub fn run_extract_bm25_queue(
                             });
                         }
 
-                        // Extract local bibliographic identifiers, heuristics & MinHash signature
-                        let first_pages: Vec<&str> = extracted
-                            .pages
-                            .iter()
-                            .take(4)
-                            .map(|p| p.raw_text.as_str())
-                            .collect();
-                        let last_page = extracted.pages.last().map(|p| p.raw_text.as_str());
-                        let stem = Path::new(&job.rel_path)
-                            .file_stem()
-                            .and_then(|s| s.to_str());
-                        let ids = extract_identifiers_and_heuristics_with_front_pages(
-                            extracted.xmp_xml.as_deref(),
-                            extracted.doc_title.as_deref(),
-                            extracted.doc_author.as_deref(),
-                            &first_pages,
-                            last_page,
-                            extracted.page_count,
-                            stem,
-                            extracted.pages.first(),
-                            extracted.pages.get(1),
-                        );
-                        let _ = apply_extracted_identifiers_to_doc(&w, job.document_id, &ids, None);
+                        let _ = apply_extracted_identifiers_to_doc(&w, job.document_id, &prep.ids, None);
 
-                        let full_text_for_minhash = extracted
-                            .pages
-                            .iter()
-                            .take(15)
-                            .map(|p| p.raw_text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if let Some(sig) = compute_minhash(&full_text_for_minhash) {
-                            let blob = pack_minhash(&sig);
+                        if let Some(blob) = prep.minhash_blob {
                             let _ = w.execute(
                                 "UPDATE documents SET minhash_sig = ?1 WHERE id = ?2",
                                 params![blob, job.document_id],
@@ -309,23 +346,44 @@ pub fn run_embed_queue(
     let default_ctrl = ScanControl::new();
     let ctrl = control.unwrap_or(&default_ctrl);
     let batch_size = match profile {
-        ModelProfile::Light => 16usize,
-        ModelProfile::Quality => 8usize,
+        ModelProfile::Light => 32usize,
+        ModelProfile::Quality => 16usize,
     };
-    let intra_threads = config.max_worker_threads.max(1);
+    // Cap background ONNX intra-op threads so `--ml-worker` runs quietly on Efficiency / low-power cores.
+    let intra_threads = config.max_worker_threads.div_ceil(2).clamp(1, 3);
     let ort_lib = config.onnxruntime_lib_path.as_deref();
 
+    const FLUSH_PASSAGE_THRESHOLD: usize = 1_200;
+    const FLUSH_FILE_THRESHOLD: usize = 10;
+    let mut pending_completed: Vec<(i64, Option<i64>)> = Vec::new();
+    let mut buffered_passages: usize = 0;
+
     for job in jobs {
+        if ctrl.is_paused() || ctrl.is_cancelled() {
+            flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
+            buffered_passages = 0;
+        }
         if ctrl.wait_if_paused().is_err() || ctrl.is_cancelled() {
             break;
         }
-        report.processed += 1;
 
-        let passages = load_file_passages_for_embedding(db, job.file_id)?;
+        let mut passages = load_file_passages_for_embedding(db, job.file_id)?;
+        // Length-sort passages across the whole file so transformer batches avoid padding waste.
+        passages.sort_by_key(|(_, t)| t.len());
+
         let mut to_upsert: Vec<(u64, Vec<f32>)> = Vec::with_capacity(passages.len());
         let mut failed_err: Option<String> = None;
+        let mut stopped = false;
 
         for chunk in passages.chunks(batch_size) {
+            if ctrl.is_paused() || ctrl.is_cancelled() {
+                flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
+                buffered_passages = 0;
+            }
+            if ctrl.wait_if_paused().is_err() || ctrl.is_cancelled() {
+                stopped = true;
+                break;
+            }
             let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
             let emb_res = embedder_slot.with_model(
                 || OnnxEmbedder::load_isolated(models_dir, profile, ort_lib, intra_threads),
@@ -344,6 +402,12 @@ pub fn run_embed_queue(
             }
         }
 
+        if stopped {
+            break;
+        }
+
+        report.processed += 1;
+
         if let Some(err) = failed_err {
             report.failed += 1;
             if let Some(jid) = job.job_id {
@@ -357,23 +421,54 @@ pub fn run_embed_queue(
         }
 
         if !to_upsert.is_empty() {
-            vector_index.upsert_batch(&to_upsert)?;
+            vector_index.upsert_in_memory(&to_upsert)?;
             report.passages_indexed += to_upsert.len();
+            buffered_passages += to_upsert.len();
         }
 
-        let now = chrono::Utc::now().timestamp();
-        let w = db.writer();
-        let update_sql = format!(
-            "UPDATE files SET {embedded_col} = 1, index_state = 'ready', updated_at = ?1 WHERE id = ?2"
-        );
-        w.execute(&update_sql, params![now, job.file_id])?;
-        if let Some(jid) = job.job_id {
-            let _ = w.execute("DELETE FROM index_jobs WHERE id = ?1", params![jid]);
-        }
+        pending_completed.push((job.file_id, job.job_id));
         report.succeeded += 1;
+
+        if buffered_passages >= FLUSH_PASSAGE_THRESHOLD
+            || pending_completed.len() >= FLUSH_FILE_THRESHOLD
+        {
+            flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
+            buffered_passages = 0;
+        }
     }
 
+    flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
+
     Ok(report)
+}
+
+fn flush_completed_embed_jobs(
+    db: &Database,
+    vector_index: &VectorIndex,
+    embedded_col: &str,
+    pending_completed: &mut Vec<(i64, Option<i64>)>,
+) -> Result<()> {
+    vector_index.flush()?;
+    if pending_completed.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let update_sql = format!(
+        "UPDATE files SET {embedded_col} = 1, index_state = 'ready', updated_at = ?1 WHERE id = ?2"
+    );
+    {
+        let w = db.writer();
+        let tx = w.unchecked_transaction()?;
+        for (file_id, job_id) in pending_completed.iter() {
+            tx.execute(&update_sql, params![now, file_id])?;
+            if let Some(jid) = job_id {
+                let _ = tx.execute("DELETE FROM index_jobs WHERE id = ?1", params![jid]);
+            }
+        }
+        tx.commit()?;
+    }
+    pending_completed.clear();
+    Ok(())
 }
 
 fn load_pending_embed_jobs(

@@ -1,16 +1,20 @@
-use crate::config::resolve_external_tool;
+use crate::config::{configure_background_command, resolve_external_tool};
 use crate::error::{CoreError, Result};
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Disk-backed LRU cache for rendered DjVu page images (`ddjvu` -> PNG).
 pub struct DjvuCache {
     cache_dir: PathBuf,
     max_bytes: u64,
+    approx_bytes: AtomicU64,
     evict_lock: Mutex<()>,
 }
 
@@ -18,9 +22,17 @@ impl DjvuCache {
     pub fn new(cache_root: &Path, max_mb: u64) -> Result<Self> {
         let cache_dir = cache_root.join("djvu_pages");
         fs::create_dir_all(&cache_dir)?;
+        let initial_bytes = fs::read_dir(&cache_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum::<u64>();
         Ok(Self {
             cache_dir,
             max_bytes: max_mb.saturating_mul(1024 * 1024),
+            approx_bytes: AtomicU64::new(initial_bytes),
             evict_lock: Mutex::new(()),
         })
     }
@@ -44,19 +56,14 @@ impl DjvuCache {
         let safe_dpi = dpi.clamp(40, 300);
         let target = self.cache_path(blake3_hash, page_ord, safe_dpi);
 
-        if target.exists() {
-            if let Ok(bytes) = fs::read(&target) {
-                // Touch mtime for LRU ordering (best-effort)
-                let _ = fs::OpenOptions::new()
-                    .write(true)
-                    .open(&target)
-                    .and_then(|f| f.set_modified(SystemTime::now()));
-                return Ok(bytes);
-            }
+        if let Ok(bytes) = fs::read(&target) {
+            return Ok(bytes);
         }
 
         let bin = resolve_external_tool(ddjvu_bin, "ddjvu");
-        let output = Command::new(&bin)
+        let mut cmd = Command::new(&bin);
+        configure_background_command(&mut cmd);
+        let output = cmd
             .arg("-format=ppm")
             .arg(format!("-page={page_ord}"))
             .arg(format!("-scale={safe_dpi}"))
@@ -86,13 +93,21 @@ impl DjvuCache {
 
         let png_bytes = ppm_to_png(&output.stdout)?;
 
-        // Atomic write via temp file in cache dir, then LRU eviction
-        let tmp_path = self
-            .cache_dir
-            .join(format!(".tmp_{}_{}_{}.png", blake3_hash, page_ord, std::process::id()));
+        // Unique temp filename per (hash, page, dpi, atomic seq) prevents concurrent DPI render races!
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.cache_dir.join(format!(
+            ".tmp_{blake3_hash}_p{page_ord}_d{safe_dpi}_{}_{seq}.png",
+            std::process::id()
+        ));
         if fs::write(&tmp_path, &png_bytes).is_ok() {
             let _ = fs::rename(&tmp_path, &target);
-            self.evict_lru_if_needed();
+            let next_approx = self
+                .approx_bytes
+                .fetch_add(png_bytes.len() as u64, Ordering::Relaxed)
+                .saturating_add(png_bytes.len() as u64);
+            if self.max_bytes > 0 && next_approx > self.max_bytes {
+                self.evict_lru_if_needed();
+            }
         }
 
         Ok(png_bytes)
@@ -115,6 +130,13 @@ impl DjvuCache {
             if path.extension().and_then(|e| e.to_str()) != Some("png") {
                 continue;
             }
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".tmp_"))
+            {
+                continue;
+            }
             if let Ok(meta) = ent.metadata() {
                 let len = meta.len();
                 let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -124,19 +146,22 @@ impl DjvuCache {
         }
 
         if total <= self.max_bytes {
+            self.approx_bytes.store(total, Ordering::Relaxed);
             return;
         }
 
-        // Oldest modified first
+        // Oldest modified first; trim down to 90% of max_bytes so eviction doesn't re-run on every single page
+        let target_bytes = (self.max_bytes * 9) / 10;
         entries.sort_by_key(|(_, _, mtime)| *mtime);
         for (path, len, _) in entries {
-            if total <= self.max_bytes {
+            if total <= target_bytes && total <= self.max_bytes {
                 break;
             }
             if fs::remove_file(&path).is_ok() {
                 total = total.saturating_sub(len);
             }
         }
+        self.approx_bytes.store(total, Ordering::Relaxed);
     }
 }
 
@@ -236,6 +261,7 @@ mod tests {
         let cache = DjvuCache {
             cache_dir: tmp.path().to_path_buf(),
             max_bytes: 20,
+            approx_bytes: AtomicU64::new(30),
             evict_lock: Mutex::new(()),
         };
         let old_file = tmp.path().join("old.png");

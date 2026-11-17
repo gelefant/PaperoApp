@@ -54,7 +54,7 @@ impl AppPaths {
         #[cfg(target_os = "windows")]
         {
             if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                return PathBuf::from(local_app_data).join("Papero");
+                return select_windows_app_dir(Path::new(&local_app_data));
             }
         }
         #[cfg(target_os = "linux")]
@@ -401,13 +401,43 @@ pub fn resolve_external_tool(explicit: Option<&str>, tool_name: &str) -> String 
     tool_name.to_string()
 }
 
+/// Configures a background CLI `Command` so it does not flash a transient console window on Windows.
+pub fn configure_background_command(
+    cmd: &mut std::process::Command,
+) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 impl AppConfig {
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let raw = fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&raw)?)
+        if raw.trim().is_empty() {
+            tracing::warn!(path = %path.display(), "config.json is empty; falling back to defaults");
+            return Ok(Self::default());
+        }
+        match serde_json::from_str(&raw) {
+            Ok(cfg) => Ok(cfg),
+            Err(err) => {
+                let backup_path = path.with_extension("json.corrupt");
+                let _ = fs::copy(path, &backup_path);
+                tracing::warn!(
+                    path = %path.display(),
+                    backup = %backup_path.display(),
+                    error = %err,
+                    "failed to parse config.json; backed up corrupt file and restored defaults"
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -508,4 +538,63 @@ pub fn init_logging(logs_dir: &Path) -> Result<WorkerGuard> {
         .try_init();
 
     Ok(guard)
+}
+
+/// Resolves the Windows application data directory inside `%LOCALAPPDATA%`.
+/// Uses `%LOCALAPPDATA%\org.papero.app` so user databases/indices never collide with Tauri NSIS's
+/// default `currentUser` binary installation directory (`%LOCALAPPDATA%\Papero`), while preserving
+/// standalone dev data in `%LOCALAPPDATA%\Papero` when no NSIS installation lives there.
+pub fn select_windows_app_dir(local_app_data: &Path) -> PathBuf {
+    let preferred = local_app_data.join("org.papero.app");
+    if preferred.join("papero.db").exists() || preferred.join("config.json").exists() {
+        return preferred;
+    }
+    let legacy = local_app_data.join("Papero");
+    if legacy.join("papero.db").exists()
+        && !legacy.join("uninstall.exe").exists()
+        && !legacy.join("papero-app.exe").exists()
+    {
+        return legacy;
+    }
+    preferred
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_app_dir_avoids_nsis_install_dir_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        // Fresh install defaults to `%LOCALAPPDATA%/org.papero.app`
+        assert_eq!(select_windows_app_dir(base), base.join("org.papero.app"));
+
+        // Standalone dev directory with `papero.db` and no NSIS binaries stays on legacy path
+        let legacy = base.join("Papero");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("papero.db"), b"sqlite").unwrap();
+        assert_eq!(select_windows_app_dir(base), legacy);
+
+        // If NSIS binaries (`uninstall.exe` / `papero-app.exe`) live in `%LOCALAPPDATA%/Papero`,
+        // `org.papero.app` is chosen so upgrades/uninstalls never mix binaries with user data.
+        fs::write(legacy.join("uninstall.exe"), b"MZ").unwrap();
+        assert_eq!(select_windows_app_dir(base), base.join("org.papero.app"));
+    }
+
+    #[test]
+    fn load_or_default_recovers_from_empty_or_corrupt_config_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.json");
+
+        fs::write(&cfg_path, "   \n").unwrap();
+        let cfg = AppConfig::load_or_default(&cfg_path).unwrap();
+        assert_eq!(cfg.ml_profile, "light");
+
+        fs::write(&cfg_path, "{corrupt_json").unwrap();
+        let cfg2 = AppConfig::load_or_default(&cfg_path).unwrap();
+        assert_eq!(cfg2.ml_profile, "light");
+        assert!(tmp.path().join("config.json.corrupt").exists());
+    }
 }

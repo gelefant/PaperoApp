@@ -1,4 +1,4 @@
-use crate::config::resolve_external_tool;
+use crate::config::{configure_background_command, resolve_external_tool};
 use crate::error::{CoreError, Result};
 use crate::extract::types::{
     ExtractedDocument, ExtractedPage, ExtractedSpan, NormalizedRect, OutlineItem,
@@ -69,21 +69,40 @@ pub fn extract_djvu(path: &Path, djvused_bin: Option<&str>) -> Result<ExtractedD
 /// pages 1..=4 and the last page without scanning every page of large books.
 pub fn extract_djvu_front_matter(path: &Path, djvused_bin: Option<&str>) -> Result<ExtractedDocument> {
     let bin = resolve_external_tool(djvused_bin, "djvused");
-    let count_out = run_djvused(&bin, path, "n\n")?;
-    let page_count: u32 = count_out
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u32>().ok())
-        .ok_or_else(|| {
-            CoreError::CorruptFile(format!(
-                "djvused did not return a valid page count for {}",
-                path.display()
-            ))
-        })?;
-
-    let (doc_title, doc_author) = run_djvused(&bin, path, "print-meta\n")
-        .map(|s| parse_djvu_meta(&s))
-        .unwrap_or((None, None));
+    let (page_count, doc_title, doc_author) = match run_djvused(&bin, path, "n\nprint-meta\n") {
+        Ok(combined) => {
+            let mut lines = combined.lines();
+            let count = lines
+                .next()
+                .and_then(|l| l.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    CoreError::CorruptFile(format!(
+                        "djvused did not return a valid page count for {}",
+                        path.display()
+                    ))
+                })?;
+            let meta_tail: String = lines.collect::<Vec<_>>().join("\n");
+            let (mt, ma) = parse_djvu_meta(&meta_tail);
+            (count, mt, ma)
+        }
+        Err(_) => {
+            let count_out = run_djvused(&bin, path, "n\n")?;
+            let count = count_out
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    CoreError::CorruptFile(format!(
+                        "djvused did not return a valid page count for {}",
+                        path.display()
+                    ))
+                })?;
+            let (mt, ma) = run_djvused(&bin, path, "print-meta\n")
+                .map(|s| parse_djvu_meta(&s))
+                .unwrap_or((None, None));
+            (count, mt, ma)
+        }
+    };
 
     if page_count == 0 {
         return Ok(ExtractedDocument {
@@ -243,7 +262,9 @@ fn collect_granular_text_spans(
 }
 
 fn run_djvused(bin: &str, file: &Path, script: &str) -> Result<String> {
-    let mut child = Command::new(bin)
+    let mut cmd = Command::new(bin);
+    configure_background_command(&mut cmd);
+    let mut child = cmd
         .arg("-u")
         .arg(file)
         .stdin(Stdio::piped())

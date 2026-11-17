@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_docs_title_norm ON documents(title_norm);
 CREATE INDEX IF NOT EXISTS idx_docs_authors_norm ON documents(authors_norm_summary);
 CREATE INDEX IF NOT EXISTS idx_docs_year ON documents(year);
+CREATE INDEX IF NOT EXISTS idx_docs_updated_at ON documents(updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_docs_msc_primary ON documents(msc_primary);
 CREATE INDEX IF NOT EXISTS idx_docs_doi ON documents(doi) WHERE doi IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_docs_arxiv ON documents(arxiv_id) WHERE arxiv_id IS NOT NULL;
@@ -158,6 +159,7 @@ CREATE TABLE IF NOT EXISTS passages (
 );
 CREATE INDEX IF NOT EXISTS idx_passages_file_page ON passages(file_id, page_ord);
 CREATE INDEX IF NOT EXISTS idx_passages_doc ON passages(document_id);
+CREATE INDEX IF NOT EXISTS idx_passages_doc_page ON passages(document_id, page_ord, chunk_index);
 
 -- 9. User free tags & Unsupervised topic clusters
 CREATE TABLE IF NOT EXISTS tags (
@@ -230,6 +232,7 @@ CREATE TABLE IF NOT EXISTS metadata_candidates (
     candidate_json  TEXT NOT NULL,    -- Full BibliographicRecord JSON
     created_at      INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_metadata_candidates_doc ON metadata_candidates(document_id);
 
 -- 12. Permanent HTTP cache for bibliographic lookups (CRITICAL for Open Library ToS!)
 CREATE TABLE IF NOT EXISTS metadata_http_cache (
@@ -275,3 +278,4 @@ CREATE TABLE IF NOT EXISTS index_jobs (
     last_error  TEXT,
     UNIQUE(file_id, stage)
 );
+CREATE INDEX IF NOT EXISTS idx_index_jobs_stage_status ON index_jobs(stage, status, priority, id);

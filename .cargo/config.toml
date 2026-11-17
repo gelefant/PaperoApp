@@ -1,0 +1,9 @@
+# Statically link the MSVC C/C++ runtime (`/MT`, `libcpmt.lib`, `libvcruntime.lib`) on Windows.
+# Without `+crt-static`, C++ dependencies (`usearch` via `cxx-build`) compile with `/MD` against
+# Visual Studio 2022 17.10+ (`MSVC >= 14.40`), emitting a dynamic dependency on `MSVCP140.dll`
+# with `constexpr` zero-initialized `std::mutex` (no `_Mtx_init_in_situ`). That either fails to
+# load (`0xC0000135`) on clean Windows installations without VC++ Redistributable or crashes
+# silently at startup (`0xC0000005` inside `MSVCP140.dll!_Mtx_lock`) on Windows PCs whose
+# installed `MSVCP140.dll` predates `14.40`.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

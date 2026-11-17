@@ -70,6 +70,24 @@ pub fn ensure_ort_environment(explicit_path: Option<&Path>) -> Result<(Environme
         )
     })?;
 
+    #[cfg(target_os = "windows")]
+    if let Some(dir) = lib_path.parent() {
+        // Preload bundled modern MSVC CRT DLLs (matching VS 2022 17.10+ `constexpr std::mutex` ABI)
+        // in dependency order before `onnxruntime.dll` so Windows binds to our bundled 14.4x runtime
+        // instead of failing on clean Windows or crashing against an older System32 `msvcp140.dll`.
+        for crt_dll in [
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+        ] {
+            let candidate = dir.join(crt_dll);
+            if candidate.is_file() {
+                let _ = ort::util::preload_dylib(&candidate);
+            }
+        }
+    }
+
     let env = ort::init_from(&lib_path)
         .map_err(|e| CoreError::Config(format!("failed loading ORT {}: {e}", lib_path.display())))?
         .with_name("papero")

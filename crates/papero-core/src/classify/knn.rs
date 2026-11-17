@@ -1,4 +1,5 @@
 use crate::classify::msc2020::normalize_msc_code;
+use crate::db::Database;
 use crate::error::Result;
 use crate::index::vector::VectorIndex;
 use crate::ml::embedder::l2_normalize;
@@ -30,10 +31,19 @@ pub fn compute_document_mean_vectors(
     conn: &Connection,
     vindex: &VectorIndex,
 ) -> Result<Vec<DocMeanVector>> {
+    compute_document_mean_vectors_opts(conn, vindex, true)
+}
+
+/// Computes L2-normalized document mean embeddings using covering index `idx_passages_doc_page`
+/// (zero `passages.text_content` heap scans unless `include_lead_text` is requested for c-TF-IDF).
+pub fn compute_document_mean_vectors_opts(
+    conn: &Connection,
+    vindex: &VectorIndex,
+    include_lead_text: bool,
+) -> Result<Vec<DocMeanVector>> {
     if vindex.is_empty() {
         return Ok(Vec::new());
     }
-    let dim = vindex.dimensions();
 
     let mut doc_meta: HashMap<i64, (String, Option<String>, String, bool)> = HashMap::new();
     {
@@ -57,42 +67,46 @@ pub fn compute_document_mean_vectors(
         }
     }
 
-    let mut acc_vecs: HashMap<i64, (Vec<f32>, usize, String)> = HashMap::new();
-    {
+    // 100% covering-index scan (`idx_passages_doc_page`): never touches `passages.text_content` pages!
+    let pairs: Vec<(i64, u64)> = {
         let mut stmt = conn.prepare(
-            "SELECT document_id, id, text_content FROM passages ORDER BY document_id ASC, page_ord ASC, chunk_index ASC",
+            "SELECT document_id, id FROM passages ORDER BY document_id ASC, page_ord ASC, chunk_index ASC",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)? as u64,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let acc_vecs = vindex.accumulate_doc_vectors(pairs);
+    if acc_vecs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut lead_texts: HashMap<i64, String> = HashMap::new();
+    if include_lead_text {
+        let mut stmt = conn.prepare(
+            "SELECT document_id, SUBSTR(text_content, 1, 1200)
+             FROM passages
+             WHERE page_ord <= 3 AND chunk_index <= 1
+             ORDER BY document_id ASC, page_ord ASC, chunk_index ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for r in rows {
-            let (doc_id, pid, text) = r?;
-            if let Some(vec) = vindex.get_vector(pid) {
-                if vec.len() == dim {
-                    let entry = acc_vecs
-                        .entry(doc_id)
-                        .or_insert_with(|| (vec![0.0_f32; dim], 0usize, String::new()));
-                    for (acc, v) in entry.0.iter_mut().zip(vec.iter()) {
-                        *acc += *v;
-                    }
-                    entry.1 += 1;
-                    if entry.2.len() < 1200 {
-                        if !entry.2.is_empty() {
-                            entry.2.push(' ');
-                        }
-                        entry.2.push_str(&text);
-                    }
+            let (doc_id, snippet) = r?;
+            if !acc_vecs.contains_key(&doc_id) {
+                continue;
+            }
+            let entry = lead_texts.entry(doc_id).or_default();
+            if entry.len() < 1200 {
+                if !entry.is_empty() {
+                    entry.push(' ');
                 }
+                entry.push_str(&snippet);
             }
         }
     }
 
     let mut out = Vec::with_capacity(acc_vecs.len());
-    for (doc_id, (mut sum_vec, count, lead_text)) in acc_vecs {
+    for (doc_id, (mut sum_vec, count)) in acc_vecs {
         if count == 0 {
             continue;
         }
@@ -102,6 +116,7 @@ pub fn compute_document_mean_vectors(
         }
         l2_normalize(&mut sum_vec);
         if let Some((title, msc_primary, msc_status, is_msc_locked)) = doc_meta.remove(&doc_id) {
+            let lead_text = lead_texts.remove(&doc_id).unwrap_or_default();
             out.push(DocMeanVector {
                 document_id: doc_id,
                 title,
@@ -116,16 +131,43 @@ pub fn compute_document_mean_vectors(
     Ok(out)
 }
 
-/// Runs cosine-weighted k-NN (`k = 7` default) over L2-normalized document mean embeddings
-/// to assign `msc_primary` with `msc_primary_status = 'proposed'` on unclassified documents.
-/// Confirmed/metadata/locked MSC assignments are never overwritten.
-pub fn propose_msc_knn(
-    conn: &Connection,
+/// Runs k-NN MSC proposal using a read-only connection for vector aggregation/scoring and acquiring
+/// the writer lock only for the brief SQLite `UPDATE` transaction.
+pub fn propose_msc_knn_on_db(
+    db: &Database,
     vindex: &VectorIndex,
     k: usize,
     min_top_similarity: f32,
 ) -> Result<KnnProposeReport> {
-    let docs = compute_document_mean_vectors(conn, vindex)?;
+    let (labeled_docs, unlabeled_docs, updates) = {
+        let r = db.reader();
+        compute_knn_proposals(&r, vindex, k, min_top_similarity)?
+    };
+    if updates.is_empty() {
+        return Ok(KnnProposeReport {
+            labeled_docs,
+            unlabeled_docs,
+            proposed_count: 0,
+        });
+    }
+    let w = db.writer();
+    let proposed_count = apply_knn_proposals(&w, &updates)?;
+    Ok(KnnProposeReport {
+        labeled_docs,
+        unlabeled_docs,
+        proposed_count,
+    })
+}
+
+type KnnProposalPlan = (usize, usize, Vec<(i64, String)>);
+
+fn compute_knn_proposals(
+    conn: &Connection,
+    vindex: &VectorIndex,
+    k: usize,
+    min_top_similarity: f32,
+) -> Result<KnnProposalPlan> {
+    let docs = compute_document_mean_vectors_opts(conn, vindex, false)?;
     let k = k.max(1);
 
     let mut labeled: Vec<(&str, &[f32])> = Vec::new();
@@ -148,49 +190,68 @@ pub fn propose_msc_knn(
     let labeled_docs = labeled.len();
     let unlabeled_docs = unlabeled.len();
     if labeled.is_empty() || unlabeled.is_empty() {
+        return Ok((labeled_docs, unlabeled_docs, Vec::new()));
+    }
+
+    let mut updates = Vec::new();
+    for target in unlabeled {
+        let mut sims: Vec<(&str, f32)> = labeled
+            .iter()
+            .map(|(code, vec)| (*code, dot(&target.vector, vec)))
+            .filter(|(_, sim)| *sim > 0.0)
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sims.truncate(k);
+
+        if sims.first().map(|s| s.1).unwrap_or(0.0) < min_top_similarity {
+            continue;
+        }
+
+        let mut votes: HashMap<&str, f32> = HashMap::new();
+        for (code, sim) in sims {
+            *votes.entry(code).or_insert(0.0) += sim;
+        }
+        if let Some((best_code, _)) = votes
+            .into_iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            updates.push((target.document_id, best_code.to_string()));
+        }
+    }
+    Ok((labeled_docs, unlabeled_docs, updates))
+}
+
+fn apply_knn_proposals(conn: &Connection, updates: &[(i64, String)]) -> Result<usize> {
+    let now = chrono::Utc::now().timestamp();
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "UPDATE documents SET msc_primary = ?1, msc_primary_status = 'proposed', updated_at = ?2 WHERE id = ?3",
+        )?;
+        for (doc_id, code) in updates {
+            stmt.execute(params![code, now, doc_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(updates.len())
+}
+
+pub fn propose_msc_knn(
+    conn: &Connection,
+    vindex: &VectorIndex,
+    k: usize,
+    min_top_similarity: f32,
+) -> Result<KnnProposeReport> {
+    let (labeled_docs, unlabeled_docs, updates) =
+        compute_knn_proposals(conn, vindex, k, min_top_similarity)?;
+    if updates.is_empty() {
         return Ok(KnnProposeReport {
             labeled_docs,
             unlabeled_docs,
             proposed_count: 0,
         });
     }
-
-    let now = chrono::Utc::now().timestamp();
-    let tx = conn.unchecked_transaction()?;
-    let mut proposed_count = 0usize;
-
-    {
-        let mut stmt = tx.prepare_cached(
-            "UPDATE documents SET msc_primary = ?1, msc_primary_status = 'proposed', updated_at = ?2 WHERE id = ?3",
-        )?;
-        for target in unlabeled {
-            let mut sims: Vec<(&str, f32)> = labeled
-                .iter()
-                .map(|(code, vec)| (*code, dot(&target.vector, vec)))
-                .filter(|(_, sim)| *sim > 0.0)
-                .collect();
-            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            sims.truncate(k);
-
-            if sims.first().map(|s| s.1).unwrap_or(0.0) < min_top_similarity {
-                continue;
-            }
-
-            let mut votes: HashMap<&str, f32> = HashMap::new();
-            for (code, sim) in sims {
-                *votes.entry(code).or_insert(0.0) += sim;
-            }
-            if let Some((best_code, _)) = votes
-                .into_iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                stmt.execute(params![best_code, now, target.document_id])?;
-                proposed_count += 1;
-            }
-        }
-    }
-
-    tx.commit()?;
+    let proposed_count = apply_knn_proposals(conn, &updates)?;
     Ok(KnnProposeReport {
         labeled_docs,
         unlabeled_docs,

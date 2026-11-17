@@ -6,13 +6,92 @@ use crate::protocol::handle_papero_doc_request;
 use crate::state::AppState;
 use std::sync::Arc;
 
+#[cfg(target_os = "windows")]
+fn show_windows_error_dialog(title: &str, body: &str) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_body: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: Both UTF-16 slices are NUL-terminated and live for the duration of `MessageBoxW`.
+    unsafe {
+        let _ = MessageBoxW(
+            std::ptr::null_mut(),
+            wide_body.as_ptr(),
+            wide_title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+fn startup_crash_log_path() -> std::path::PathBuf {
+    let log_dir = papero_core::config::AppPaths::default_app_dir().join("logs");
+    if std::fs::create_dir_all(&log_dir).is_ok() {
+        log_dir.join("startup-error.log")
+    } else {
+        std::env::temp_dir().join("papero-startup-error.log")
+    }
+}
+
+fn report_fatal_startup_error(context: &str, detail: &str) -> ! {
+    tracing::error!("{context}: {detail}");
+    eprintln!("Papero fatal error ({context}): {detail}");
+
+    let crash_path = startup_crash_log_path();
+    let _ = std::fs::write(&crash_path, format!("{context}\n\n{detail}\n"));
+
+    #[cfg(target_os = "windows")]
+    {
+        let dialog_msg = format!(
+            "{context}:\n\n{detail}\n\nDettagli salvati in:\n{}",
+            crash_path.display()
+        );
+        show_windows_error_dialog("Papero — Errore di avvio", &dialog_msg);
+    }
+
+    std::process::exit(1);
+}
+
+fn install_panic_logger() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("panic: {info}");
+        tracing::error!("{msg}");
+        let crash_path = startup_crash_log_path();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&crash_path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{msg}");
+        }
+        prev_hook(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = Arc::new(AppState::initialize().expect("failed to initialize Papero state"));
+    install_panic_logger();
+
+    let app_state = match AppState::initialize() {
+        Ok(state) => Arc::new(state),
+        Err(err) => {
+            report_fatal_startup_error("Impossibile inizializzare lo stato di Papero", &err.to_string())
+        }
+    };
     let protocol_state = Arc::clone(&app_state);
     let reaper_state = Arc::clone(&app_state);
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .setup(move |app| {
@@ -99,6 +178,9 @@ pub fn run() {
             commands::accept_llm_cloud_consent_cmd,
             commands::generate_llm_answer_cmd,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+
+    if let Err(err) = result {
+        report_fatal_startup_error("Errore durante l'avvio della finestra di Papero", &err.to_string());
+    }
 }

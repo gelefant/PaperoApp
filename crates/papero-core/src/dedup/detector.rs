@@ -444,53 +444,69 @@ pub fn list_duplicate_groups(db: &Database) -> Result<Vec<DuplicateGroupView>> {
         .filter_map(std::result::Result::ok)
         .collect();
 
-    let mut out = Vec::with_capacity(groups.len());
-    for (gid, level, sim, reason, status) in groups {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch-load all members for non-'distinct' groups in 1 single SQL query instead of N+1 queries!
+    let mut members_by_group: HashMap<i64, Vec<DuplicateFileMember>> =
+        HashMap::with_capacity(groups.len());
+    {
         let mut m_stmt = conn.prepare(
-            "SELECT dgm.document_id, f.id, f.root_id, sr.label, f.rel_path, f.format,
+            "SELECT dgm.group_id, dgm.document_id, f.id, f.root_id, sr.label, f.rel_path, f.format,
                     d.title, d.year, d.edition, d.isbn, d.doi, d.arxiv_id, d.mr_number,
                     d.zbl_number, f.page_count, f.size_bytes, f.is_available
              FROM duplicate_group_members dgm
+             JOIN duplicate_groups dg ON dg.id = dgm.group_id
              JOIN files f ON f.id = dgm.file_id
              JOIN documents d ON d.id = dgm.document_id
              JOIN source_roots sr ON sr.id = f.root_id
-             WHERE dgm.group_id = ?1
-             ORDER BY f.id ASC",
+             WHERE dg.status != 'distinct'
+             ORDER BY dgm.group_id ASC, f.id ASC",
         )?;
-        let members: Vec<DuplicateFileMember> = m_stmt
-            .query_map(params![gid], |r| {
-                Ok(DuplicateFileMember {
-                    document_id: r.get(0)?,
-                    file_id: r.get(1)?,
-                    root_id: r.get(2)?,
-                    root_label: r.get(3)?,
-                    rel_path: r.get(4)?,
-                    format: r.get(5)?,
-                    title: r.get(6)?,
-                    year: r.get(7)?,
-                    edition: r.get(8)?,
-                    isbn: r.get(9)?,
-                    doi: r.get(10)?,
-                    arxiv_id: r.get(11)?,
-                    mr_number: r.get(12)?,
-                    zbl_number: r.get(13)?,
-                    page_count: r.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-                    size_bytes: r.get::<_, i64>(15)? as u64,
-                    is_available: r.get::<_, i64>(16)? != 0,
-                })
-            })?
-            .filter_map(std::result::Result::ok)
-            .collect();
+        let m_rows = m_stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                DuplicateFileMember {
+                    document_id: r.get(1)?,
+                    file_id: r.get(2)?,
+                    root_id: r.get(3)?,
+                    root_label: r.get(4)?,
+                    rel_path: r.get(5)?,
+                    format: r.get(6)?,
+                    title: r.get(7)?,
+                    year: r.get(8)?,
+                    edition: r.get(9)?,
+                    isbn: r.get(10)?,
+                    doi: r.get(11)?,
+                    arxiv_id: r.get(12)?,
+                    mr_number: r.get(13)?,
+                    zbl_number: r.get(14)?,
+                    page_count: r.get::<_, Option<i64>>(15)?.map(|v| v as u32),
+                    size_bytes: r.get::<_, i64>(16)? as u64,
+                    is_available: r.get::<_, i64>(17)? != 0,
+                },
+            ))
+        })?;
+        for r in m_rows {
+            let (gid, member) = r?;
+            members_by_group.entry(gid).or_default().push(member);
+        }
+    }
 
-        if members.len() >= 2 {
-            out.push(DuplicateGroupView {
-                group_id: gid,
-                group_level: level,
-                max_similarity: sim,
-                reason_detail: reason,
-                status,
-                members,
-            });
+    let mut out = Vec::with_capacity(groups.len());
+    for (gid, level, sim, reason, status) in groups {
+        if let Some(members) = members_by_group.remove(&gid) {
+            if members.len() >= 2 {
+                out.push(DuplicateGroupView {
+                    group_id: gid,
+                    group_level: level,
+                    max_similarity: sim,
+                    reason_detail: reason,
+                    status,
+                    members,
+                });
+            }
         }
     }
 

@@ -1,4 +1,5 @@
 use crate::classify::knn::{compute_document_mean_vectors, dot, DocMeanVector};
+use crate::db::Database;
 use crate::error::Result;
 use crate::index::vector::VectorIndex;
 use crate::ml::embedder::l2_normalize;
@@ -38,6 +39,24 @@ pub struct TagSummary {
 /// Runs deterministic spherical k-means++ with automatic Silhouette K-selection (when
 /// `requested_k` is `None`) and c-TF-IDF keyword cluster labels, preserving manually
 /// locked cluster labels and user-assigned cluster memberships (`is_user_assigned = 1`).
+/// Runs spherical k-means++ using a read-only connection for vector loading & Silhouette
+/// selection, acquiring the writer lock only for the brief SQLite write transaction.
+pub fn run_topic_clustering_on_db(
+    db: &Database,
+    vindex: &VectorIndex,
+    profile: ModelProfile,
+    requested_k: Option<usize>,
+) -> Result<ClusteringReport> {
+    let docs = {
+        let r = db.reader();
+        compute_document_mean_vectors(&r, vindex)?
+    };
+    compute_and_save_clusters_from_docs(docs, profile, requested_k, |cb| {
+        let w = db.writer();
+        cb(&w)
+    })
+}
+
 pub fn run_topic_clustering(
     conn: &Connection,
     vindex: &VectorIndex,
@@ -45,6 +64,18 @@ pub fn run_topic_clustering(
     requested_k: Option<usize>,
 ) -> Result<ClusteringReport> {
     let docs = compute_document_mean_vectors(conn, vindex)?;
+    compute_and_save_clusters_from_docs(docs, profile, requested_k, |cb| cb(conn))
+}
+
+fn compute_and_save_clusters_from_docs<F>(
+    docs: Vec<DocMeanVector>,
+    profile: ModelProfile,
+    requested_k: Option<usize>,
+    with_writer: F,
+) -> Result<ClusteringReport>
+where
+    F: FnOnce(&dyn Fn(&Connection) -> Result<()>) -> Result<()>,
+{
     let n = docs.len();
     if n < 2 {
         return Ok(ClusteringReport {
@@ -82,7 +113,6 @@ pub fn run_topic_clustering(
         (best_k, best_assigns, best_sil)
     };
 
-    // Remap contiguous cluster indices `0..actual_clusters` (defensive if empty cluster occurred)
     let mut active_indices: Vec<usize> = Vec::new();
     let mut remap: HashMap<usize, usize> = HashMap::new();
     for &c in &assignments {
@@ -101,53 +131,54 @@ pub fn run_topic_clustering(
     let now = chrono::Utc::now().timestamp();
     let prof_str = profile.as_str();
 
-    let tx = conn.unchecked_transaction()?;
-
-    // Preserve user-assigned memberships (`is_user_assigned = 1`) and any clusters referenced by
-    // locked labels (`is_label_locked = 1`) or user assignments.
-    tx.execute(
-        "DELETE FROM document_clusters
-         WHERE is_user_assigned = 0
-           AND cluster_id IN (SELECT id FROM topic_clusters WHERE model_profile = ?1)",
-        params![prof_str],
-    )?;
-    tx.execute(
-        "DELETE FROM topic_clusters
-         WHERE model_profile = ?1
-           AND is_label_locked = 0
-           AND id NOT IN (SELECT DISTINCT cluster_id FROM document_clusters WHERE is_user_assigned = 1)",
-        params![prof_str],
-    )?;
-
-    let mut cluster_db_ids = vec![0_i64; cluster_count];
-    for c_idx in 0..cluster_count {
-        let kws = &keywords_by_cluster[c_idx];
-        let label = if kws.is_empty() {
-            format!("Gruppo tematico {}", c_idx + 1)
-        } else {
-            kws.join(" · ")
-        };
-        let kws_json = serde_json::to_string(kws)?;
+    with_writer(&|conn: &Connection| {
+        let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO topic_clusters (model_profile, label, is_label_locked, keywords_json, updated_at)
-             VALUES (?1, ?2, 0, ?3, ?4)",
-            params![prof_str, label, kws_json, now],
+            "DELETE FROM document_clusters
+             WHERE is_user_assigned = 0
+               AND cluster_id IN (SELECT id FROM topic_clusters WHERE model_profile = ?1)",
+            params![prof_str],
         )?;
-        cluster_db_ids[c_idx] = tx.last_insert_rowid();
-    }
+        tx.execute(
+            "DELETE FROM topic_clusters
+             WHERE model_profile = ?1
+               AND is_label_locked = 0
+               AND id NOT IN (SELECT DISTINCT cluster_id FROM document_clusters WHERE is_user_assigned = 1)",
+            params![prof_str],
+        )?;
 
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO document_clusters (document_id, cluster_id, is_user_assigned, score)
-             VALUES (?1, ?2, 0, 1.0)",
-        )?;
-        for (doc, &c_idx) in docs.iter().zip(assignments.iter()) {
-            let cid = cluster_db_ids[c_idx];
-            stmt.execute(params![doc.document_id, cid])?;
+        let mut cluster_db_ids = vec![0_i64; cluster_count];
+        for c_idx in 0..cluster_count {
+            let kws = &keywords_by_cluster[c_idx];
+            let label = if kws.is_empty() {
+                format!("Gruppo tematico {}", c_idx + 1)
+            } else {
+                kws.join(" · ")
+            };
+            let kws_json = serde_json::to_string(kws)?;
+            tx.execute(
+                "INSERT INTO topic_clusters (model_profile, label, is_label_locked, keywords_json, updated_at)
+                 VALUES (?1, ?2, 0, ?3, ?4)",
+                params![prof_str, label, kws_json, now],
+            )?;
+            cluster_db_ids[c_idx] = tx.last_insert_rowid();
         }
-    }
 
-    tx.commit()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO document_clusters (document_id, cluster_id, is_user_assigned, score)
+                 VALUES (?1, ?2, 0, 1.0)",
+            )?;
+            for (doc, &c_idx) in docs.iter().zip(assignments.iter()) {
+                let cid = cluster_db_ids[c_idx];
+                stmt.execute(params![doc.document_id, cid])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    })?;
+
     Ok(ClusteringReport {
         documents_clustered: n,
         clusters_created: cluster_count,

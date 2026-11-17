@@ -1,9 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from 'svelte';
-  import * as pdfjsLib from 'pdfjs-dist';
-  import { WorkerMessageHandler } from 'pdfjs-dist/build/pdf.worker.min.mjs';
-  import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
+  import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from 'pdfjs-dist';
   import { api } from '../api';
+  import { createPdfRangeTransport, loadPdfJs, type PdfJsModule } from '../pdfjsLoader';
   import type {
     ExtractedSpan,
     FilePageInfo,
@@ -19,14 +18,27 @@
   } from '../viewerUtils';
   import { attachSelectableTextLayer } from '../textLayerSelection';
 
-  // Register PDF.js's built-in LoopbackPort worker handler directly in-module.
-  // On macOS WKWebView (`tauri://localhost`), `new URL(location.href).origin` is `"null"`,
-  // which causes PDF.js's external `new Worker(..., { type: "module" })` wrapper to hang silently.
-  (globalThis as Record<string, unknown>).pdfjsWorker = { WorkerMessageHandler };
+  const MAX_CANVAS_PIXELS = 16_777_216; // 16 MP cap prevents 80+ MB Retina BackingStore spikes
+  const THUMB_ROW_HEIGHT = 176;
+  const DJVU_IMG_CACHE_LIMIT = 28;
+  const DJVU_SPANS_CACHE_LIMIT = 64;
 
   function toUint8Array(raw: unknown): Uint8Array<ArrayBuffer> {
     if (raw instanceof ArrayBuffer) {
       return new Uint8Array(raw);
+    }
+    if (raw instanceof Uint8Array) {
+      if (
+        raw.buffer instanceof ArrayBuffer &&
+        raw.byteOffset === 0 &&
+        raw.byteLength === raw.buffer.byteLength
+      ) {
+        return raw as Uint8Array<ArrayBuffer>;
+      }
+      const copy = new ArrayBuffer(raw.byteLength);
+      const out = new Uint8Array(copy);
+      out.set(raw);
+      return out;
     }
     if (ArrayBuffer.isView(raw)) {
       const copy = new ArrayBuffer(raw.byteLength);
@@ -43,39 +55,8 @@
     throw new Error('Formato binario IPC non valido');
   }
 
-  class TauriPdfRangeTransport extends pdfjsLib.PDFDataRangeTransport {
-    private fid: number;
-    private onRangeError: (err: unknown) => void;
-
-    constructor(
-      length: number,
-      initialData: Uint8Array<ArrayBuffer>,
-      fid: number,
-      onRangeError: (err: unknown) => void
-    ) {
-      super(length, initialData, length <= initialData.byteLength);
-      this.fid = fid;
-      this.onRangeError = onRangeError;
-    }
-
-    override requestDataRange(begin: number, end: number): void {
-      const len = Math.max(0, end - begin);
-      if (len === 0) {
-        this.onDataRange(begin, new Uint8Array(0));
-        return;
-      }
-      api
-        .readPdfRange(this.fid, begin, len)
-        .then((ab) => {
-          this.onDataRange(begin, toUint8Array(ab));
-        })
-        .catch((err) => {
-          this.onRangeError(err);
-        });
-    }
-  }
-
   interface PdfPageParams {
+    pdfjsLib: PdfJsModule;
     doc: PDFDocumentProxy;
     pageOrd: number;
     scale: number;
@@ -86,6 +67,7 @@
   function pdfPageAction(surfaceEl: HTMLDivElement, initial: PdfPageParams) {
     let current = initial;
     let activeTask: RenderTask | null = null;
+    let renderedPage: PDFPageProxy | null = null;
     let detachSelection: (() => void) | null = null;
     let renderToken = 0;
     let lastRenderedKey = '';
@@ -113,12 +95,25 @@
 
       try {
         const page = await params.doc.getPage(params.pageOrd);
-        if (token !== renderToken) return;
+        if (token !== renderToken) {
+          page.cleanup();
+          return;
+        }
+        if (renderedPage && renderedPage !== page) {
+          renderedPage.cleanup();
+        }
+        renderedPage = page;
 
-        const dpr = window.devicePixelRatio || 1;
+        const baseDpr = window.devicePixelRatio || 1;
         const viewport = page.getViewport({ scale: params.scale });
-        canvas.width = Math.max(1, Math.floor(viewport.width * dpr));
-        canvas.height = Math.max(1, Math.floor(viewport.height * dpr));
+        const rawPixels = Math.max(1, viewport.width * baseDpr) * Math.max(1, viewport.height * baseDpr);
+        const renderDpr =
+          rawPixels > MAX_CANVAS_PIXELS
+            ? baseDpr * Math.sqrt(MAX_CANVAS_PIXELS / rawPixels)
+            : baseDpr;
+
+        canvas.width = Math.max(1, Math.floor(viewport.width * renderDpr));
+        canvas.height = Math.max(1, Math.floor(viewport.height * renderDpr));
         canvas.style.width = `${Math.floor(viewport.width)}px`;
         canvas.style.height = `${Math.floor(viewport.height)}px`;
 
@@ -128,7 +123,7 @@
         const task = page.render({
           canvasContext: ctx,
           viewport,
-          transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+          transform: renderDpr !== 1 ? [renderDpr, 0, 0, renderDpr, 0, 0] : undefined,
         });
         activeTask = task;
         await task.promise;
@@ -139,13 +134,13 @@
         try {
           detachSelection?.();
           detachSelection = null;
-          textDiv.innerHTML = '';
+          textDiv.textContent = '';
           textDiv.style.width = `${Math.floor(viewport.width)}px`;
           textDiv.style.height = `${Math.floor(viewport.height)}px`;
           textDiv.style.setProperty('--scale-factor', String(params.scale));
           const textContent = await page.getTextContent();
           if (token !== renderToken) return;
-          const textLayer = new pdfjsLib.TextLayer({
+          const textLayer = new params.pdfjsLib.TextLayer({
             textContentSource: textContent,
             container: textDiv,
             viewport,
@@ -186,6 +181,23 @@
           }
           activeTask = null;
         }
+        const canvas = surfaceEl.querySelector('canvas');
+        if (canvas) {
+          canvas.width = 0;
+          canvas.height = 0;
+        }
+        const textDiv = surfaceEl.querySelector('.textLayer');
+        if (textDiv) {
+          textDiv.textContent = '';
+        }
+        if (renderedPage) {
+          try {
+            renderedPage.cleanup();
+          } catch {
+            // Ignore cleanup errors
+          }
+          renderedPage = null;
+        }
       },
     };
   }
@@ -219,8 +231,9 @@
     onOpenExternal,
   }: Props = $props();
 
-  let info = $state<FileViewerInfo | null>(null);
-  let pdfDoc = $state<PDFDocumentProxy | null>(null);
+  let info = $state.raw<FileViewerInfo | null>(null);
+  let pdfjsMod = $state.raw<PdfJsModule | null>(null);
+  let pdfDoc = $state.raw<PDFDocumentProxy | null>(null);
   let loadError = $state<string | null>(null);
   let loading = $state(true);
 
@@ -231,39 +244,59 @@
   let currentPage = $state(1);
 
   let docSearchQuery = $state('');
-  let docSearchHits = $state<number[]>([]);
+  let docSearchHits = $state.raw<number[]>([]);
   let docSearchIdx = $state(0);
   let searchingDoc = $state(false);
 
   let scrollEl: HTMLDivElement | undefined = $state();
+  let pageInputEl: HTMLInputElement | undefined = $state();
+  let thumbSidebarEl: HTMLElement | undefined = $state();
   let containerWidth = $state(760);
   let containerHeight = $state(640);
   let scrollTop = $state(0);
+  let thumbScrollTop = $state(0);
+  let thumbViewportHeight = $state(600);
 
-  let djvuSpansCache = $state<Record<number, ExtractedSpan[]>>({});
-  let djvuImgUrls = $state<Record<string, string>>({});
-  let djvuInFlight = new Set<string>();
-  let thumbRenderedPages = new Set<number>();
+  let djvuSpansCache = $state.raw<Record<number, ExtractedSpan[]>>({});
+  let djvuImgUrls = $state.raw<Record<string, string>>({});
+  const djvuImgOrder: string[] = [];
+  const djvuSpansOrder: number[] = [];
+  const djvuInFlight = new Set<string>();
+
+  let destroyed = false;
+  let loadSeq = 0;
+  let docSearchSeq = 0;
+  let scrollRafId: number | null = null;
+  let activeLoadingTask: { destroy?: () => Promise<void> | void } | null = null;
 
   // Base page sizes (points) fallback when file_pages isn't populated yet
   let pdfDefaultSize = $state<{ w: number; h: number }>({ w: 612, h: 792 });
 
   const pageCount = $derived(info?.page_count || pdfDoc?.numPages || 0);
 
+  const pageDimsByOrd = $derived.by(() => {
+    const map = new Map<number, { w: number; h: number }>();
+    if (info?.pages) {
+      for (const p of info.pages) {
+        if (p.width_pts > 0 && p.height_pts > 0) {
+          map.set(p.page_ord, { w: p.width_pts, h: p.height_pts });
+        }
+      }
+    }
+    return map;
+  });
+
   function revokeAllDjvuUrls() {
     for (const u of Object.values(djvuImgUrls)) {
       URL.revokeObjectURL(u);
     }
     djvuImgUrls = {};
+    djvuImgOrder.length = 0;
     djvuInFlight.clear();
   }
 
   function pageBaseDims(pageOrd: number): { w: number; h: number } {
-    const found = info?.pages.find((p) => p.page_ord === pageOrd);
-    if (found && found.width_pts > 0 && found.height_pts > 0) {
-      return { w: found.width_pts, h: found.height_pts };
-    }
-    return pdfDefaultSize;
+    return pageDimsByOrd.get(pageOrd) ?? pdfDefaultSize;
   }
 
   function effectiveScaleForPage(pageOrd: number): number {
@@ -277,33 +310,60 @@
 
   const pageSlots = $derived.by(() => {
     const count = pageCount;
-    const slots: Array<{ pageOrd: number; top: number; width: number; height: number; scale: number }> = [];
+    const dimsMap = pageDimsByOrd;
+    const defSize = pdfDefaultSize;
+    const availW = Math.max(240, containerWidth - 48);
+    const availH = Math.max(240, containerHeight - 36);
+    const mode = zoomMode;
+    const cZoom = customZoom;
+
+    const slots: Array<{ pageOrd: number; top: number; width: number; height: number; scale: number }> =
+      new Array(count);
     let y = 12;
     for (let p = 1; p <= count; p++) {
-      const { w, h } = pageBaseDims(p);
-      const scale = effectiveScaleForPage(p);
-      const pxW = Math.round(w * scale);
-      const pxH = Math.round(h * scale);
-      slots.push({ pageOrd: p, top: y, width: pxW, height: pxH, scale });
+      const dims = dimsMap.get(p) ?? defSize;
+      const scale =
+        mode === 'fit-width'
+          ? availW / dims.w
+          : mode === 'fit-page'
+            ? Math.min(availW / dims.w, availH / dims.h)
+            : cZoom;
+      const pxW = Math.round(dims.w * scale);
+      const pxH = Math.round(dims.h * scale);
+      slots[p - 1] = { pageOrd: p, top: y, width: pxW, height: pxH, scale };
       y += pxH + 16;
     }
     return { slots, totalHeight: y };
   });
+
+  function findFirstSlotAtOrBelow(
+    slots: Array<{ pageOrd: number; top: number; height: number }>,
+    targetY: number
+  ): number {
+    let lo = 0;
+    let hi = slots.length - 1;
+    let ans = slots.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (slots[mid].top + slots[mid].height >= targetY) {
+        ans = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return ans;
+  }
 
   const visibleRange = $derived.by(() => {
     const slots = pageSlots.slots;
     if (!slots.length) return { start: 1, end: 0 };
     const viewTop = scrollTop;
     const viewBottom = scrollTop + containerHeight;
-    let first = 1;
+    const firstIdx = findFirstSlotAtOrBelow(slots, viewTop);
+    const first = slots[firstIdx].pageOrd;
     let last = slots.length;
-    for (let i = 0; i < slots.length; i++) {
-      if (slots[i].top + slots[i].height >= viewTop) {
-        first = slots[i].pageOrd;
-        break;
-      }
-    }
-    for (let i = first - 1; i < slots.length; i++) {
+    for (let i = firstIdx; i < slots.length; i++) {
       if (slots[i].top > viewBottom) {
         last = Math.max(first, slots[i].pageOrd - 1);
         break;
@@ -315,23 +375,68 @@
     };
   });
 
-  function updateCurrentPageFromScroll() {
-    if (!scrollEl) return;
-    scrollTop = scrollEl.scrollTop;
-    const mid = scrollTop + containerHeight * 0.35;
-    for (const s of pageSlots.slots) {
-      if (s.top + s.height >= mid) {
-        currentPage = s.pageOrd;
-        goToInput = String(s.pageOrd);
-        break;
+  const visibleSlots = $derived.by(() => {
+    const { start, end } = visibleRange;
+    if (end < start) return [];
+    return pageSlots.slots.slice(start - 1, end);
+  });
+
+  const thumbWindow = $derived.by(() => {
+    const total = pageCount;
+    if (sidebarMode !== 'thumbnails' || total <= 0) {
+      return { pages: [] as number[], topPad: 0, bottomPad: 0, start: 1, end: 0 };
+    }
+    const firstIdx = Math.max(0, Math.floor(thumbScrollTop / THUMB_ROW_HEIGHT) - 6);
+    const visibleCount = Math.ceil(thumbViewportHeight / THUMB_ROW_HEIGHT) + 12;
+    const endIdx = Math.min(total, firstIdx + visibleCount);
+    const pages: number[] = [];
+    for (let p = firstIdx + 1; p <= endIdx; p++) {
+      pages.push(p);
+    }
+    return {
+      pages,
+      topPad: firstIdx * THUMB_ROW_HEIGHT,
+      bottomPad: Math.max(0, (total - endIdx) * THUMB_ROW_HEIGHT),
+      start: firstIdx + 1,
+      end: endIdx,
+    };
+  });
+
+  function handleViewportScroll() {
+    if (scrollRafId !== null) return;
+    scrollRafId = requestAnimationFrame(() => {
+      scrollRafId = null;
+      if (!scrollEl || destroyed) return;
+      scrollTop = scrollEl.scrollTop;
+      const slots = pageSlots.slots;
+      if (!slots.length) return;
+      const mid = scrollTop + containerHeight * 0.35;
+      const idx = findFirstSlotAtOrBelow(slots, mid);
+      const pg = slots[idx]?.pageOrd ?? 1;
+      if (currentPage !== pg) {
+        currentPage = pg;
       }
+      if (document.activeElement !== pageInputEl) {
+        const nextStr = String(pg);
+        if (goToInput !== nextStr) {
+          goToInput = nextStr;
+        }
+      }
+    });
+  }
+
+  function handleThumbSidebarScroll() {
+    if (!thumbSidebarEl) return;
+    thumbScrollTop = thumbSidebarEl.scrollTop;
+    if (thumbSidebarEl.clientHeight > 0) {
+      thumbViewportHeight = thumbSidebarEl.clientHeight;
     }
   }
 
   export async function scrollToPage(pageOrd: number, rects: NormalizedRect[] = []) {
     await tick();
-    if (!scrollEl) return;
-    const slot = pageSlots.slots.find((s) => s.pageOrd === pageOrd);
+    if (!scrollEl || destroyed) return;
+    const slot = pageSlots.slots[pageOrd - 1];
     if (!slot) return;
     const centerFrac = rects.length > 0 ? computePassageCenterFraction(rects) : 0.08;
     const targetTop =
@@ -347,23 +452,38 @@
   const INLINE_PDF_MAX_BYTES = 2 * 1024 * 1024; // <= 2 MB: single IPC read; > 2 MB: 64 KB range streaming
 
   async function loadDocument(activeFid: number) {
+    const seq = ++loadSeq;
+    docSearchSeq++;
+    searchingDoc = false;
+    docSearchHits = [];
+    docSearchIdx = 0;
     loading = true;
     loadError = null;
-    thumbRenderedPages.clear();
     djvuSpansCache = {};
+    djvuSpansOrder.length = 0;
     revokeAllDjvuUrls();
-    if (pdfDoc) {
+
+    if (activeLoadingTask) {
       try {
-        await pdfDoc.destroy();
+        await activeLoadingTask.destroy?.();
+      } catch {
+        // Ignore task cancellation errors
+      }
+      activeLoadingTask = null;
+    }
+    if (pdfDoc) {
+      const prevDoc = pdfDoc;
+      pdfDoc = null;
+      try {
+        await prevDoc.destroy();
       } catch {
         // Ignore cleanup errors
       }
-      pdfDoc = null;
     }
 
     try {
       const docInfo = await api.getViewerDoc(activeFid);
-      if (fileId !== activeFid) return;
+      if (destroyed || seq !== loadSeq || fileId !== activeFid) return;
       info = docInfo;
       if (!docInfo.is_available) {
         loadError = 'Cartella sorgente non raggiungibile.';
@@ -377,9 +497,14 @@
           throw new Error('Il file PDF risulta vuoto (0 byte).');
         }
 
+        const pdfjsLib = await loadPdfJs();
+        if (destroyed || seq !== loadSeq || fileId !== activeFid) return;
+        pdfjsMod = pdfjsLib;
+
         let loadingTask;
         if (totalSize <= INLINE_PDF_MAX_BYTES) {
           const fullBuf = toUint8Array(await api.readPdfRange(activeFid, 0, totalSize));
+          if (destroyed || seq !== loadSeq || fileId !== activeFid) return;
           loadingTask = pdfjsLib.getDocument({
             data: fullBuf,
             isOffscreenCanvasSupported: false,
@@ -391,12 +516,15 @@
           const initialBytes = toUint8Array(
             await api.readPdfRange(activeFid, 0, Math.min(chunkSize, totalSize))
           );
-          const transport = new TauriPdfRangeTransport(
+          if (destroyed || seq !== loadSeq || fileId !== activeFid) return;
+          const transport = createPdfRangeTransport(
+            pdfjsLib,
             totalSize,
             initialBytes,
-            activeFid,
+            async (begin, len) => toUint8Array(await api.readPdfRange(activeFid, begin, len)),
+            () => destroyed || seq !== loadSeq || fileId !== activeFid,
             (err) => {
-              if (!loadError) {
+              if (!destroyed && seq === loadSeq && !loadError) {
                 loadError = `Errore lettura PDF: ${String(err)}`;
               }
             }
@@ -413,8 +541,12 @@
           });
         }
 
+        activeLoadingTask = loadingTask;
         const loaded = await loadingTask.promise;
-        if (fileId !== activeFid) {
+        if (activeLoadingTask === loadingTask) {
+          activeLoadingTask = null;
+        }
+        if (destroyed || seq !== loadSeq || fileId !== activeFid) {
           await loaded.destroy();
           return;
         }
@@ -423,22 +555,27 @@
           const firstPage = await loaded.getPage(1);
           const vp = firstPage.getViewport({ scale: 1 });
           pdfDefaultSize = { w: vp.width, h: vp.height };
+          firstPage.cleanup();
         }
         if (docInfo.page_count === 0) {
           info = { ...docInfo, page_count: loaded.numPages };
         }
       }
 
+      if (destroyed || seq !== loadSeq) return;
       loading = false;
       await tick();
+      if (destroyed || seq !== loadSeq) return;
       if (scrollEl && scrollEl.clientWidth > 0) {
         containerWidth = scrollEl.clientWidth;
         containerHeight = scrollEl.clientHeight;
       }
       await scrollToPage(targetPage || 1, highlightRects);
     } catch (e) {
-      loadError = `Impossibile aprire il documento: ${String(e)}`;
-      loading = false;
+      if (!destroyed && seq === loadSeq) {
+        loadError = `Impossibile aprire il documento: ${String(e)}`;
+        loading = false;
+      }
     }
   }
 
@@ -464,25 +601,62 @@
     if (!info || loading || info.format !== 'djvu') return;
     const { start, end } = visibleRange;
     const slots = pageSlots.slots;
+    const seq = loadSeq;
     untrack(() => {
       for (let p = start; p <= end; p++) {
         const slot = slots[p - 1];
         const dpi = slot && slot.scale > 1.3 ? 200 : 150;
-        void ensureDjvuPageImage(p, dpi);
-        void ensureDjvuText(p);
+        void ensureDjvuPageImage(p, dpi, seq);
+        void ensureDjvuText(p, seq);
       }
     });
   });
 
-  async function ensureDjvuPageImage(pageOrd: number, dpi: number) {
-    const key = `${fileId}:${pageOrd}:${dpi}`;
+  function insertBoundedDjvuUrl(key: string, url: string) {
+    const next = { ...djvuImgUrls, [key]: url };
+    djvuImgOrder.push(key);
+    if (djvuImgOrder.length > DJVU_IMG_CACHE_LIMIT) {
+      const { start, end } = visibleRange;
+      const tStart = thumbWindow.start;
+      const tEnd = thumbWindow.end;
+      let i = 0;
+      while (djvuImgOrder.length > DJVU_IMG_CACHE_LIMIT && i < djvuImgOrder.length) {
+        const candKey = djvuImgOrder[i];
+        const parts = candKey.split(':');
+        const pg = Number(parts[1] ?? '0');
+        const dpi = Number(parts[2] ?? '0');
+        const pinMain = dpi !== 60 && pg >= start && pg <= end;
+        const pinThumb = dpi === 60 && pg >= tStart && pg <= tEnd;
+        if (!pinMain && !pinThumb) {
+          djvuImgOrder.splice(i, 1);
+          const oldUrl = next[candKey];
+          if (oldUrl) {
+            URL.revokeObjectURL(oldUrl);
+            delete next[candKey];
+          }
+        } else {
+          i++;
+        }
+      }
+    }
+    djvuImgUrls = next;
+  }
+
+  async function ensureDjvuPageImage(pageOrd: number, dpi: number, seq = loadSeq) {
+    const activeFid = fileId;
+    const key = `${activeFid}:${pageOrd}:${dpi}`;
     if (djvuImgUrls[key] || djvuInFlight.has(key)) return;
     djvuInFlight.add(key);
     try {
-      const ab = await api.renderDjvuPage(fileId, pageOrd, dpi);
+      const ab = await api.renderDjvuPage(activeFid, pageOrd, dpi);
+      if (destroyed || seq !== loadSeq || fileId !== activeFid) return;
       const bytes = toUint8Array(ab);
       const url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
-      djvuImgUrls = { ...djvuImgUrls, [key]: url };
+      if (destroyed || seq !== loadSeq || fileId !== activeFid) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      insertBoundedDjvuUrl(key, url);
     } catch {
       // Ignore per-page DjVu render error
     } finally {
@@ -491,40 +665,84 @@
   }
 
   function djvuThumbAction(_node: HTMLElement, pageOrd: number) {
-    ensureDjvuPageImage(pageOrd, 60);
+    void ensureDjvuPageImage(pageOrd, 60);
     return {};
   }
 
-  async function ensureDjvuText(pageOrd: number) {
-    if (djvuSpansCache[pageOrd]) return;
+  async function ensureDjvuText(pageOrd: number, seq = loadSeq) {
+    if (djvuSpansCache[pageOrd] !== undefined) return;
+    const activeFid = fileId;
     try {
-      const spans = await api.getDjvuPageText(fileId, pageOrd);
-      djvuSpansCache = { ...djvuSpansCache, [pageOrd]: spans };
-    } catch {
-      djvuSpansCache = { ...djvuSpansCache, [pageOrd]: [] };
-    }
-  }
-
-  async function renderThumbnail(canvas: HTMLCanvasElement, pageOrd: number) {
-    if (!pdfDoc || thumbRenderedPages.has(pageOrd)) return;
-    thumbRenderedPages.add(pageOrd);
-    try {
-      const page = await pdfDoc.getPage(pageOrd);
-      const vp = page.getViewport({ scale: 0.2 });
-      canvas.width = Math.max(1, Math.floor(vp.width));
-      canvas.height = Math.max(1, Math.floor(vp.height));
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      const spans = await api.getDjvuPageText(activeFid, pageOrd);
+      if (destroyed || seq !== loadSeq || fileId !== activeFid) return;
+      const next = { ...djvuSpansCache, [pageOrd]: spans };
+      djvuSpansOrder.push(pageOrd);
+      while (djvuSpansOrder.length > DJVU_SPANS_CACHE_LIMIT) {
+        const oldest = djvuSpansOrder.shift();
+        if (oldest !== undefined && (oldest < visibleRange.start || oldest > visibleRange.end)) {
+          delete next[oldest];
+        }
       }
+      djvuSpansCache = next;
     } catch {
-      thumbRenderedPages.delete(pageOrd);
+      if (!destroyed && seq === loadSeq && fileId === activeFid) {
+        djvuSpansCache = { ...djvuSpansCache, [pageOrd]: [] };
+      }
     }
   }
 
-  function thumbAction(node: HTMLCanvasElement, pageOrd: number) {
-    renderThumbnail(node, pageOrd);
-    return {};
+  function thumbAction(canvas: HTMLCanvasElement, pageOrd: number) {
+    let cancelled = false;
+    let activeTask: RenderTask | null = null;
+    let renderedThumbPage: PDFPageProxy | null = null;
+
+    void (async () => {
+      const doc = pdfDoc;
+      if (!doc || cancelled || destroyed) return;
+      try {
+        const page = await doc.getPage(pageOrd);
+        if (cancelled || destroyed || pdfDoc !== doc) {
+          page.cleanup();
+          return;
+        }
+        renderedThumbPage = page;
+        const vp = page.getViewport({ scale: 0.2 });
+        canvas.width = Math.max(1, Math.floor(vp.width));
+        canvas.height = Math.max(1, Math.floor(vp.height));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const task = page.render({ canvasContext: ctx, viewport: vp });
+        activeTask = task;
+        await task.promise;
+        activeTask = null;
+      } catch {
+        // Ignore cancelled/transient thumbnail errors
+      }
+    })();
+
+    return {
+      destroy() {
+        cancelled = true;
+        if (activeTask) {
+          try {
+            activeTask.cancel();
+          } catch {
+            // Ignore cancellation
+          }
+          activeTask = null;
+        }
+        canvas.width = 0;
+        canvas.height = 0;
+        if (renderedThumbPage) {
+          try {
+            renderedThumbPage.cleanup();
+          } catch {
+            // Ignore cleanup errors
+          }
+          renderedThumbPage = null;
+        }
+      },
+    };
   }
 
   function handleGoToSubmit(e: Event) {
@@ -532,7 +750,7 @@
     const pages: FilePageInfo[] = info?.pages ?? [];
     const target = resolveGoToPage(goToInput, pageCount, pages);
     if (target !== null) {
-      scrollToPage(target);
+      void scrollToPage(target);
     }
   }
 
@@ -540,41 +758,64 @@
     e.preventDefault();
     const q = docSearchQuery.trim().toLowerCase();
     if (!q || !info) return;
+    const seq = ++docSearchSeq;
+    const activeLoad = loadSeq;
     searchingDoc = true;
     const hits: number[] = [];
     try {
       if (info.format === 'pdf' && pdfDoc) {
-        for (let p = 1; p <= pdfDoc.numPages; p++) {
-          const page = await pdfDoc.getPage(p);
-          const tc = await page.getTextContent();
-          const full = tc.items
-            .map((it) => ('str' in it ? it.str : ''))
-            .join(' ')
-            .toLowerCase();
-          if (full.includes(q)) hits.push(p);
+        const doc = pdfDoc;
+        for (let p = 1; p <= doc.numPages; p++) {
+          if (destroyed || seq !== docSearchSeq || activeLoad !== loadSeq) return;
+          const page = await doc.getPage(p);
+          try {
+            const tc = await page.getTextContent();
+            let matched = false;
+            let combined = '';
+            for (const it of tc.items) {
+              if ('str' in it && it.str) {
+                combined += (combined ? ' ' : '') + it.str.toLowerCase();
+              }
+            }
+            matched = combined.includes(q);
+            if (matched) hits.push(p);
+          } finally {
+            page.cleanup();
+          }
+          if (p % 25 === 0) {
+            await new Promise((r) => setTimeout(r, 0));
+          }
         }
       } else if (info.format === 'djvu') {
-        for (let p = 1; p <= info.page_count; p++) {
-          await ensureDjvuText(p);
-          const spans = djvuSpansCache[p] ?? [];
+        const total = info.page_count;
+        const fid = fileId;
+        for (let p = 1; p <= total; p++) {
+          if (destroyed || seq !== docSearchSeq || activeLoad !== loadSeq) return;
+          const spans = djvuSpansCache[p] ?? (await api.getDjvuPageText(fid, p).catch(() => []));
           const full = spans.map((s) => s.text).join(' ').toLowerCase();
           if (full.includes(q)) hits.push(p);
+          if (p % 15 === 0) {
+            await new Promise((r) => setTimeout(r, 0));
+          }
         }
       }
+      if (destroyed || seq !== docSearchSeq || activeLoad !== loadSeq) return;
       docSearchHits = hits;
       docSearchIdx = 0;
       if (hits.length > 0) {
-        scrollToPage(hits[0]);
+        void scrollToPage(hits[0]);
       }
     } finally {
-      searchingDoc = false;
+      if (!destroyed && seq === docSearchSeq) {
+        searchingDoc = false;
+      }
     }
   }
 
   function stepDocSearch(delta: number) {
     if (!docSearchHits.length) return;
     docSearchIdx = (docSearchIdx + delta + docSearchHits.length) % docSearchHits.length;
-    scrollToPage(docSearchHits[docSearchIdx]);
+    void scrollToPage(docSearchHits[docSearchIdx]);
   }
 
   let resizeObserver: ResizeObserver | null = null;
@@ -599,10 +840,27 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
+    loadSeq++;
+    docSearchSeq++;
+    if (scrollRafId !== null) {
+      cancelAnimationFrame(scrollRafId);
+      scrollRafId = null;
+    }
     resizeObserver?.disconnect();
     revokeAllDjvuUrls();
+    if (activeLoadingTask) {
+      try {
+        void activeLoadingTask.destroy?.();
+      } catch {
+        // Ignore cleanup errors
+      }
+      activeLoadingTask = null;
+    }
     if (pdfDoc) {
-      pdfDoc.destroy();
+      const prev = pdfDoc;
+      pdfDoc = null;
+      void prev.destroy();
     }
   });
 </script>
@@ -616,7 +874,10 @@
         class:active={sidebarMode === 'thumbnails'}
         title="Miniature pagine"
         aria-label="Miniature pagine"
-        onclick={() => (sidebarMode = sidebarMode === 'thumbnails' ? 'none' : 'thumbnails')}
+        onclick={() => {
+          sidebarMode = sidebarMode === 'thumbnails' ? 'none' : 'thumbnails';
+          thumbScrollTop = Math.max(0, (currentPage - 2) * THUMB_ROW_HEIGHT);
+        }}
       >
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="3" y="3" width="7" height="7" rx="1" />
@@ -640,7 +901,13 @@
     </div>
 
     <form class="group" onsubmit={handleGoToSubmit}>
-      <input class="page-input" bind:value={goToInput} title="Numero di pagina (Invio per andare)" aria-label="Pagina corrente" />
+      <input
+        class="page-input"
+        bind:this={pageInputEl}
+        bind:value={goToInput}
+        title="Numero di pagina (Invio per andare)"
+        aria-label="Pagina corrente"
+      />
       <span class="pg-total">/ {pageCount}</span>
     </form>
 
@@ -764,10 +1031,13 @@
 
   <div class="viewer-body">
     {#if sidebarMode !== 'none' && info}
-      <aside class="viewer-sidebar">
+      <aside class="viewer-sidebar" bind:this={thumbSidebarEl} onscroll={handleThumbSidebarScroll}>
         {#if sidebarMode === 'thumbnails'}
-          <div class="thumbs-list">
-            {#each Array.from({ length: pageCount }, (_, i) => i + 1) as p (p)}
+          <div
+            class="thumbs-list"
+            style="padding-top: {thumbWindow.topPad}px; padding-bottom: {thumbWindow.bottomPad}px;"
+          >
+            {#each thumbWindow.pages as p (p)}
               <button
                 type="button"
                 class="thumb-item"
@@ -821,69 +1091,66 @@
       </aside>
     {/if}
 
-    <div class="scroll-viewport" bind:this={scrollEl} onscroll={updateCurrentPageFromScroll}>
+    <div class="scroll-viewport" bind:this={scrollEl} onscroll={handleViewportScroll}>
       {#if loading}
         <div class="center-msg">Caricamento documento…</div>
       {:else if loadError}
         <div class="center-msg error">{loadError}</div>
       {:else if info}
         <div class="pages-canvas-stage" style="height: {pageSlots.totalHeight}px;">
-          {#each pageSlots.slots as slot (slot.pageOrd)}
+          {#each visibleSlots as slot (slot.pageOrd)}
             <div
               id={`page-wrap-${fileId}-${slot.pageOrd}`}
               class="page-slot"
               style="top: {slot.top}px; width: {slot.width}px; height: {slot.height}px;"
             >
-              {#if slot.pageOrd >= visibleRange.start && slot.pageOrd <= visibleRange.end}
-                {#if info.format === 'pdf' && pdfDoc}
-                  <div
-                    class="pdf-page-surface"
-                    use:pdfPageAction={{
-                      doc: pdfDoc,
-                      pageOrd: slot.pageOrd,
-                      scale: slot.scale,
-                      width: slot.width,
-                      height: slot.height,
-                    }}
-                  >
-                    <canvas class="pdf-canvas"></canvas>
-                    <div class="textLayer"></div>
-                  </div>
-                {:else}
-                  {@const pageDpi = slot.scale > 1.3 ? 200 : 150}
-                  {@const pageImgUrl = djvuImgUrls[`${fileId}:${slot.pageOrd}:${pageDpi}`]}
-                  {#if pageImgUrl}
-                    <img
-                      class="djvu-page-img"
-                      src={pageImgUrl}
-                      alt={`Pagina ${slot.pageOrd}`}
-                      draggable="false"
-                    />
-                  {:else}
-                    <div class="page-placeholder">Rendering DjVu p. {slot.pageOrd}…</div>
-                  {/if}
-                  <div class="djvu-text-layer" use:djvuTextLayerAction>
-                    {#each djvuSpansCache[slot.pageOrd] ?? [] as sp}
-                      <span
-                        class="djvu-text-span"
-                        style="left: {sp.bbox.x * 100}%; top: {sp.bbox.y * 100}%; width: {sp.bbox.w * 100}%; height: {sp.bbox.h * 100}%; font-size: {Math.max(8, sp.bbox.h * slot.height * 0.85)}px;"
-                      >{sp.text}</span>
-                    {/each}
-                  </div>
-                {/if}
-
-                {#if slot.pageOrd === targetPage && highlightRects.length > 0}
-                  <div class="highlight-layer">
-                    {#each highlightRects as rect}
-                      <div
-                        class="highlight-box"
-                        style="left: {rect.x * 100}%; top: {rect.y * 100}%; width: {rect.w * 100}%; height: {rect.h * 100}%;"
-                      ></div>
-                    {/each}
-                  </div>
-                {/if}
+              {#if info.format === 'pdf' && pdfDoc && pdfjsMod}
+                <div
+                  class="pdf-page-surface"
+                  use:pdfPageAction={{
+                    pdfjsLib: pdfjsMod,
+                    doc: pdfDoc,
+                    pageOrd: slot.pageOrd,
+                    scale: slot.scale,
+                    width: slot.width,
+                    height: slot.height,
+                  }}
+                >
+                  <canvas class="pdf-canvas"></canvas>
+                  <div class="textLayer"></div>
+                </div>
               {:else}
-                <div class="page-placeholder">Pagina {slot.pageOrd}</div>
+                {@const pageDpi = slot.scale > 1.3 ? 200 : 150}
+                {@const pageImgUrl = djvuImgUrls[`${fileId}:${slot.pageOrd}:${pageDpi}`]}
+                {#if pageImgUrl}
+                  <img
+                    class="djvu-page-img"
+                    src={pageImgUrl}
+                    alt={`Pagina ${slot.pageOrd}`}
+                    draggable="false"
+                  />
+                {:else}
+                  <div class="page-placeholder">Rendering DjVu p. {slot.pageOrd}…</div>
+                {/if}
+                <div class="djvu-text-layer" use:djvuTextLayerAction>
+                  {#each djvuSpansCache[slot.pageOrd] ?? [] as sp}
+                    <span
+                      class="djvu-text-span"
+                      style="left: {sp.bbox.x * 100}%; top: {sp.bbox.y * 100}%; width: {sp.bbox.w * 100}%; height: {sp.bbox.h * 100}%; font-size: {Math.max(8, sp.bbox.h * slot.height * 0.85)}px;"
+                    >{sp.text}</span>
+                  {/each}
+                </div>
+              {/if}
+
+              {#if slot.pageOrd === targetPage && highlightRects.length > 0}
+                <div class="highlight-layer">
+                  {#each highlightRects as rect}
+                    <div
+                      class="highlight-box"
+                      style="left: {rect.x * 100}%; top: {rect.y * 100}%; width: {rect.w * 100}%; height: {rect.h * 100}%;"
+                    ></div>
+                  {/each}
+                </div>
               {/if}
             </div>
           {/each}
@@ -965,6 +1232,7 @@
     background: var(--bg-panel);
     overflow-y: auto;
     padding: 6px;
+    contain: content;
   }
   .thumbs-list {
     display: flex;
@@ -975,6 +1243,9 @@
     display: flex;
     flex-direction: column;
     align-items: center;
+    justify-content: center;
+    height: 168px;
+    box-sizing: border-box;
     gap: 4px;
     padding: 6px;
     background: transparent;
@@ -986,13 +1257,14 @@
   .thumb-canvas,
   .thumb-img {
     max-width: 150px;
+    max-height: 132px;
     border: 1px solid var(--border);
     background: #fff;
     display: block;
   }
   .thumb-placeholder {
     width: 110px;
-    height: 145px;
+    height: 132px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1035,6 +1307,7 @@
     overflow-x: auto;
     position: relative;
     background: var(--bg-muted);
+    contain: strict;
   }
   .pages-canvas-stage {
     position: relative;
@@ -1047,6 +1320,7 @@
     background: #fff;
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
     overflow: hidden;
+    contain: layout paint;
   }
   .pdf-page-surface {
     position: relative;

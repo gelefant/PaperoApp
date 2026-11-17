@@ -66,7 +66,9 @@ pub struct WaterfallClients {
 impl WaterfallClients {
     pub fn from_config(config: &AppConfig) -> Result<Self> {
         const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-        let email = load_polite_email(config);
+        let email = load_polite_email(config).filter(|m| {
+            !m.is_empty() && m.bytes().all(|b| (0x20..=0x7E).contains(&b))
+        });
         let ua = match email.as_deref() {
             Some(mail) => format!("Papero/{APP_VERSION} ({mail})"),
             None => format!("Papero/{APP_VERSION}"),
@@ -286,13 +288,19 @@ pub async fn resolve_document_metadata(
     .await
     {
         Ok(res) => res,
-        Err(_) => {
+        Err(payload) => {
+            let panic_msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic payload");
             tracing::error!(
                 document_id,
+                panic = %panic_msg,
                 "unexpected panic while resolving bibliographic metadata"
             );
             Err(CoreError::Network(format!(
-                "internal error while resolving metadata for document {document_id}"
+                "internal error while resolving metadata for document {document_id}: {panic_msg}"
             )))
         }
     }
@@ -320,7 +328,7 @@ async fn resolve_document_metadata_inner(
         });
     }
 
-    let ctx = gather_document_context(db, config, document_id)?;
+    let ctx = gather_document_context_async(db, config, document_id, scope).await?;
     let mut working_ids = ctx.ids.clone();
     {
         let w = db.writer();
@@ -452,11 +460,52 @@ async fn resolve_document_metadata_inner(
         }
     }
 
+    // ISBN Bridge for books: resolve canonical book Title + Author (+ publisher DOI) via Crossref / Open Library
+    // before running the title waterfall so prioritized math sources (MRLookup / zbMATH) get clean book queries.
+    if bridge_record.is_none() {
+        if let Some(isbn_val) = working_ids.isbn.clone() {
+            let mut isbn_hit = if config.crossref_enabled {
+                clients
+                    .crossref
+                    .lookup_isbn(db, &isbn_val)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            if isbn_hit.is_none() && config.openlibrary_enabled {
+                let isbn_only = ExtractedIdentifiers {
+                    isbn: Some(isbn_val),
+                    looks_like_book: true,
+                    ..ExtractedIdentifiers::default()
+                };
+                if let Ok(ol_hits) = clients.openlibrary.lookup_book(db, &isbn_only).await {
+                    isbn_hit = ol_hits.into_iter().next().filter(|h| h.score >= 0.95);
+                }
+            }
+            if let Some(hit) = isbn_hit {
+                if verify_candidate_against_context(&hit, &ctx) {
+                    enrich_working_ids_from_bridge(&mut working_ids, &hit.record, &ctx);
+                    if working_ids.doi.is_none() {
+                        working_ids.doi = hit.record.doi.clone();
+                    }
+                    working_ids.looks_like_book = true;
+                    bridge_record = Some(hit.record.clone());
+                    bridge_hit = Some(hit);
+                } else if !ctx.is_guided {
+                    working_ids.isbn = None;
+                }
+            }
+        }
+    }
+
     run_waterfall_pass(
         db,
         clients,
         config,
         allow_mrlookup,
+        scope,
         &ordered_sources,
         &working_ids,
         &ctx,
@@ -467,12 +516,20 @@ async fn resolve_document_metadata_inner(
 
     // Multi-hypothesis title fallback: if Pass 1 did not yield a confident match (e.g. primary title
     // had mangled PDF math symbols, subtitle noise, or differed from embedded/filename title), try up to
-    // 2 alternative title hypotheses across the prioritized waterfall.
+    // 2 alternative title hypotheses across the prioritized waterfall (1 in bulk book mode).
     if best_certain.is_none() && bridge_record.is_none() && !working_ids.alt_heuristic_titles.is_empty() {
+        let max_alts = if scope == MetadataLookupScope::BulkBackgroundScan && working_ids.looks_like_book {
+            1
+        } else {
+            2
+        };
+        // Avoid repeating 5s-rate-limited MRLookup in secondary bulk passes if Pass 1 already queried it.
+        let allow_mrlookup_alt =
+            allow_mrlookup && scope == MetadataLookupScope::SingleRecordUserAction;
         let alt_list: Vec<String> = working_ids
             .alt_heuristic_titles
             .iter()
-            .take(2)
+            .take(max_alts)
             .cloned()
             .collect();
         for alt_ti in alt_list {
@@ -485,7 +542,8 @@ async fn resolve_document_metadata_inner(
                 db,
                 clients,
                 config,
-                allow_mrlookup,
+                allow_mrlookup_alt,
+                scope,
                 &ordered_sources,
                 &alt_ids,
                 &ctx,
@@ -506,11 +564,14 @@ async fn resolve_document_metadata_inner(
     // `documents.title` held a clean title, retry enabled sources with ONLY the title and accept
     // only an unambiguous total title match verified against front-matter context.
     if best_certain.is_none() {
+        let allow_mrlookup_dc =
+            allow_mrlookup && scope == MetadataLookupScope::SingleRecordUserAction;
         run_final_title_only_double_check(
             db,
             clients,
             config,
-            allow_mrlookup,
+            allow_mrlookup_dc,
+            scope,
             &ordered_sources,
             &working_ids,
             &ctx,
@@ -561,20 +622,13 @@ async fn resolve_document_metadata_inner(
     };
     all_candidates.retain(|c| c.score >= 0.45);
     all_candidates.sort_by(|a, b| {
-        let diff = (b.score - a.score).abs();
-        if diff <= 0.02 && is_same_work(&a.record, &b.record) {
-            record_completeness_score(&b.record)
-                .cmp(&record_completeness_score(&a.record))
-                .then_with(|| rank_of(&a.source).cmp(&rank_of(&b.source)))
-                .then_with(|| b.score.total_cmp(&a.score))
-        } else if diff <= 0.015 {
-            record_completeness_score(&b.record)
-                .cmp(&record_completeness_score(&a.record))
-                .then_with(|| rank_of(&a.source).cmp(&rank_of(&b.source)))
-                .then_with(|| b.score.total_cmp(&a.score))
-        } else {
-            b.score.total_cmp(&a.score)
-        }
+        candidate_rank_key(b)
+            .total_cmp(&candidate_rank_key(a))
+            .then_with(|| {
+                record_completeness_score(&b.record).cmp(&record_completeness_score(&a.record))
+            })
+            .then_with(|| rank_of(&a.source).cmp(&rank_of(&b.source)))
+            .then_with(|| b.score.total_cmp(&a.score))
     });
     let mut deduped_candidates: Vec<CandidateMatch> =
         Vec::with_capacity(all_candidates.len().min(8));
@@ -634,9 +688,27 @@ async fn fetch_source_hits(
     clients: &WaterfallClients,
     config: &AppConfig,
     allow_mrlookup: bool,
+    scope: MetadataLookupScope,
     src: &str,
     ids: &ExtractedIdentifiers,
 ) -> Vec<CandidateMatch> {
+    if ids.looks_like_book {
+        // Skip preprint/biomedical paper-only APIs on monographs so 300-book syncs don't waste
+        // sequential rate-limit windows (arXiv 3s/req, DBLP 0.9s/req, INSPIRE, EuropePMC).
+        if src == "europepmc" {
+            return Vec::new();
+        }
+        if src == "arxiv" && ids.arxiv_id.is_none() {
+            return Vec::new();
+        }
+        if scope == MetadataLookupScope::BulkBackgroundScan
+            && ids.doi.is_none()
+            && matches!(src, "inspirehep" | "dblp")
+        {
+            return Vec::new();
+        }
+    }
+
     let res = match src {
         "mrlookup" if allow_mrlookup => clients.mrlookup.lookup(db, ids).await,
         "zbmath" if config.zbmath_enabled => clients.zbmath.lookup(db, ids).await,
@@ -666,6 +738,7 @@ async fn run_waterfall_pass(
     clients: &WaterfallClients,
     config: &AppConfig,
     allow_mrlookup: bool,
+    scope: MetadataLookupScope,
     ordered_sources: &[String],
     working_ids: &ExtractedIdentifiers,
     ctx: &GatheredDocContext,
@@ -676,7 +749,8 @@ async fn run_waterfall_pass(
         if best_certain.is_some() {
             break;
         }
-        let hits = fetch_source_hits(db, clients, config, allow_mrlookup, src, working_ids).await;
+        let hits =
+            fetch_source_hits(db, clients, config, allow_mrlookup, scope, src, working_ids).await;
         if !hits.is_empty() {
             absorb_hits(hits, ctx, best_certain, all_candidates);
         }
@@ -786,6 +860,7 @@ async fn run_final_title_only_double_check(
     clients: &WaterfallClients,
     config: &AppConfig,
     allow_mrlookup: bool,
+    scope: MetadataLookupScope,
     ordered_sources: &[String],
     working_ids: &ExtractedIdentifiers,
     ctx: &GatheredDocContext,
@@ -875,6 +950,7 @@ async fn run_final_title_only_double_check(
                 clients,
                 config,
                 allow_mrlookup,
+                scope,
                 src,
                 &title_only_ids,
             )
@@ -1019,6 +1095,13 @@ async fn resolve_record_journal_fields(
     apply_iso4_journal_fallback(rec, false);
 }
 
+/// Strictly transitive scalar tie-breaking score (`score + up to 0.0154 completeness bonus`)
+/// so `slice::sort_by` always observes a total order and can never panic in `driftsort`.
+fn candidate_rank_key(c: &CandidateMatch) -> f32 {
+    let comp = record_completeness_score(&c.record).clamp(0, 22) as f32;
+    c.score + comp * 0.0007
+}
+
 fn absorb_hits(
     mut hits: Vec<CandidateMatch>,
     ctx: &GatheredDocContext,
@@ -1029,14 +1112,12 @@ fn absorb_hits(
         h.score *= context_verification_factor(h, ctx);
     }
     hits.sort_by(|a, b| {
-        let diff = (b.score - a.score).abs();
-        if (diff <= 0.035 && is_same_work(&a.record, &b.record)) || diff <= 0.015 {
-            record_completeness_score(&b.record)
-                .cmp(&record_completeness_score(&a.record))
-                .then_with(|| b.score.total_cmp(&a.score))
-        } else {
-            b.score.total_cmp(&a.score)
-        }
+        candidate_rank_key(b)
+            .total_cmp(&candidate_rank_key(a))
+            .then_with(|| {
+                record_completeness_score(&b.record).cmp(&record_completeness_score(&a.record))
+            })
+            .then_with(|| b.score.total_cmp(&a.score))
     });
 
     if let Some(top) = hits.first() {
@@ -1337,6 +1418,37 @@ struct GatheredDocContext {
     locked_year: bool,
 }
 
+struct DocDbSnapshot {
+    locked: HashSet<String>,
+    locked_title_flag: bool,
+    locked_authors_flag: bool,
+    locked_year_flag: bool,
+    stripped_title: String,
+    db_title: Option<String>,
+    db_authors: Vec<String>,
+    year: Option<i64>,
+    doi: Option<String>,
+    arxiv_id: Option<String>,
+    arxiv_ver: Option<String>,
+    mr_num: Option<String>,
+    zbl_num: Option<String>,
+    isbn: Option<String>,
+    work_type: String,
+    metadata_source: Option<String>,
+    file_format: Option<String>,
+    root_path: Option<String>,
+    rel_path: Option<String>,
+    file_available: bool,
+    page_count: u32,
+    db_first_pages: Vec<String>,
+    db_last_page: Option<String>,
+}
+
+enum DocContextPrep {
+    Guided(Box<GatheredDocContext>),
+    NeedsFinalize(Box<DocDbSnapshot>),
+}
+
 #[cfg(test)]
 fn gather_document_identifiers(
     db: &Database,
@@ -1346,11 +1458,109 @@ fn gather_document_identifiers(
     Ok(gather_document_context(db, config, document_id)?.ids)
 }
 
+#[cfg(test)]
 fn gather_document_context(
     db: &Database,
     config: &AppConfig,
     document_id: i64,
 ) -> Result<GatheredDocContext> {
+    match prepare_doc_context(db, document_id)? {
+        DocContextPrep::Guided(ctx) => Ok(*ctx),
+        DocContextPrep::NeedsFinalize(snap) => {
+            let fm = if snap.file_available {
+                match (
+                    snap.file_format.as_deref(),
+                    snap.root_path.as_deref(),
+                    snap.rel_path.as_deref(),
+                ) {
+                    (Some(fmt), Some(rp), Some(rel)) => extract_front_matter_blocking(
+                        fmt,
+                        rp,
+                        rel,
+                        config.pdfium_lib_path.as_deref(),
+                        config.djvused_bin.as_deref(),
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            Ok(finalize_doc_context(*snap, fm))
+        }
+    }
+}
+
+async fn gather_document_context_async(
+    db: &Database,
+    config: &AppConfig,
+    document_id: i64,
+    scope: MetadataLookupScope,
+) -> Result<GatheredDocContext> {
+    let prep = prepare_doc_context(db, document_id)?;
+    let snap = match prep {
+        DocContextPrep::Guided(ctx) => return Ok(*ctx),
+        DocContextPrep::NeedsFinalize(s) => s,
+    };
+
+    // Never run synchronous PDFium / `djvused` subprocesses on Tokio's async worker threads!
+    // Also skip re-spawning external `djvused` processes in bulk mode when DjVu front pages are already in SQLite.
+    let skip_djvu_reextract = scope == MetadataLookupScope::BulkBackgroundScan
+        && snap.file_format.as_deref() == Some("djvu")
+        && !snap.db_first_pages.is_empty();
+
+    let front_matter = if snap.file_available && !skip_djvu_reextract {
+        match (
+            snap.file_format.clone(),
+            snap.root_path.clone(),
+            snap.rel_path.clone(),
+        ) {
+            (Some(fmt), Some(rp), Some(rel)) => {
+                let pdfium_lib = config.pdfium_lib_path.clone();
+                let djvused_bin = config.djvused_bin.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = thread_priority::set_current_thread_priority(
+                        thread_priority::ThreadPriority::Min,
+                    );
+                    extract_front_matter_blocking(
+                        &fmt,
+                        &rp,
+                        &rel,
+                        pdfium_lib.as_deref(),
+                        djvused_bin.as_deref(),
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(finalize_doc_context(*snap, front_matter))
+}
+
+fn extract_front_matter_blocking(
+    fmt: &str,
+    rp: &str,
+    rel: &str,
+    pdfium_lib: Option<&std::path::Path>,
+    djvused_bin: Option<&str>,
+) -> Option<crate::extract::types::ExtractedDocument> {
+    let abs = resolve_rel_path(std::path::Path::new(rp), rel).ok()?;
+    if !abs.exists() {
+        return None;
+    }
+    match fmt {
+        "pdf" => extract_pdf_front_matter(&abs, pdfium_lib).ok(),
+        "djvu" => extract_djvu_front_matter(&abs, djvused_bin).ok(),
+        _ => None,
+    }
+}
+
+fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep> {
     let conn = db.reader();
     let locked = load_locked_fields(&conn, document_id)?;
     let DocIdRow {
@@ -1471,7 +1681,7 @@ fn gather_document_context(
             .and_then(extract_prose_core_title)
             .into_iter()
             .collect();
-        return Ok(GatheredDocContext {
+        return Ok(DocContextPrep::Guided(Box::new(GatheredDocContext {
             ids: ExtractedIdentifiers {
                 doi: if locked.contains("doi") {
                     doi.as_deref().and_then(normalize_doi)
@@ -1514,26 +1724,30 @@ fn gather_document_context(
             locked_title: locked_title_flag,
             locked_authors: locked_authors_flag,
             locked_year: locked_year_flag,
-        });
+        })));
     }
+
+    let max_ord: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(page_ord), 0) FROM passages WHERE document_id = ?1",
+            params![document_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
 
     let mut stmt = conn.prepare(
         "SELECT page_ord, text_content FROM passages
-         WHERE document_id = ?1 AND (page_ord <= 4 OR page_ord = (SELECT MAX(page_ord) FROM passages WHERE document_id = ?1))
+         WHERE document_id = ?1 AND (page_ord <= 4 OR page_ord = ?2)
          ORDER BY page_ord ASC, chunk_index ASC",
     )?;
-    let rows = stmt.query_map(params![document_id], |r| {
+    let rows = stmt.query_map(params![document_id, max_ord], |r| {
         Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?))
     })?;
 
     let mut db_first_pages: Vec<String> = Vec::new();
-    let mut db_page123_chunks: Vec<String> = Vec::new();
     let mut db_last_page: Option<String> = None;
     for (ord, txt) in rows.filter_map(std::result::Result::ok) {
         if ord <= 4 {
-            if ord <= 3 {
-                db_page123_chunks.push(txt.clone());
-            }
             db_first_pages.push(txt);
         } else {
             db_last_page = Some(txt);
@@ -1542,24 +1756,62 @@ fn gather_document_context(
     drop(stmt);
     drop(conn);
 
-    // Inspect primary file front matter (embedded PDF Info / XMP + pages 1-2 layout bounding boxes)
-    let front_matter = if file_available {
-        match (file_format.as_deref(), root_path.as_deref(), rel_path.as_deref()) {
-            (Some(fmt), Some(rp), Some(rel)) => {
-                resolve_rel_path(std::path::Path::new(rp), rel)
-                    .ok()
-                    .filter(|p| p.exists())
-                    .and_then(|abs| match fmt {
-                        "pdf" => extract_pdf_front_matter(&abs, config.pdfium_lib_path.as_deref()).ok(),
-                        "djvu" => extract_djvu_front_matter(&abs, config.djvused_bin.as_deref()).ok(),
-                        _ => None,
-                    })
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
+    Ok(DocContextPrep::NeedsFinalize(Box::new(DocDbSnapshot {
+        locked,
+        locked_title_flag,
+        locked_authors_flag,
+        locked_year_flag,
+        stripped_title,
+        db_title,
+        db_authors,
+        year,
+        doi,
+        arxiv_id,
+        arxiv_ver,
+        mr_num,
+        zbl_num,
+        isbn,
+        work_type,
+        metadata_source,
+        file_format,
+        root_path,
+        rel_path,
+        file_available,
+        page_count,
+        db_first_pages,
+        db_last_page,
+    })))
+}
+
+fn finalize_doc_context(
+    snap: DocDbSnapshot,
+    front_matter: Option<crate::extract::types::ExtractedDocument>,
+) -> GatheredDocContext {
+    let DocDbSnapshot {
+        locked,
+        locked_title_flag,
+        locked_authors_flag,
+        locked_year_flag,
+        stripped_title,
+        db_title,
+        db_authors,
+        year,
+        doi,
+        arxiv_id,
+        arxiv_ver,
+        mr_num,
+        zbl_num,
+        isbn,
+        work_type,
+        metadata_source,
+        file_format: _,
+        root_path: _,
+        rel_path,
+        file_available: _,
+        page_count,
+        db_first_pages,
+        db_last_page,
+    } = snap;
 
     let fm_has_text = front_matter.as_ref().is_some_and(|fm| {
         fm.has_text_layer && fm.pages.iter().any(|p| !p.raw_text.trim().is_empty())
@@ -1696,15 +1948,15 @@ fn gather_document_context(
         extracted.looks_like_book = true;
     }
 
-    // Build normalized pages 1-3 verification text (covering repository cover page + article pages 1-2)
+    // Build normalized pages 1-4 verification text (covering repository cover / series half-title + pages 1-4)
     let mut verify_raw = String::new();
     if !fm_first_pages.is_empty() {
-        for p in fm_first_pages.iter().take(3) {
+        for p in fm_first_pages.iter().take(4) {
             verify_raw.push_str(p);
             verify_raw.push('\n');
         }
     } else {
-        for p in db_page123_chunks.iter() {
+        for p in db_first_pages.iter() {
             verify_raw.push_str(p);
             verify_raw.push('\n');
         }
@@ -1720,7 +1972,7 @@ fn gather_document_context(
         .count();
     let verify_text = (alpha_count >= 60).then_some(verify_norm);
 
-    Ok(GatheredDocContext {
+    GatheredDocContext {
         ids: extracted,
         db_title,
         verify_text,
@@ -1728,7 +1980,7 @@ fn gather_document_context(
         locked_title: locked_title_flag,
         locked_authors: locked_authors_flag,
         locked_year: locked_year_flag,
-    })
+    }
 }
 
 fn load_locked_fields(conn: &Connection, document_id: i64) -> Result<HashSet<String>> {
@@ -1961,6 +2213,7 @@ fn replace_authors_in_tx(
     )?;
     let mut role_positions: HashMap<&str, i64> = HashMap::new();
     let mut summary_parts = Vec::new();
+    let mut editor_parts = Vec::new();
     for a in authors {
         let pos = role_positions.entry(a.role.as_str()).or_insert(0);
         let full = if a.given_name.trim().is_empty() {
@@ -1969,8 +2222,12 @@ fn replace_authors_in_tx(
             format!("{} {}", a.given_name.trim(), a.family_name.trim())
         };
         let norm = normalize_math_text(&full);
-        if a.role == "author" && !norm.is_empty() {
-            summary_parts.push(norm.clone());
+        if !norm.is_empty() {
+            if a.role == "author" {
+                summary_parts.push(norm.clone());
+            } else {
+                editor_parts.push(norm.clone());
+            }
         }
         tx.execute(
             "INSERT INTO document_authors (document_id, position, family_name, given_name, name_norm, role)
@@ -1979,6 +2236,7 @@ fn replace_authors_in_tx(
         )?;
         *pos += 1;
     }
+    summary_parts.extend(editor_parts);
     let summary = summary_parts.join("; ");
     tx.execute(
         "UPDATE documents SET authors_norm_summary = ?1 WHERE id = ?2",
@@ -2531,6 +2789,177 @@ pub fn get_document_metadata(db: &Database, document_id: i64) -> Result<Document
     Ok(doc)
 }
 
+/// Batched export loader for BibTeX / CSV: fetches requested documents (or the entire library when
+/// `document_ids` is empty) in 3 batched SQL queries instead of 5×N queries + JSON candidate parses!
+pub fn get_documents_metadata_for_export(
+    conn: &Connection,
+    document_ids: &[i64],
+) -> Result<Vec<DocumentMetadataView>> {
+    let mut views_by_id: HashMap<i64, DocumentMetadataView> = HashMap::new();
+    let mut ordered_ids: Vec<i64> = Vec::new();
+
+    let parse_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, DocumentMetadataView)> {
+        let doc_id: i64 = r.get(0)?;
+        let locked_raw: String = r.get(30)?;
+        let locked: Vec<String> = serde_json::from_str(&locked_raw).unwrap_or_default();
+        Ok((
+            doc_id,
+            DocumentMetadataView {
+                document_id: doc_id,
+                work_type: r.get(1)?,
+                title: r.get(2)?,
+                authors: Vec::new(),
+                journal_abbrev: r.get(3)?,
+                journal_full: r.get(4)?,
+                booktitle: r.get(5)?,
+                series: r.get(6)?,
+                volume: r.get(7)?,
+                issue_number: r.get(8)?,
+                year: r.get(9)?,
+                pages: r.get(10)?,
+                edition: r.get(11)?,
+                publisher: r.get(12)?,
+                address: r.get(13)?,
+                isbn: r.get(14)?,
+                issn: r.get(15)?,
+                doi: r.get(16)?,
+                arxiv_id: r.get(17)?,
+                arxiv_version: r.get(18)?,
+                mr_number: r.get(19)?,
+                mr_number_display: r.get(20)?,
+                mr_reviewer: r.get(21)?,
+                zbl_number: r.get(22)?,
+                url: r.get(23)?,
+                msc_primary: r.get(24)?,
+                msc_primary_status: r.get(25)?,
+                msc_secondary: Vec::new(),
+                abstract_text: r.get(26)?,
+                raw_mrlookup_bibtex: r.get(27)?,
+                metadata_source: r.get(28)?,
+                metadata_license_note: r.get(29)?,
+                manual_locked_fields: locked,
+                exclude_from_cloud_llm: r.get::<_, i64>(31)? != 0,
+                metadata_verified: r.get::<_, i64>(32)? != 0,
+                tags: Vec::new(),
+                pending_candidates: Vec::new(),
+            },
+        ))
+    };
+
+    const SELECT_COLS: &str = "SELECT id, work_type, title, journal_abbrev, journal_full, booktitle, series, volume,
+        issue_number, year, pages, edition, publisher, address, isbn, issn, doi,
+        arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer, zbl_number,
+        url, msc_primary, msc_primary_status, abstract_text, raw_mrlookup_bibtex,
+        metadata_source, metadata_license_note, manual_locked_fields, exclude_from_cloud_llm,
+        metadata_verified FROM documents";
+
+    if document_ids.is_empty() {
+        let sql = format!("{SELECT_COLS} ORDER BY updated_at DESC, id DESC");
+        let mut st = conn.prepare(&sql)?;
+        let rows = st.query_map([], parse_row)?;
+        for r in rows {
+            let (id, v) = r?;
+            ordered_ids.push(id);
+            views_by_id.insert(id, v);
+        }
+
+        let mut a_st = conn.prepare(
+            "SELECT document_id, family_name, given_name, role FROM document_authors ORDER BY document_id ASC, role ASC, position ASC",
+        )?;
+        let a_rows = a_st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                BibliographicAuthor {
+                    family_name: r.get(1)?,
+                    given_name: r.get(2)?,
+                    role: r.get(3)?,
+                },
+            ))
+        })?;
+        for ar in a_rows {
+            let (did, au) = ar?;
+            if let Some(v) = views_by_id.get_mut(&did) {
+                v.authors.push(au);
+            }
+        }
+
+        let mut m_st = conn.prepare(
+            "SELECT document_id, msc_code FROM document_msc_secondary ORDER BY document_id ASC, msc_code ASC",
+        )?;
+        let m_rows = m_st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for mr in m_rows {
+            let (did, code) = mr?;
+            if let Some(v) = views_by_id.get_mut(&did) {
+                v.msc_secondary.push(code);
+            }
+        }
+    } else {
+        ordered_ids.extend_from_slice(document_ids);
+        for chunk in document_ids.chunks(500) {
+            let placeholders = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+            let sql = format!("{SELECT_COLS} WHERE id IN ({placeholders})");
+            let mut st = conn.prepare(&sql)?;
+            let rows = st.query_map(params_refs.as_slice(), parse_row)?;
+            for r in rows {
+                let (id, v) = r?;
+                views_by_id.insert(id, v);
+            }
+
+            let a_sql = format!(
+                "SELECT document_id, family_name, given_name, role FROM document_authors
+                 WHERE document_id IN ({placeholders}) ORDER BY document_id ASC, role ASC, position ASC"
+            );
+            let mut a_st = conn.prepare(&a_sql)?;
+            let a_rows = a_st.query_map(params_refs.as_slice(), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    BibliographicAuthor {
+                        family_name: r.get(1)?,
+                        given_name: r.get(2)?,
+                        role: r.get(3)?,
+                    },
+                ))
+            })?;
+            for ar in a_rows {
+                let (did, au) = ar?;
+                if let Some(v) = views_by_id.get_mut(&did) {
+                    v.authors.push(au);
+                }
+            }
+
+            let m_sql = format!(
+                "SELECT document_id, msc_code FROM document_msc_secondary
+                 WHERE document_id IN ({placeholders}) ORDER BY document_id ASC, msc_code ASC"
+            );
+            let mut m_st = conn.prepare(&m_sql)?;
+            let m_rows =
+                m_st.query_map(params_refs.as_slice(), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for mr in m_rows {
+                let (did, code) = mr?;
+                if let Some(v) = views_by_id.get_mut(&did) {
+                    v.msc_secondary.push(code);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(ordered_ids.len());
+    for id in ordered_ids {
+        if let Some(v) = views_by_id.remove(&id) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetadataSearchFilter {
     pub text: Option<String>,
@@ -2614,24 +3043,20 @@ pub fn search_documents_metadata(
         _ => "",
     };
 
+    let text_q = norm_opt(&filter.text);
+    let author_q = norm_opt(&filter.author);
+    let title_q = norm_opt(&filter.title);
+    let journal_q = norm_opt(&filter.journal);
+    let text_has_digit = text_q
+        .as_deref()
+        .is_some_and(|q| q.bytes().any(|b| b.is_ascii_digit()));
+    let has_text_filter =
+        title_q.is_some() || author_q.is_some() || journal_q.is_some() || text_q.is_some();
+
+    // Omit per-row correlated `GROUP_CONCAT` temp sort B-trees; evaluate filters zero-copy on SQLite
+    // row slices first and hydrate `authors_summary` only for surviving documents!
     let sql = format!(
         "SELECT d.id, f.id, f.root_id, sr.label, d.work_type, d.title,
-                COALESCE(
-                    (SELECT GROUP_CONCAT(
-                        CASE WHEN TRIM(given_name) = '' THEN family_name
-                             WHEN TRIM(family_name) = '' THEN given_name
-                             ELSE family_name || ', ' || given_name END,
-                        '; '
-                     )
-                     FROM (
-                        SELECT family_name, given_name
-                        FROM document_authors
-                        WHERE document_id = d.id
-                        ORDER BY CASE WHEN role = 'author' THEN 0 ELSE 1 END, position ASC
-                     )),
-                    NULLIF(d.authors_norm_summary, ''),
-                    ''
-                ) AS authors_display,
                 d.authors_norm_summary,
                 d.year, f.format, f.rel_path, f.page_count, f.is_available,
                 f.index_state, f.error_message,
@@ -2672,112 +3097,180 @@ pub fn search_documents_metadata(
          ORDER BY {order_clause}"
     );
 
-    let text_q = norm_opt(&filter.text);
-    let author_q = norm_opt(&filter.author);
-    let title_q = norm_opt(&filter.title);
-    let journal_q = norm_opt(&filter.journal);
+    // Preload formatted `authors_display` in one single sequential PK scan only if needed for fallback matching
+    let preload_all_authors = !has_text_filter;
+    let mut authors_map: HashMap<i64, String> = HashMap::new();
+    let load_authors_into = |map: &mut HashMap<i64, String>, only_ids: Option<&[i64]>| -> Result<()> {
+        let push_au = |acc: &mut String, fam: &str, giv: &str| {
+            let ft = fam.trim();
+            let gt = giv.trim();
+            if ft.is_empty() && gt.is_empty() {
+                return;
+            }
+            if !acc.is_empty() {
+                acc.push_str("; ");
+            }
+            if gt.is_empty() {
+                acc.push_str(ft);
+            } else if ft.is_empty() {
+                acc.push_str(gt);
+            } else {
+                acc.push_str(ft);
+                acc.push_str(", ");
+                acc.push_str(gt);
+            }
+        };
+        if let Some(ids) = only_ids {
+            for chunk in ids.chunks(500) {
+                let ph = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let q = format!(
+                    "SELECT document_id, family_name, given_name FROM document_authors
+                     WHERE document_id IN ({ph}) ORDER BY document_id ASC, role ASC, position ASC"
+                );
+                let mut st = conn.prepare(&q)?;
+                let pr: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let mut a_rows = st.query(pr.as_slice())?;
+                while let Some(ar) = a_rows.next()? {
+                    let did: i64 = ar.get(0)?;
+                    let fam = ar.get_ref(1)?.as_str().unwrap_or("");
+                    let giv = ar.get_ref(2)?.as_str().unwrap_or("");
+                    push_au(map.entry(did).or_default(), fam, giv);
+                }
+            }
+        } else {
+            let mut st = conn.prepare(
+                "SELECT document_id, family_name, given_name FROM document_authors
+                 ORDER BY document_id ASC, role ASC, position ASC",
+            )?;
+            let mut a_rows = st.query([])?;
+            while let Some(ar) = a_rows.next()? {
+                let did: i64 = ar.get(0)?;
+                let fam = ar.get_ref(1)?.as_str().unwrap_or("");
+                let giv = ar.get_ref(2)?.as_str().unwrap_or("");
+                push_au(map.entry(did).or_default(), fam, giv);
+            }
+        }
+        Ok(())
+    };
+
+    if preload_all_authors {
+        load_authors_into(&mut authors_map, None)?;
+    }
+
+    let p_root = clean_opt(&filter.root_id);
+    let p_fmt = clean_opt(&filter.format);
+    let p_msc = clean_opt(&filter.msc_prefix);
+    let p_tag = clean_opt(&filter.tag);
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        params![
-            clean_opt(&filter.root_id),
-            clean_opt(&filter.format),
-            filter.year_from,
-            filter.year_to,
-            clean_opt(&filter.msc_prefix),
-            clean_opt(&filter.tag),
-            filter.cluster_id,
-        ],
-        |r| {
-            Ok((
-                DocumentListItem {
-                    document_id: r.get(0)?,
-                    file_id: r.get(1)?,
-                    root_id: r.get(2)?,
-                    root_label: r.get(3)?,
-                    work_type: r.get(4)?,
-                    title: r.get(5)?,
-                    authors_summary: r.get(6)?,
-                    year: r.get(8)?,
-                    format: r.get(9)?,
-                    rel_path: r.get(10)?,
-                    page_count: r.get::<_, Option<i64>>(11)?.map(|v| v as u32),
-                    is_available: r.get::<_, i64>(12)? != 0,
-                    index_state: r.get(13)?,
-                    error_message: r.get(14)?,
-                    msc_primary: {
-                        let raw: String = r.get(16)?;
-                        if raw.trim().is_empty() { None } else { Some(raw) }
-                    },
-                    msc_primary_status: r.get(17)?,
-                    has_text_layer: r.get::<_, i64>(18)? != 0,
-                    ocr_status: r.get(19)?,
-                    metadata_source: r.get(20)?,
-                    metadata_verified: r.get::<_, i64>(21)? != 0,
-                },
-                r.get::<_, String>(7)?,
-                r.get::<_, String>(15)?,
-                r.get::<_, String>(16)?,
-                r.get::<_, String>(22)?,
-            ))
-        },
-    )?;
-
-    let text_has_digit = text_q
-        .as_deref()
-        .is_some_and(|q| q.bytes().any(|b| b.is_ascii_digit()));
-    let has_text_filter =
-        title_q.is_some() || author_q.is_some() || journal_q.is_some() || text_q.is_some();
+    let mut rows = stmt.query(params![
+        p_root,
+        p_fmt,
+        filter.year_from,
+        filter.year_to,
+        p_msc,
+        p_tag,
+        filter.cluster_id,
+    ])?;
 
     let mut out = Vec::new();
-    for r in rows {
-        let (item, raw_authors_norm, journal_raw, msc_raw, db_title_norm) = r?;
-        if !has_text_filter {
-            out.push(item);
-            continue;
+    let mut fallback_norm_summaries: Vec<String> = Vec::new();
+
+    while let Some(r) = rows.next()? {
+        if has_text_filter {
+            let raw_title = r.get_ref(5)?.as_str().unwrap_or("");
+            let raw_authors_norm = r.get_ref(6)?.as_str().unwrap_or("");
+            let yr_opt: Option<i64> = r.get(7)?;
+            let journal_raw = r.get_ref(14)?.as_str().unwrap_or("");
+            let msc_raw = r.get_ref(15)?.as_str().unwrap_or("");
+            let db_title_norm = r.get_ref(21)?.as_str().unwrap_or("");
+
+            if let Some(ref q) = author_q {
+                if !author_matches_query(raw_authors_norm, q) {
+                    continue;
+                }
+            }
+            if let Some(ref q) = title_q {
+                if !normalized_title_contains(db_title_norm, raw_title, q) {
+                    continue;
+                }
+            }
+            let mut cached_j_norm: Option<String> = None;
+            if let Some(ref q) = journal_q {
+                if journal_raw.trim().is_empty() {
+                    continue;
+                }
+                let j_norm = cached_j_norm.get_or_insert_with(|| normalize_math_text(journal_raw));
+                if !j_norm.contains(q.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(ref q) = text_q {
+                let matched = author_matches_query(raw_authors_norm, q)
+                    || normalized_title_contains(db_title_norm, raw_title, q)
+                    || (!msc_raw.is_empty() && msc_raw.to_ascii_lowercase().contains(q.as_str()))
+                    || (text_has_digit && yr_opt.is_some_and(|y| y.to_string().contains(q.as_str())))
+                    || (!journal_raw.trim().is_empty()
+                        && cached_j_norm
+                            .get_or_insert_with(|| normalize_math_text(journal_raw))
+                            .contains(q.as_str()));
+                if !matched {
+                    continue;
+                }
+            }
         }
 
-        if let Some(ref q) = author_q {
-            let matched = raw_authors_norm.contains(q)
-                || (!item.authors_summary.is_empty()
-                    && item.authors_summary != raw_authors_norm
-                    && normalize_math_text(&item.authors_summary).contains(q));
-            if !matched {
-                continue;
-            }
+        let doc_id: i64 = r.get(0)?;
+        let raw_authors_norm: String = r.get(6)?;
+        let msc_raw: String = r.get(15)?;
+        out.push(DocumentListItem {
+            document_id: doc_id,
+            file_id: r.get(1)?,
+            root_id: r.get(2)?,
+            root_label: r.get(3)?,
+            work_type: r.get(4)?,
+            title: r.get(5)?,
+            authors_summary: String::new(),
+            year: r.get(7)?,
+            format: r.get(8)?,
+            rel_path: r.get(9)?,
+            page_count: r.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+            is_available: r.get::<_, i64>(11)? != 0,
+            index_state: r.get(12)?,
+            error_message: r.get(13)?,
+            msc_primary: if msc_raw.trim().is_empty() {
+                None
+            } else {
+                Some(msc_raw)
+            },
+            msc_primary_status: r.get(16)?,
+            has_text_layer: r.get::<_, i64>(17)? != 0,
+            ocr_status: r.get(18)?,
+            metadata_source: r.get(19)?,
+            metadata_verified: r.get::<_, i64>(20)? != 0,
+        });
+        fallback_norm_summaries.push(raw_authors_norm);
+    }
+    drop(rows);
+    drop(stmt);
+
+    if !preload_all_authors && !out.is_empty() {
+        let matched_ids: Vec<i64> = out.iter().map(|d| d.document_id).collect();
+        load_authors_into(&mut authors_map, Some(&matched_ids))?;
+    }
+
+    for (item, norm_fallback) in out.iter_mut().zip(fallback_norm_summaries) {
+        if let Some(disp) = authors_map.remove(&item.document_id).filter(|s| !s.is_empty()) {
+            item.authors_summary = disp;
+        } else {
+            item.authors_summary = norm_fallback;
         }
-        if let Some(ref q) = title_q {
-            if !normalized_title_contains(&db_title_norm, &item.title, q) {
-                continue;
-            }
-        }
-        let mut cached_j_norm: Option<String> = None;
-        if let Some(ref q) = journal_q {
-            if journal_raw.trim().is_empty() {
-                continue;
-            }
-            let j_norm = cached_j_norm.get_or_insert_with(|| normalize_math_text(&journal_raw));
-            if !j_norm.contains(q) {
-                continue;
-            }
-        }
-        if let Some(ref q) = text_q {
-            let matched = raw_authors_norm.contains(q)
-                || normalized_title_contains(&db_title_norm, &item.title, q)
-                || (!msc_raw.is_empty() && msc_raw.to_ascii_lowercase().contains(q))
-                || (text_has_digit && item.year.is_some_and(|y| y.to_string().contains(q)))
-                || (!journal_raw.trim().is_empty()
-                    && cached_j_norm
-                        .get_or_insert_with(|| normalize_math_text(&journal_raw))
-                        .contains(q))
-                || (!item.authors_summary.is_empty()
-                    && item.authors_summary != raw_authors_norm
-                    && normalize_math_text(&item.authors_summary).contains(q));
-            if !matched {
-                continue;
-            }
-        }
-        out.push(item);
     }
 
     // Accent/diacritic-normalized alphabetical sort by first author's surname + given name,
@@ -2807,6 +3300,29 @@ pub fn search_documents_metadata(
     }
 
     Ok(out)
+}
+
+fn author_matches_query(raw_authors_norm: &str, needle: &str) -> bool {
+    if raw_authors_norm.is_empty() {
+        return false;
+    }
+    if raw_authors_norm.contains(needle) {
+        return true;
+    }
+    if needle.bytes().any(|b| b == b',' || b == b';' || b == b' ') {
+        let mut had_token = false;
+        for tok in needle.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+            if tok.is_empty() {
+                continue;
+            }
+            had_token = true;
+            if !raw_authors_norm.contains(tok) {
+                return false;
+            }
+        }
+        return had_token;
+    }
+    false
 }
 
 fn normalized_title_contains(db_title_norm: &str, raw_title: &str, needle: &str) -> bool {
@@ -2989,7 +3505,20 @@ pub async fn run_pending_metadata_jobs(
     config: &AppConfig,
     limit: usize,
 ) -> Result<usize> {
+    run_pending_metadata_jobs_cancellable(db, clients, config, limit, None).await
+}
+
+pub async fn run_pending_metadata_jobs_cancellable(
+    db: &Database,
+    clients: &WaterfallClients,
+    config: &AppConfig,
+    limit: usize,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<usize> {
     if !config.network_lookups_enabled {
+        return Ok(0);
+    }
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
         return Ok(0);
     }
     // Discard any queued background metadata jobs for already-confirmed documents
@@ -3022,6 +3551,9 @@ pub async fn run_pending_metadata_jobs(
 
     let mut processed = 0usize;
     for (job_id, doc_id) in pending {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         let outcome = resolve_document_metadata(
             db,
             clients,
@@ -3030,6 +3562,9 @@ pub async fn run_pending_metadata_jobs(
             MetadataLookupScope::BulkBackgroundScan,
         )
         .await;
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            break;
+        }
         let w = db.writer();
         match outcome {
             Ok(_) => {
@@ -5186,5 +5721,150 @@ mod tests {
             m3.booktitle.as_deref(),
             Some("2016 IEEE Conference on Computer Vision and Pattern Recognition")
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_sort_is_strictly_transitive_and_isbn_bridge_resolves_books() {
+        // 1. Adversarial 20-element score ladder spaced by 0.009 with inverted completeness scores
+        //    (previously triggered a non-transitive cycle in Rust's `driftsort` `slice::sort_by`).
+        let ctx = GatheredDocContext {
+            ids: ExtractedIdentifiers::default(),
+            db_title: None,
+            verify_text: None,
+            is_guided: false,
+            locked_title: false,
+            locked_authors: false,
+            locked_year: false,
+        };
+        let mut hits = Vec::new();
+        for i in 0..20usize {
+            let mut rec = BibliographicRecord {
+                work_type: if i % 2 == 0 { WorkType::Book } else { WorkType::Misc },
+                title: format!("Distinct Mathematical Monograph Number {i}"),
+                year: Some(1990 + (i as i64)),
+                source: "crossref".to_string(),
+                ..Default::default()
+            };
+            if i >= 5 {
+                rec.authors.push(BibliographicAuthor {
+                    family_name: format!("Author{i}"),
+                    given_name: "A.".to_string(),
+                    role: "author".to_string(),
+                });
+            }
+            if i >= 10 {
+                rec.doi = Some(format!("10.1007/978-0-387-000{i:02}-0"));
+                rec.volume = Some(format!("{i}"));
+            }
+            if i >= 15 {
+                rec.mr_number = Some(format!("12345{i:02}"));
+                rec.zbl_number = Some(format!("0999.{i:05}"));
+            }
+            hits.push(CandidateMatch {
+                score: 0.78 - (i as f32) * 0.009,
+                source: "crossref".to_string(),
+                record: rec,
+            });
+        }
+        let mut best_certain = None;
+        let mut all_candidates = Vec::new();
+        absorb_hits(hits, &ctx, &mut best_certain, &mut all_candidates);
+        assert_eq!(all_candidates.len(), 20);
+
+        // 2. ISBN Bridge resolves a book whose front page had a noisy series title
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("isbn_bridge.db"), 2).unwrap();
+        let root_path = dir.path().join("books");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let doc_id = {
+            let w = db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "r_books".into(),
+                    label: "Books".into(),
+                    root_path: root_path.to_string_lossy().into_owned(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+            let d = create_heuristic_document(&w, "Graduate Texts in Mathematics 142").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d,
+                    root_id: "r_books",
+                    rel_path: "Halmos - Measure theory.pdf",
+                    format: "pdf",
+                    size_bytes: 10_000,
+                    mtime_ns: 1,
+                    blake3_hash: "h_isbn_book",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            w.execute(
+                "UPDATE documents SET work_type = 'book', year = 1974, isbn = '9781468494426' WHERE id = ?1",
+                params![d],
+            )
+            .unwrap();
+            d
+        };
+
+        let cr_isbn_json = r#"{
+            "message": {
+                "items": [{
+                    "type": "book",
+                    "title": ["Measure Theory"],
+                    "author": [{"given": "Paul R.", "family": "Halmos"}],
+                    "publisher": "Springer New York",
+                    "DOI": "10.1007/978-1-4684-9440-2",
+                    "ISBN": ["9781468494426"],
+                    "published-print": {"date-parts": [[1974]]}
+                }]
+            }
+        }"#;
+        crate::metadata::limiter::store_http_cache(
+            &db,
+            "crossref",
+            "isbn:9781468494426",
+            200,
+            cr_isbn_json,
+        )
+        .unwrap();
+        crate::metadata::limiter::store_http_cache(
+            &db,
+            "crossref",
+            "doi:10.1007/978-1-4684-9440-2",
+            200,
+            r#"{"message":{"type":"book","title":["Measure Theory"],"author":[{"given":"Paul R.","family":"Halmos"}],"publisher":"Springer New York","DOI":"10.1007/978-1-4684-9440-2","ISBN":["9781468494426"],"published-print":{"date-parts":[[1974]]}}}"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig {
+            zbmath_enabled: false,
+            mrlookup_enabled_bulk: false,
+            openalex_enabled: false,
+            datacite_enabled: false,
+            semanticscholar_enabled: false,
+            openlibrary_enabled: false,
+            ..AppConfig::default()
+        };
+        let clients = WaterfallClients::from_config(&cfg).unwrap();
+
+        let out = resolve_document_metadata(
+            &db,
+            &clients,
+            &cfg,
+            doc_id,
+            MetadataLookupScope::BulkBackgroundScan,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, "updated");
+        let meta = get_document_metadata(&db, doc_id).unwrap();
+        assert_eq!(meta.title, "Measure Theory");
+        assert_eq!(meta.authors[0].family_name, "Halmos");
+        assert_eq!(meta.doi.as_deref(), Some("10.1007/978-1-4684-9440-2"));
     }
 }

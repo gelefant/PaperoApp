@@ -253,7 +253,7 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
 
     let p1_is_cover = first_pages_text
         .first()
-        .is_some_and(|p| is_repository_cover_page(p))
+        .is_some_and(|p| is_repository_cover_page(p) || is_book_half_title_or_boilerplate_page(p))
         && first_pages_text.len() >= 2;
     let id_page_limit = if p1_is_cover { 3 } else { 2 };
 
@@ -415,13 +415,21 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
             .unwrap_or((None, Vec::new(), None))
     };
 
-    let (p2_layout_title, p2_layout_authors) = page2_layout
-        .filter(|p| !p.spans.is_empty())
-        .map(extract_layout_title_and_authors)
-        .unwrap_or((None, Vec::new()));
+    let p2_is_boilerplate = first_pages_text
+        .get(1)
+        .is_some_and(|p| is_book_half_title_or_boilerplate_page(p));
 
-    let (p2_h_title, p2_h_authors, p2_h_year) = if p1_is_cover
-        || (p1_layout_title.is_none() && p1_h_title.is_none())
+    let (p2_layout_title, p2_layout_authors) = if p2_is_boilerplate {
+        (None, Vec::new())
+    } else {
+        page2_layout
+            .filter(|p| !p.spans.is_empty())
+            .map(extract_layout_title_and_authors)
+            .unwrap_or((None, Vec::new()))
+    };
+
+    let (p2_h_title, p2_h_authors, p2_h_year) = if !p2_is_boilerplate
+        && (p1_is_cover || (p1_layout_title.is_none() && p1_h_title.is_none()))
     {
         first_pages_text
             .get(1)
@@ -442,11 +450,30 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
 
     let p1_title = p1_layout_title.or(p1_h_title);
     let p2_title = p2_layout_title.or(p2_h_title);
-    let page_title = if p1_is_cover {
+    let mut page_title = if p1_is_cover {
         p2_title.clone().or(p1_title.clone())
     } else {
         p1_title.clone().or(p2_title.clone())
     };
+
+    // Many books have Page 1 = series half-title ("Graduate Texts in Mathematics 142 / Editorial Board"),
+    // Page 2 = series volume list or blank, and Page 3 (or 4) = actual book title page.
+    let mut p34_h_authors: Vec<String> = Vec::new();
+    let mut p34_h_year: Option<i64> = None;
+    if page_title.is_none() {
+        for &pg_txt in first_pages_text.iter().skip(2).take(2) {
+            if is_book_half_title_or_boilerplate_page(pg_txt) {
+                continue;
+            }
+            let (ti, aus, yr) = heuristic_first_page(pg_txt);
+            if ti.is_some() {
+                page_title = ti;
+                p34_h_authors = aus;
+                p34_h_year = yr;
+                break;
+            }
+        }
+    }
 
     let raw_embedded_title = cleaned_doc_title.map(ToOwned::to_owned).or(xmp_title);
     // Zotero-style check: only trust embedded PDF /Title or XMP title if its words actually appear
@@ -528,11 +555,17 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
     }
     if authors_acc.is_empty() {
         let primary_h_authors = if p1_is_cover {
-            p2_h_authors
+            if !p2_h_authors.is_empty() {
+                p2_h_authors
+            } else {
+                p34_h_authors
+            }
         } else if !p1_h_authors.is_empty() {
             p1_h_authors
-        } else {
+        } else if !p2_h_authors.is_empty() {
             p2_h_authors
+        } else {
+            p34_h_authors
         };
         for a in primary_h_authors {
             push_unique_author(&mut authors_acc, a);
@@ -564,15 +597,19 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
 
     let arxiv_inferred_year = out.arxiv_id.as_deref().and_then(infer_year_from_arxiv_id);
 
-    out.heuristic_year = (if p1_is_cover { p2_h_year } else { p1_h_year.or(p2_h_year) })
-        .or_else(|| {
-            first_pages_text
-                .iter()
-                .take(3)
-                .find_map(|p| extract_clean_year(p))
-        })
-        .or(fn_parsed.year)
-        .or(arxiv_inferred_year);
+    out.heuristic_year = (if p1_is_cover {
+        p2_h_year.or(p34_h_year)
+    } else {
+        p1_h_year.or(p2_h_year).or(p34_h_year)
+    })
+    .or_else(|| {
+        first_pages_text
+            .iter()
+            .take(4)
+            .find_map(|p| extract_clean_year(p))
+    })
+    .or(fn_parsed.year)
+    .or(arxiv_inferred_year);
 
     out
 }
@@ -625,6 +662,185 @@ fn is_repository_cover_page(page_text: &str) -> bool {
         return true;
     }
     false
+}
+
+fn is_editorial_board_heading(low: &str) -> bool {
+    let t = low.trim().trim_end_matches(':').trim();
+    matches!(
+        t,
+        "editorial board"
+            | "advisory board"
+            | "editorial committee"
+            | "series editors"
+            | "series editor"
+            | "managing editor"
+            | "managing editors"
+            | "founding editors"
+            | "founding editor"
+            | "honorary editors"
+            | "editors-in-chief"
+            | "editor-in-chief"
+    ) || low.starts_with("editorial board:")
+        || low.starts_with("advisory board:")
+        || low.starts_with("series editors:")
+        || low.starts_with("series editor:")
+        || low.starts_with("managing editor:")
+        || low.starts_with("founding editors:")
+        || low.starts_with("editors:")
+}
+
+fn is_book_series_or_publisher_banner(low: &str) -> bool {
+    let t = low
+        .trim()
+        .replace(['’', '‘'], "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if matches!(
+        t.as_str(),
+        "publishers' page"
+            | "publisher's page"
+            | "publishers page"
+            | "this page intentionally left blank"
+            | "springer"
+            | "springer-verlag"
+            | "birkhäuser"
+            | "birkhauser"
+            | "elsevier"
+            | "academic press"
+            | "world scientific"
+            | "cambridge university press"
+            | "oxford university press"
+            | "princeton university press"
+            | "american mathematical society"
+            | "dover publications"
+    ) || is_editorial_board_heading(&t)
+    {
+        return true;
+    }
+
+    const SERIES_PREFIXES: &[&str] = &[
+        "graduate texts in mathematics",
+        "undergraduate texts in mathematics",
+        "lecture notes in mathematics",
+        "lecture notes in computational science and engineering",
+        "lecture notes in statistics",
+        "lecture notes in physics",
+        "grundlehren der mathematischen wissenschaften",
+        "ergebnisse der mathematik und ihrer grenzgebiete",
+        "applied mathematical sciences",
+        "texts in applied mathematics",
+        "universitext",
+        "classics in mathematics",
+        "springer monographs in mathematics",
+        "graduate studies in mathematics",
+        "student mathematical library",
+        "mathematical surveys and monographs",
+        "colloquium publications",
+        "cambridge studies in advanced mathematics",
+        "cambridge tracts in mathematics",
+        "london mathematical society monographs",
+        "london mathematical society lecture note series",
+        "london mathematical society student texts",
+        "oxford mathematical monographs",
+        "oxford lecture series in mathematics and its applications",
+        "oxford graduate texts in mathematics",
+        "princeton mathematical series",
+        "annals of mathematics studies",
+        "carathéodory", // no-op guard; keep exact series below
+        "caratheodory",
+    ];
+
+    for &prefix in SERIES_PREFIXES {
+        if prefix == "carathéodory" || prefix == "caratheodory" {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let r = rest.trim();
+            if r.is_empty() {
+                return true;
+            }
+            // Only treat as a standalone series banner if any trailing tokens are volume/series qualifiers,
+            // never if followed by a colon + actual book title.
+            if r.starts_with(':') {
+                return false;
+            }
+            let all_qualifiers = r.split_whitespace().all(|w| {
+                let cw = w.trim_matches(['.', ',', '-', '#', '(', ')', '[', ']', '/']);
+                cw.is_empty()
+                    || cw.chars().all(|c| c.is_ascii_digit())
+                    || matches!(
+                        cw,
+                        "vol"
+                            | "volume"
+                            | "no"
+                            | "nr"
+                            | "number"
+                            | "band"
+                            | "heft"
+                            | "tome"
+                            | "fasc"
+                            | "new"
+                            | "series"
+                            | "second"
+                            | "third"
+                            | "fourth"
+                            | "ns"
+                            | "i"
+                            | "ii"
+                            | "iii"
+                            | "iv"
+                            | "v"
+                            | "vi"
+                            | "vii"
+                            | "viii"
+                            | "ix"
+                            | "x"
+                    )
+            });
+            if all_qualifiers {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_book_half_title_or_boilerplate_page(page_text: &str) -> bool {
+    let word_count = page_text.split_whitespace().count();
+    if word_count == 0 {
+        return true;
+    }
+    if word_count > 140 {
+        return false;
+    }
+    let low = page_text.to_ascii_lowercase();
+    if low.contains("abstract") || low.contains("1. introduction") || low.contains("\nintroduction\n") {
+        return false;
+    }
+    let norm_quotes = low.replace(['’', '‘'], "'");
+    if norm_quotes.contains("editorial board")
+        || norm_quotes.contains("advisory board")
+        || norm_quotes.contains("series editors")
+        || norm_quotes.contains("managing editor")
+        || norm_quotes.contains("founding editors")
+        || norm_quotes.contains("publishers' page")
+        || norm_quotes.contains("publisher's page")
+        || norm_quotes.contains("this page intentionally left blank")
+    {
+        return true;
+    }
+    let non_empty: Vec<&str> = page_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    non_empty.len() <= 6
+        && non_empty.iter().all(|l| {
+            l.len() < 4
+                || l.chars().all(|c| c.is_ascii_digit() || c.is_whitespace())
+                || is_book_series_or_publisher_banner(&l.to_ascii_lowercase())
+        })
 }
 
 fn extract_cover_page_authors(page_text: &str) -> Vec<String> {
@@ -974,6 +1190,7 @@ pub(crate) fn looks_like_garbage_title(s: &str) -> bool {
                 | "dvips"
         )
         || is_running_journal_header(&low)
+        || is_book_series_or_publisher_banner(&low)
     {
         return true;
     }
@@ -993,8 +1210,32 @@ fn looks_like_garbage_author(s: &str) -> bool {
     low.is_empty()
         || matches!(
             low.as_str(),
-            "unknown" | "author" | "user" | "admin" | "administrator" | "ieee" | "elsevier" | "springer"
+            "unknown"
+                | "author"
+                | "authors"
+                | "editor"
+                | "editors"
+                | "board"
+                | "user"
+                | "admin"
+                | "administrator"
+                | "ieee"
+                | "elsevier"
+                | "springer"
+                | "springer-verlag"
+                | "birkhäuser"
+                | "birkhauser"
+                | "wiley"
+                | "academic press"
+                | "world scientific"
+                | "cambridge university press"
+                | "oxford university press"
+                | "princeton university press"
+                | "american mathematical society"
+                | "dover publications"
         )
+        || is_editorial_board_heading(&low)
+        || is_book_series_or_publisher_banner(&low)
         || low.contains('@')
         || low.starts_with("http")
 }
@@ -1509,6 +1750,9 @@ fn looks_like_author_line(line: &str) -> bool {
     let low = trimmed.to_ascii_lowercase();
     if is_body_boundary_line(&low)
         || is_running_journal_header(&low)
+        || is_editorial_board_heading(&low)
+        || is_book_series_or_publisher_banner(&low)
+        || looks_like_garbage_author(&low)
         || looks_like_affiliation_line(trimmed)
         || contains_title_topic_word(trimmed)
     {
@@ -2046,7 +2290,7 @@ fn extract_layout_title_and_authors(page1: &ExtractedPage) -> (Option<String>, V
             break;
         }
         let low = ln.text.to_ascii_lowercase();
-        if is_body_boundary_line(&low) {
+        if is_body_boundary_line(&low) || is_editorial_board_heading(&low) {
             break;
         }
         if low.starts_with("dedicated to ")
@@ -2054,6 +2298,7 @@ fn extract_layout_title_and_authors(page1: &ExtractedPage) -> (Option<String>, V
             || low.starts_with("communicated by ")
             || low.starts_with("received ")
             || is_running_journal_header(&low)
+            || is_book_series_or_publisher_banner(&low)
             || looks_like_affiliation_line(&ln.text)
         {
             continue;
@@ -2203,9 +2448,12 @@ fn parse_filename_metadata(stem: &str) -> FilenameParsed {
         return out;
     }
 
-    // 4. Fallback to Author_CamelCaseTitle / Author - Title / clean stem
-    let (author, title) = parse_filename_author_and_title(trimmed);
+    // 4. Fallback to Author_CamelCaseTitle / Author - Title (YYYY) / clean stem
+    let (author, title, trailing_year) = parse_filename_author_and_title_with_year(trimmed);
     out.author = author;
+    if out.year.is_none() {
+        out.year = trailing_year;
+    }
     if let Some(t) = title {
         if !looks_like_garbage_title(&t) {
             out.keywords = extract_significant_keywords(&t);
@@ -2302,30 +2550,209 @@ fn is_non_author_filename_prefix(tok: &str) -> bool {
         )
 }
 
+#[cfg(test)]
 fn parse_filename_author_and_title(stem: &str) -> (Option<String>, Option<String>) {
-    // Supports common academic naming like `GrettonBorgwardt_AKernelTwoSampleTest` or `Author - Title`
-    if let Some((left, right)) = stem.split_once(" - ").or_else(|| stem.split_once('_')) {
-        let left_spaced = split_camel_case(left.trim());
-        let first_surname = left_spaced
+    let (au, ti, _) = parse_filename_author_and_title_with_year(stem);
+    (au, ti)
+}
+
+fn split_filename_author_title_delimiter(stem: &str) -> Option<(&str, &str)> {
+    for sep in [" - ", " – ", " — ", " -", "- "] {
+        if let Some((l, r)) = stem.split_once(sep) {
+            if !l.trim().is_empty() && !r.trim().is_empty() {
+                return Some((l.trim(), r.trim()));
+            }
+        }
+    }
+    if let Some((l, r)) = stem.split_once('_') {
+        if !l.trim().is_empty() && !r.trim().is_empty() {
+            return Some((l.trim(), r.trim()));
+        }
+    }
+    None
+}
+
+fn strip_trailing_year_from_title(raw: &str) -> (String, Option<i64>) {
+    static PAREN_YEAR_RE: StdOnceLock<Regex> = StdOnceLock::new();
+    let paren_re = PAREN_YEAR_RE.get_or_init(|| {
+        Regex::new(r"[\s_.-]*(?:\((18\d{2}|19\d{2}|20[0-3]\d)\)|\[(18\d{2}|19\d{2}|20[0-3]\d)\])\s*$")
+            .unwrap()
+    });
+    let trimmed = raw.trim();
+    if let Some(c) = paren_re.captures(trimmed) {
+        let m_all = c.get(0).unwrap();
+        let prefix = trimmed[..m_all.start()].trim();
+        if prefix.chars().filter(|ch| ch.is_alphabetic()).count() >= 4 {
+            let yr = c
+                .get(1)
+                .or_else(|| c.get(2))
+                .and_then(|m| m.as_str().parse::<i64>().ok());
+            return (prefix.to_string(), yr);
+        }
+    }
+
+    static BARE_YEAR_RE: StdOnceLock<Regex> = StdOnceLock::new();
+    let bare_re = BARE_YEAR_RE
+        .get_or_init(|| Regex::new(r"[\s_.-]+(18\d{2}|19\d{2}|20[0-3]\d)\s*$").unwrap());
+    if let Some(c) = bare_re.captures(trimmed) {
+        let m_all = c.get(0).unwrap();
+        let prefix = trimmed[..m_all.start()].trim();
+        let last_word = prefix
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let part_of_title = matches!(
+            last_word.as_str(),
+            "in" | "of" | "since" | "from" | "to" | "until" | "after" | "before"
+        );
+        if !part_of_title && prefix.chars().filter(|ch| ch.is_alphabetic()).count() >= 4 {
+            let yr = c.get(1).and_then(|m| m.as_str().parse::<i64>().ok());
+            return (prefix.to_string(), yr);
+        }
+    }
+
+    (trimmed.to_string(), None)
+}
+
+fn is_filename_initial_token(tok: &str) -> bool {
+    let stripped = tok.trim_matches('.');
+    if stripped.is_empty() {
+        return false;
+    }
+    if stripped.chars().count() == 1 && stripped.chars().all(char::is_alphabetic) {
+        return tok.ends_with('.') || stripped.chars().all(char::is_uppercase);
+    }
+    tok.contains('.')
+        && stripped.chars().count() <= 3
+        && stripped.chars().all(|c| c.is_alphabetic() || c == '.' || c == '-')
+}
+
+fn extract_filename_first_author(left: &str) -> Option<String> {
+    let trimmed = left.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Single CamelCase/plain token like `GiganteLeopardi` or `Halmos`
+    if !trimmed.contains(' ') && !trimmed.contains(',') && !trimmed.contains('.') {
+        let spaced = split_camel_case(trimmed);
+        return spaced
             .split_whitespace()
             .next()
             .filter(|w| {
                 w.len() >= 2
-                    && w.chars().all(|c| c.is_alphabetic() || c == '-')
+                    && w.chars().all(|c| c.is_alphabetic() || c == '-' || c == '\'')
                     && !is_non_author_filename_prefix(w)
             })
-            .map(ToOwned::to_owned);
-        let right_title = clean_filename_to_title(right);
-        if first_surname.is_some() && right_title.len() >= 4 && !looks_like_garbage_title(&right_title)
-        {
-            return (first_surname, Some(right_title));
+            .map(capitalize_surname);
+    }
+
+    let first_coauthor = trimmed
+        .split([';', '&'])
+        .next()
+        .unwrap_or(trimmed)
+        .split(" and ")
+        .next()
+        .unwrap_or(trimmed)
+        .split(" AND ")
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+
+    let comma_parts: Vec<&str> = first_coauthor
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if comma_parts.is_empty() {
+        return None;
+    }
+
+    // Check `Surname, Given` (e.g. `Lang, Serge` or `De Giorgi, Ennio` or `Halmos, P. R.`)
+    // vs `De Marco G., Mariconda C.` (where comma_parts[0] already ends with initial `G.`).
+    let p0_tokens: Vec<&str> = comma_parts[0].split_whitespace().collect();
+    let p0_has_initial = p0_tokens.iter().any(|t| is_filename_initial_token(t));
+    if comma_parts.len() == 2 && !p0_has_initial {
+        let p1_tokens: Vec<&str> = comma_parts[1].split_whitespace().collect();
+        let p0_words_valid = !p0_tokens.is_empty()
+            && p0_tokens.len() <= 3
+            && p0_tokens.iter().all(|w| {
+                w.chars().all(|c| c.is_alphabetic() || c == '-' || c == '\'')
+                    && !is_non_author_filename_prefix(w)
+            });
+        let p1_looks_given = !p1_tokens.is_empty()
+            && p1_tokens.len() <= 3
+            && (p1_tokens.iter().all(|t| is_filename_initial_token(t))
+                || p1_tokens.len() == 1);
+        if p0_words_valid && p1_looks_given {
+            return Some(format!("{}, {}", comma_parts[0], comma_parts[1]));
         }
     }
-    let cleaned = clean_filename_to_title(stem);
+
+    let person = comma_parts[0];
+    let tokens: Vec<&str> = person.split_whitespace().collect();
+    let mut non_initials: Vec<&str> = Vec::new();
+    let mut initials: Vec<&str> = Vec::new();
+    for &t in &tokens {
+        if is_filename_initial_token(t) {
+            initials.push(t);
+        } else {
+            non_initials.push(t);
+        }
+    }
+
+    if non_initials.is_empty() || non_initials.len() > 4 {
+        return None;
+    }
+    let all_valid = non_initials.iter().all(|w| {
+        let cw = w.trim_matches(['.', '-', '\'']);
+        cw.chars().count() >= 2
+            && cw.chars().all(|c| c.is_alphabetic() || c == '-' || c == '\'')
+            && !is_non_author_filename_prefix(cw)
+    });
+    if !all_valid {
+        return None;
+    }
+
+    if non_initials.len() == 1 {
+        let fam = non_initials[0].trim_matches('.');
+        if initials.is_empty() {
+            return Some(fam.to_string());
+        }
+        return Some(format!("{fam}, {}", initials.join(" ")));
+    }
+
+    // If trailing token in `tokens` was an initial (e.g. `De Marco G.` or `Garcia Marquez G.`),
+    // all `non_initials` belong to the family name!
+    if tokens.last().is_some_and(|t| is_filename_initial_token(t)) {
+        return Some(format!("{}, {}", non_initials.join(" "), initials.join(" ")));
+    }
+
+    Some(non_initials.join(" "))
+}
+
+fn parse_filename_author_and_title_with_year(
+    stem: &str,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    // Supports `GrettonBorgwardt_AKernelTwoSampleTest`, `Lang S. - Real and functional analysis (1993)`,
+    // `G. Fasshauer - Kernel-based Approximation (2015)`, `Epstein L. -Relativity Visualized 1994`.
+    if let Some((left, right)) = split_filename_author_title_delimiter(stem) {
+        let first_author = extract_filename_first_author(left);
+        let (right_no_yr, yr) = strip_trailing_year_from_title(right);
+        let right_title = clean_filename_to_title(&right_no_yr);
+        if first_author.is_some()
+            && right_title.len() >= 4
+            && !looks_like_garbage_title(&right_title)
+        {
+            return (first_author, Some(right_title), yr);
+        }
+    }
+    let (stem_no_yr, yr) = strip_trailing_year_from_title(stem);
+    let cleaned = clean_filename_to_title(&stem_no_yr);
     if looks_like_garbage_title(&cleaned) {
-        (None, None)
+        (None, None, yr)
     } else {
-        (None, Some(cleaned))
+        (None, Some(cleaned), yr)
     }
 }
 
@@ -2414,6 +2841,21 @@ fn heuristic_first_page(page_text: &str) -> (Option<String>, Vec<String>, Option
         return (None, Vec::new(), extract_clean_year(page_text));
     }
 
+    // Book title pages frequently place the author line ("Serge Lang") directly ABOVE the book title
+    let mut pre_title_authors: Vec<String> = Vec::new();
+    if lines.len() >= 2 && looks_like_author_line(lines[0]) {
+        let second = lines[1];
+        let second_low = second.to_ascii_lowercase();
+        if !looks_like_author_line(second)
+            && !is_body_boundary_line(&second_low)
+            && !is_non_title_seed_line(second)
+            && (contains_title_topic_word(second) || second.split_whitespace().count() >= 3)
+        {
+            pre_title_authors = split_author_list(lines[0]);
+            lines.remove(0);
+        }
+    }
+
     // Reconstruct multi-line title (up to 4 lines) when connectors, lowercase continuations, or ALL-CAPS titles wrap
     let mut title_end = 0usize;
     while title_end + 1 < lines.len() && title_end < 3 {
@@ -2453,12 +2895,19 @@ fn heuristic_first_page(page_text: &str) -> (Option<String>, Vec<String>, Option
     };
 
     let mut authors = Vec::new();
+    for a in pre_title_authors {
+        push_unique_author(&mut authors, a);
+    }
     for &ln in lines.iter().skip(title_end + 1).take(4) {
         let low = ln.to_ascii_lowercase();
-        if is_body_boundary_line(&low) || (ln.len() > 110 && !ln.contains(',')) {
+        if is_body_boundary_line(&low)
+            || is_editorial_board_heading(&low)
+            || (ln.len() > 110 && !ln.contains(','))
+        {
             break;
         }
         if looks_like_affiliation_line(ln)
+            || is_book_series_or_publisher_banner(&low)
             || low.starts_with("dedicated to ")
             || low.starts_with("communicated by ")
             || low.starts_with("received ")
@@ -2929,5 +3378,114 @@ mod tests {
                 .as_deref(),
             Some("regularity for Laplacian systems in")
         );
+    }
+
+    #[test]
+    fn skips_book_series_half_title_editorial_board_and_parses_book_filenames() {
+        let p1_half_title = "Graduate Texts in Mathematics 142\n\
+                             Editorial Board\n\
+                             S. Axler F.W. Gehring K.A. Ribet\n\
+                             Springer";
+        let p2_series_list = "Publishers’ page\nThis page intentionally left blank";
+        let p3_title_page = "Serge Lang\n\
+                             Real and Functional Analysis\n\
+                             Third Edition\n\
+                             Springer-Verlag 1993";
+        let p4_copyright = "ISBN 978-0-387-94001-4\n© 1993 Springer-Verlag New York, Inc.";
+
+        let ids_gtm = extract_identifiers_and_heuristics(
+            None,
+            None,
+            None,
+            &[p1_half_title, p2_series_list, p3_title_page, p4_copyright],
+            None,
+            596,
+            Some("Lang S. - Real and functional analysis (1993)"),
+        );
+        assert!(ids_gtm.looks_like_book);
+        assert_eq!(ids_gtm.isbn.as_deref(), Some("9780387940014"));
+        assert_eq!(
+            ids_gtm.heuristic_title.as_deref(),
+            Some("Real and Functional Analysis")
+        );
+        assert_eq!(
+            ids_gtm
+                .heuristic_first_author
+                .as_deref()
+                .and_then(clean_author_surname)
+                .as_deref(),
+            Some("Lang")
+        );
+        assert_eq!(ids_gtm.heuristic_year, Some(1993));
+
+        // Filename-only book parsing cases
+        let ids_init_first = extract_identifiers_and_heuristics(
+            None,
+            None,
+            None,
+            &[],
+            None,
+            520,
+            Some("G. Fasshauer - Kernel-based Approximation Methods using MATLAB (2015)"),
+        );
+        assert_eq!(
+            ids_init_first
+                .heuristic_first_author
+                .as_deref()
+                .and_then(clean_author_surname)
+                .as_deref(),
+            Some("Fasshauer")
+        );
+        assert_eq!(
+            ids_init_first.heuristic_title.as_deref(),
+            Some("Kernel based Approximation Methods using MATLAB")
+        );
+        assert_eq!(ids_init_first.heuristic_year, Some(2015));
+
+        let ids_multi_fam = extract_identifiers_and_heuristics(
+            None,
+            None,
+            None,
+            &[],
+            None,
+            340,
+            Some("De Marco G., Mariconda C. - Esercizi in una variabile (2015) "),
+        );
+        assert_eq!(
+            ids_multi_fam
+                .heuristic_first_author
+                .as_deref()
+                .and_then(clean_author_surname)
+                .as_deref(),
+            Some("De Marco")
+        );
+        assert_eq!(
+            ids_multi_fam.heuristic_title.as_deref(),
+            Some("Esercizi in una variabile")
+        );
+        assert_eq!(ids_multi_fam.heuristic_year, Some(2015));
+
+        let ids_tight_dash = extract_identifiers_and_heuristics(
+            None,
+            None,
+            None,
+            &[],
+            None,
+            210,
+            Some("Epstein L. -Relativity Visualized 1994"),
+        );
+        assert_eq!(
+            ids_tight_dash
+                .heuristic_first_author
+                .as_deref()
+                .and_then(clean_author_surname)
+                .as_deref(),
+            Some("Epstein")
+        );
+        assert_eq!(
+            ids_tight_dash.heuristic_title.as_deref(),
+            Some("Relativity Visualized")
+        );
+        assert_eq!(ids_tight_dash.heuristic_year, Some(1994));
     }
 }

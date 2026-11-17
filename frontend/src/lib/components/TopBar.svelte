@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { tr, type Lang } from '../i18n';
   import type {
     DownloadProgressEvent,
@@ -132,13 +133,24 @@
     }, 160);
   }
 
-  function scheduleMetaFilterChange(next: MetadataSearchFilter) {
+  function scheduleMetaFilterChange(patch: Partial<MetadataSearchFilter>) {
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
     filterDebounceTimer = setTimeout(() => {
       filterDebounceTimer = null;
-      onMetaFilterChange(next);
+      onMetaFilterChange({ ...metaFilter, ...patch });
     }, 160);
   }
+
+  onDestroy(() => {
+    if (metaDebounceTimer) {
+      clearTimeout(metaDebounceTimer);
+      metaDebounceTimer = null;
+    }
+    if (filterDebounceTimer) {
+      clearTimeout(filterDebounceTimer);
+      filterDebounceTimer = null;
+    }
+  });
 
   export function focusSearch() {
     searchInputEl?.focus();
@@ -197,8 +209,8 @@
       <polygon points="17,5 22,7 19,8.5" fill="#ea580c" />
       <polygon points="6,15 17,15 13,20 4,18" fill="#fcd34d" />
     </svg>
-    <strong class="brand-name" title="Papero v0.3.0">Papero</strong>
-    <span class="brand-version" title="Papero v0.3.0">0.3.0</span>
+    <strong class="brand-name" title="Papero v0.3.1">Papero</strong>
+    <span class="brand-version" title="Papero v0.3.1">0.3.1</span>
     <span
       class="roots-pill"
       title={roots.length > 0
@@ -222,7 +234,13 @@
         ? 'Ricerca nel testo completo (BM25 + semantica ibrida)'
         : 'Filtra per titolo, autore, anno, rivista, MSC'}
       value={searchMode}
-      onchange={(e) => onSearchModeChange((e.currentTarget as HTMLSelectElement).value as 'content' | 'metadata')}
+      onchange={(e) => {
+        if (metaDebounceTimer) {
+          clearTimeout(metaDebounceTimer);
+          metaDebounceTimer = null;
+        }
+        onSearchModeChange((e.currentTarget as HTMLSelectElement).value as 'content' | 'metadata');
+      }}
     >
       <option value="content">{tr(lang, 'modeContent')}</option>
       <option value="metadata">{tr(lang, 'modeMetadata')}</option>

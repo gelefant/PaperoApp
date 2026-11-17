@@ -424,6 +424,7 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    contain: content;
   }
 
   .sb-section {

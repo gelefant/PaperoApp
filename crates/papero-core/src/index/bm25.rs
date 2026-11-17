@@ -51,6 +51,17 @@ impl<T: TokenStream> TokenStream for MathNormalizeStream<T> {
         if !self.tail.advance() {
             return false;
         }
+        // Zero-allocation in-place fast path for pure ASCII tokens without backticks.
+        if self
+            .tail
+            .token()
+            .text
+            .bytes()
+            .all(|b| b < 0x80 && b != b'`')
+        {
+            self.tail.token_mut().text.make_ascii_lowercase();
+            return true;
+        }
         let normalized = normalize_math_text(&self.tail.token().text);
         self.tail.token_mut().text = normalized;
         true
@@ -85,7 +96,9 @@ pub struct Bm25Hit {
 pub struct Bm25Index {
     index: Index,
     reader: IndexReader,
-    writer: Mutex<IndexWriter>,
+    /// Lazily opened during write batches and dropped on `commit()` so Tantivy's ~30–50 MB
+    /// writer arena and background merge threads consume 0 MB RAM at idle.
+    writer: Mutex<Option<IndexWriter>>,
     f_passage_id: Field,
     f_document_id: Field,
     f_file_id: Field,
@@ -142,7 +155,6 @@ impl Bm25Index {
             .build();
         index.tokenizers().register(MATH_ANALYZER_NAME, analyzer);
 
-        let writer = index.writer(50_000_000)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -151,7 +163,7 @@ impl Bm25Index {
         Ok(Self {
             index,
             reader,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(None),
             f_passage_id,
             f_document_id,
             f_file_id,
@@ -160,11 +172,23 @@ impl Bm25Index {
         })
     }
 
+    fn ensure_writer<'a>(
+        &'a self,
+        slot: &'a mut Option<IndexWriter>,
+    ) -> Result<&'a mut IndexWriter> {
+        if slot.is_none() {
+            let w = self.index.writer_with_num_threads(2, 30_000_000)?;
+            *slot = Some(w);
+        }
+        Ok(slot.as_mut().expect("writer initialized"))
+    }
+
     pub fn add_passages(&self, passages: &[Bm25Passage]) -> Result<()> {
         if passages.is_empty() {
             return Ok(());
         }
-        let writer = self.writer.lock().expect("bm25 writer mutex poisoned");
+        let mut guard = self.writer.lock().expect("bm25 writer mutex poisoned");
+        let writer = self.ensure_writer(&mut guard)?;
         for p in passages {
             writer.delete_term(Term::from_field_u64(self.f_passage_id, p.passage_id));
             writer.add_document(doc!(
@@ -182,7 +206,8 @@ impl Bm25Index {
         if passage_ids.is_empty() {
             return Ok(());
         }
-        let writer = self.writer.lock().expect("bm25 writer mutex poisoned");
+        let mut guard = self.writer.lock().expect("bm25 writer mutex poisoned");
+        let writer = self.ensure_writer(&mut guard)?;
         for &pid in passage_ids {
             writer.delete_term(Term::from_field_u64(self.f_passage_id, pid));
         }
@@ -190,15 +215,23 @@ impl Bm25Index {
     }
 
     pub fn delete_document(&self, document_id: u64) -> Result<()> {
-        let writer = self.writer.lock().expect("bm25 writer mutex poisoned");
+        let mut guard = self.writer.lock().expect("bm25 writer mutex poisoned");
+        let writer = self.ensure_writer(&mut guard)?;
         writer.delete_term(Term::from_field_u64(self.f_document_id, document_id));
         Ok(())
     }
 
     pub fn commit(&self) -> Result<()> {
-        let mut writer = self.writer.lock().expect("bm25 writer mutex poisoned");
-        writer.commit()?;
-        drop(writer);
+        let writer_opt = {
+            let mut guard = self.writer.lock().expect("bm25 writer mutex poisoned");
+            if let Some(ref mut w) = *guard {
+                w.commit()?;
+            }
+            guard.take()
+        };
+        if let Some(w) = writer_opt {
+            let _ = w.wait_merging_threads();
+        }
         self.reader.reload()?;
         Ok(())
     }
@@ -206,8 +239,11 @@ impl Bm25Index {
     /// Commits any buffered changes and snapshots `src_dir` while holding the writer mutex
     /// so concurrent commits/merges cannot delete segment files mid-backup.
     pub fn commit_and_copy_dir(&self, src_dir: &Path, dst_dir: &Path) -> Result<()> {
-        let mut writer = self.writer.lock().expect("bm25 writer mutex poisoned");
-        writer.commit()?;
+        let mut guard = self.writer.lock().expect("bm25 writer mutex poisoned");
+        if let Some(mut w) = guard.take() {
+            w.commit()?;
+            let _ = w.wait_merging_threads();
+        }
         self.reader.reload()?;
         if src_dir.exists() {
             crate::backup::copy_dir_excluding_locks(src_dir, dst_dir)?;
@@ -265,26 +301,52 @@ impl Bm25Index {
 
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
-            let retrieved: tantivy::TantivyDocument = searcher.doc(addr)?;
-            let passage_id = retrieved
-                .get_first(self.f_passage_id)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let document_id = retrieved
-                .get_first(self.f_document_id)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let file_id = retrieved
-                .get_first(self.f_file_id)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            // Read `passage_id` and `document_id` directly from mmap FAST columns when available
+            // so searches avoid decompressing up to 300 LZ4 doc-store blocks!
+            let seg = searcher.segment_reader(addr.segment_ord);
+            let ff = seg.fast_fields();
+            let fast_pid = ff
+                .u64("passage_id")
+                .ok()
+                .and_then(|col| col.first(addr.doc_id));
+            let fast_did = ff
+                .u64("document_id")
+                .ok()
+                .and_then(|col| col.first(addr.doc_id));
 
-            hits.push(Bm25Hit {
-                passage_id,
-                document_id,
-                file_id,
-                score,
-            });
+            if let (Some(passage_id), Some(document_id)) = (fast_pid, fast_did) {
+                let fast_fid = ff
+                    .u64("file_id")
+                    .ok()
+                    .and_then(|col| col.first(addr.doc_id))
+                    .unwrap_or(0);
+                hits.push(Bm25Hit {
+                    passage_id,
+                    document_id,
+                    file_id: fast_fid,
+                    score,
+                });
+            } else {
+                let retrieved: tantivy::TantivyDocument = searcher.doc(addr)?;
+                let passage_id = retrieved
+                    .get_first(self.f_passage_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let document_id = retrieved
+                    .get_first(self.f_document_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let file_id = retrieved
+                    .get_first(self.f_file_id)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                hits.push(Bm25Hit {
+                    passage_id,
+                    document_id,
+                    file_id,
+                    score,
+                });
+            }
         }
 
         Ok(hits)
@@ -295,15 +357,14 @@ fn build_schema() -> (Schema, Field, Field, Field, Field, Field) {
     let mut builder = Schema::builder();
     let f_passage_id = builder.add_u64_field("passage_id", INDEXED | STORED | FAST);
     let f_document_id = builder.add_u64_field("document_id", INDEXED | STORED | FAST);
-    let f_file_id = builder.add_u64_field("file_id", INDEXED | STORED);
+    let f_file_id = builder.add_u64_field("file_id", INDEXED | STORED | FAST);
     let f_root_id = builder.add_text_field("root_id", STRING | STORED);
 
     let text_indexing = TextFieldIndexing::default()
         .set_tokenizer(MATH_ANALYZER_NAME)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-    let text_options = TextOptions::default()
-        .set_indexing_options(text_indexing)
-        .set_stored();
+    // Do not duplicate full `text_content` inside Tantivy's doc-store (SQLite `passages` already stores it).
+    let text_options = TextOptions::default().set_indexing_options(text_indexing);
     let f_text_content = builder.add_text_field("text_content", text_options);
 
     (

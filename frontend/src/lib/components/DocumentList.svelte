@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { tr, type Lang } from '../i18n';
   import { shouldShowRowVerifyControl } from '../viewerUtils';
   import type {
@@ -52,6 +53,185 @@
   }: Props = $props();
 
   const showVerifyControl = $derived(shouldShowRowVerifyControl(verifiedFilter, unverifiedCount));
+
+  const VIRTUALIZE_THRESHOLD = 80;
+  const ESTIMATED_ROW_HEIGHT = 50;
+  const OVERSCAN_ROWS = 14;
+
+  let rowsEl: HTMLDivElement | undefined = $state();
+  let scrollTop = $state(0);
+  let viewportHeight = $state(640);
+  let heightRevision = $state(0);
+  const measuredHeights = new Map<number, number>();
+  let scrollRafId: number | null = null;
+  let measureRafId: number | null = null;
+  const pendingMeasureNodes = new Map<number, HTMLElement>();
+  let rowsResizeObserver: ResizeObserver | null = null;
+
+  function scheduleFlushMeasurements() {
+    if (measureRafId !== null) return;
+    measureRafId = requestAnimationFrame(() => {
+      measureRafId = null;
+      let changed = false;
+      for (const [docId, el] of pendingMeasureNodes) {
+        if (!el.isConnected) continue;
+        const h = el.offsetHeight;
+        if (h > 0 && measuredHeights.get(docId) !== h) {
+          measuredHeights.set(docId, h);
+          changed = true;
+        }
+      }
+      pendingMeasureNodes.clear();
+      if (changed) {
+        heightRevision++;
+      }
+    });
+  }
+
+  function measureRow(node: HTMLElement, docId: number) {
+    let currentId = docId;
+    pendingMeasureNodes.set(currentId, node);
+    scheduleFlushMeasurements();
+    return {
+      update(nextId: number) {
+        if (nextId !== currentId) {
+          pendingMeasureNodes.delete(currentId);
+          currentId = nextId;
+        }
+        pendingMeasureNodes.set(currentId, node);
+        scheduleFlushMeasurements();
+      },
+      destroy() {
+        pendingMeasureNodes.delete(currentId);
+      },
+    };
+  }
+
+  const rowLayout = $derived.by(() => {
+    const _rev = heightRevision;
+    void _rev;
+    const len = documents.length;
+    const offsets = new Float64Array(len + 1);
+    for (let i = 0; i < len; i++) {
+      offsets[i + 1] =
+        offsets[i] + (measuredHeights.get(documents[i].document_id) ?? ESTIMATED_ROW_HEIGHT);
+    }
+    return { offsets, totalHeight: offsets[len] };
+  });
+
+  function findRowIndexAtOffset(offsets: Float64Array, count: number, y: number): number {
+    if (count <= 0) return 0;
+    let lo = 0;
+    let hi = count - 1;
+    let ans = count - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (offsets[mid + 1] >= y) {
+        ans = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return ans;
+  }
+
+  const virtualWindow = $derived.by(() => {
+    const len = documents.length;
+    if (len <= VIRTUALIZE_THRESHOLD) {
+      return { items: documents, topPad: 0, bottomPad: 0, startIdx: 0, endIdx: len };
+    }
+    const { offsets, totalHeight } = rowLayout;
+    const firstVisible = findRowIndexAtOffset(offsets, len, Math.max(0, scrollTop));
+    const lastVisible = findRowIndexAtOffset(
+      offsets,
+      len,
+      Math.max(0, scrollTop + viewportHeight)
+    );
+    const startIdx = Math.max(0, firstVisible - OVERSCAN_ROWS);
+    const endIdx = Math.min(len, lastVisible + 1 + OVERSCAN_ROWS);
+    return {
+      items: documents.slice(startIdx, endIdx),
+      topPad: offsets[startIdx],
+      bottomPad: Math.max(0, totalHeight - offsets[endIdx]),
+      startIdx,
+      endIdx,
+    };
+  });
+
+  function handleRowsScroll() {
+    if (scrollRafId !== null) return;
+    scrollRafId = requestAnimationFrame(() => {
+      scrollRafId = null;
+      if (rowsEl) {
+        scrollTop = rowsEl.scrollTop;
+      }
+    });
+  }
+
+  $effect(() => {
+    const el = rowsEl;
+    if (!el) return;
+    untrack(() => {
+      if (el.clientHeight > 0) {
+        viewportHeight = el.clientHeight;
+      }
+      scrollTop = el.scrollTop;
+    });
+    rowsResizeObserver?.disconnect();
+    rowsResizeObserver = new ResizeObserver((entries) => {
+      for (const ent of entries) {
+        if (ent.contentRect.height > 0) {
+          viewportHeight = ent.contentRect.height;
+        }
+      }
+    });
+    rowsResizeObserver.observe(el);
+    return () => {
+      rowsResizeObserver?.disconnect();
+      rowsResizeObserver = null;
+    };
+  });
+
+  // Keep keyboard/workflow-selected row visible when `selectedDocId` moves outside viewport
+  let prevScrolledDocId: number | null = null;
+  $effect(() => {
+    const sel = selectedDocId;
+    if (sel === prevScrolledDocId) return;
+    prevScrolledDocId = sel;
+    if (sel === null || !rowsEl) return;
+    untrack(() => {
+      if (!rowsEl) return;
+      const idx = documents.findIndex((d) => d.document_id === sel);
+      if (idx < 0) return;
+      const { offsets } = rowLayout;
+      const rowTop = offsets[idx];
+      const rowBottom = offsets[idx + 1];
+      const curTop = rowsEl.scrollTop;
+      const curBottom = curTop + viewportHeight;
+      if (rowTop < curTop) {
+        rowsEl.scrollTop = rowTop;
+        scrollTop = rowTop;
+      } else if (rowBottom > curBottom) {
+        const nextTop = Math.max(0, rowBottom - viewportHeight);
+        rowsEl.scrollTop = nextTop;
+        scrollTop = nextTop;
+      }
+    });
+  });
+
+  onMount(() => {
+    if (rowsEl && rowsEl.clientHeight > 0) {
+      viewportHeight = rowsEl.clientHeight;
+    }
+  });
+
+  onDestroy(() => {
+    if (scrollRafId !== null) cancelAnimationFrame(scrollRafId);
+    if (measureRafId !== null) cancelAnimationFrame(measureRafId);
+    rowsResizeObserver?.disconnect();
+    pendingMeasureNodes.clear();
+  });
 </script>
 
 <div class="doc-list">
@@ -167,9 +347,11 @@
       {tr(lang, 'emptyCatalog')}
     </div>
   {:else}
-    <div class="rows">
-      {#each documents as doc (`${doc.document_id}-${doc.file_id}`)}
+    <div class="rows" bind:this={rowsEl} onscroll={handleRowsScroll}>
+      <div style="padding-top: {virtualWindow.topPad}px; padding-bottom: {virtualWindow.bottomPad}px;">
+      {#each virtualWindow.items as doc (`${doc.document_id}-${doc.file_id}`)}
         <div
+          use:measureRow={doc.document_id}
           class="doc-row"
           class:selected={doc.document_id === selectedDocId}
           class:unavailable={!doc.is_available}
@@ -289,6 +471,7 @@
           {/if}
         </div>
       {/each}
+      </div>
     </div>
   {/if}
 </div>
@@ -451,6 +634,7 @@
   .rows {
     overflow-y: auto;
     flex: 1;
+    contain: content;
   }
   .doc-row {
     padding: 6px 10px;

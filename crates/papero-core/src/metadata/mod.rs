@@ -27,8 +27,9 @@ pub use models::{
 };
 pub use resolver::{
     apply_manual_metadata_edit, apply_manual_metadata_edit_with_locks, confirm_metadata_candidate,
-    dismiss_metadata_candidate, get_document_metadata, is_document_metadata_verified,
-    resolve_document_metadata, search_documents_metadata, set_document_metadata_verified,
-    ManualMetadataEdit, MetadataLookupScope, MetadataSearchFilter, ResolveOutcome,
-    SaveAndFetchResult, WaterfallClients,
+    dismiss_metadata_candidate, get_document_metadata, get_documents_metadata_for_export,
+    is_document_metadata_verified, resolve_document_metadata, run_pending_metadata_jobs_cancellable,
+    search_documents_metadata, set_document_metadata_verified, ManualMetadataEdit,
+    MetadataLookupScope, MetadataSearchFilter, ResolveOutcome, SaveAndFetchResult,
+    WaterfallClients,
 };

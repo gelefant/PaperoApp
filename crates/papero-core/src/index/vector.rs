@@ -16,6 +16,7 @@ pub struct VectorHit {
 struct VectorState {
     index: Index,
     is_view: bool,
+    dirty: bool,
 }
 
 /// Disk-backed HNSW vector index using `usearch` (`ScalarKind::F16`, `MetricKind::Cos`).
@@ -69,7 +70,11 @@ impl VectorIndex {
         Ok(Self {
             path: path.to_path_buf(),
             dimensions,
-            state: RwLock::new(VectorState { index, is_view }),
+            state: RwLock::new(VectorState {
+                index,
+                is_view,
+                dirty: false,
+            }),
         })
     }
 
@@ -98,19 +103,65 @@ impl VectorIndex {
 
     /// Retrieves a stored vector by `passage_id` (if present in the index).
     pub fn get_vector(&self, passage_id: u64) -> Option<Vec<f32>> {
-        let guard = self.state.read().ok()?;
-        if !guard.index.contains(passage_id) {
-            return None;
-        }
         let mut buf = vec![0.0_f32; self.dimensions];
-        match guard.index.get(passage_id, &mut buf) {
-            Ok(n) if n > 0 => Some(buf),
-            _ => None,
+        if self.read_vector_into(passage_id, &mut buf) {
+            Some(buf)
+        } else {
+            None
         }
     }
 
-    /// Upserts `(passage_id, embedding)` pairs, saves atomically, and restores OS-mmap view.
-    pub fn upsert_batch(&self, items: &[(u64, Vec<f32>)]) -> Result<()> {
+    /// Reads a stored vector into a caller-provided slice without heap allocation.
+    pub fn read_vector_into(&self, passage_id: u64, buf: &mut [f32]) -> bool {
+        if buf.len() != self.dimensions {
+            return false;
+        }
+        let Ok(guard) = self.state.read() else {
+            return false;
+        };
+        if !guard.index.contains(passage_id) {
+            return false;
+        }
+        matches!(guard.index.get(passage_id, buf), Ok(n) if n > 0)
+    }
+
+    /// Streams `(document_id, passage_id)` pairs under a single `RwLock::read` guard and single
+    /// reusable scratch buffer, returning `(sum_vec, count)` per document with zero per-passage heap allocs.
+    pub fn accumulate_doc_vectors<I>(
+        &self,
+        doc_passage_pairs: I,
+    ) -> std::collections::HashMap<i64, (Vec<f32>, usize)>
+    where
+        I: IntoIterator<Item = (i64, u64)>,
+    {
+        let mut acc: std::collections::HashMap<i64, (Vec<f32>, usize)> =
+            std::collections::HashMap::new();
+        let Ok(guard) = self.state.read() else {
+            return acc;
+        };
+        if guard.index.size() == 0 {
+            return acc;
+        }
+        let dim = self.dimensions;
+        let mut scratch = vec![0.0_f32; dim];
+        for (doc_id, pid) in doc_passage_pairs {
+            if guard.index.contains(pid) && matches!(guard.index.get(pid, &mut scratch), Ok(n) if n > 0)
+            {
+                let entry = acc
+                    .entry(doc_id)
+                    .or_insert_with(|| (vec![0.0_f32; dim], 0usize));
+                for (dst, src) in entry.0.iter_mut().zip(scratch.iter()) {
+                    *dst += *src;
+                }
+                entry.1 += 1;
+            }
+        }
+        acc
+    }
+
+    /// Upserts `(passage_id, embedding)` pairs in memory without rewriting the index file yet.
+    /// Call [`Self::flush`] after a batch of files to persist atomically and restore OS-mmap view.
+    pub fn upsert_in_memory(&self, items: &[(u64, Vec<f32>)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
@@ -147,8 +198,31 @@ impl VectorIndex {
                 .add(*pid, vec)
                 .map_err(|e| CoreError::Config(format!("usearch add key {pid} failed: {e}")))?;
         }
+        guard.dirty = true;
+        Ok(())
+    }
 
-        self.save_and_remap_locked(&mut guard)
+    /// Persists any buffered in-memory vector updates atomically to disk and restores OS-mmap view.
+    pub fn flush(&self) -> Result<()> {
+        let mut guard = self
+            .state
+            .write()
+            .map_err(|_| CoreError::Config("vector index lock poisoned".into()))?;
+        if !guard.dirty {
+            return Ok(());
+        }
+        self.save_and_remap_locked(&mut guard)?;
+        guard.dirty = false;
+        Ok(())
+    }
+
+    /// Upserts `(passage_id, embedding)` pairs, saves atomically, and restores OS-mmap view.
+    pub fn upsert_batch(&self, items: &[(u64, Vec<f32>)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.upsert_in_memory(items)?;
+        self.flush()
     }
 
     /// Removes passage keys from the index, persisting atomically if any were present.
@@ -174,6 +248,7 @@ impl VectorIndex {
         }
         if removed > 0 {
             self.save_and_remap_locked(&mut guard)?;
+            guard.dirty = false;
         }
         Ok(removed)
     }
