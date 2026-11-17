@@ -141,9 +141,10 @@ pub fn normalize_root_dir_path(path: &Path) -> String {
             #[cfg(target_os = "windows")]
             {
                 if s.starts_with(r"\\?\Volume{") && path.is_dir() {
-                    return path.to_string_lossy().into_owned();
+                    path.to_string_lossy().into_owned()
+                } else {
+                    strip_windows_verbatim_prefix(&s)
                 }
-                return strip_windows_verbatim_prefix(&s);
             }
             #[cfg(not(target_os = "windows"))]
             {
