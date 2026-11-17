@@ -274,20 +274,19 @@
               </button>
             {/if}
           </div>
-          {#if doc.authors_summary || doc.year}
+          {#if doc.authors_summary || doc.year || doc.page_count}
             <div class="doc-bib">
-              <span>{doc.authors_summary || 'Autore sconosciuto'}</span>
-              {#if doc.year}
-                <span> · {doc.year}</span>
+              {#if doc.authors_summary || doc.year}
+                <span>{doc.authors_summary || 'Autore sconosciuto'}</span>
+                {#if doc.year}
+                  <span> · {doc.year}</span>
+                {/if}
+              {/if}
+              {#if doc.page_count}
+                <span class="doc-pages">{#if doc.authors_summary || doc.year} · {/if}{doc.page_count} pp.</span>
               {/if}
             </div>
           {/if}
-          <div class="doc-meta">
-            <span>{doc.root_label} / {doc.rel_path}</span>
-            {#if doc.page_count}
-              <span>· {doc.page_count} pp.</span>
-            {/if}
-          </div>
         </div>
       {/each}
     </div>
@@ -454,7 +453,7 @@
     flex: 1;
   }
   .doc-row {
-    padding: 8px 10px;
+    padding: 6px 10px;
     border-bottom: 1px solid var(--border);
     cursor: pointer;
   }
@@ -468,6 +467,9 @@
     margin-top: 2px;
     font-size: 11px;
     color: var(--text);
+  }
+  .doc-pages {
+    color: var(--text-muted);
   }
   .doc-row.unavailable {
     opacity: 0.65;
@@ -566,14 +568,6 @@
     border-radius: 4px;
     background: rgba(22, 163, 74, 0.14);
     color: #15803d;
-  }
-  .doc-meta {
-    margin-top: 3px;
-    font-size: 11px;
-    color: var(--text-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   .empty {
     padding: 20px;

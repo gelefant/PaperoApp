@@ -31,6 +31,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_roots,
             commands::add_source_root,
+            commands::rebind_source_root,
             commands::toggle_source_root,
             commands::delete_source_root,
             commands::trigger_rescan,

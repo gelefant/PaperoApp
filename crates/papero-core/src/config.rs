@@ -87,6 +87,17 @@ impl AppPaths {
         }
         Ok(())
     }
+
+    /// Local-only JSON mapping `root_id -> native root_path` for this device.
+    /// Never exported inside `.papero-backup`, enabling automatic cross-OS folder rebinding.
+    pub fn local_roots_path(&self) -> PathBuf {
+        self.data_dir.join("local_root_paths.json")
+    }
+
+    /// Directory holding a verified staged `.papero-backup` payload applied on next launch.
+    pub fn pending_restore_dir(&self) -> PathBuf {
+        self.data_dir.join(".pending_restore")
+    }
 }
 
 /// Default ordered list of bibliographic metadata sources in the resolution waterfall.
@@ -406,6 +417,78 @@ impl AppConfig {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
         Ok(())
+    }
+}
+
+/// Strips host-specific targets and secret fallbacks before exporting a portable backup.
+pub fn sanitize_config_for_backup(cfg: &mut AppConfig) {
+    cfg.polite_email_fallback = None;
+    cfg.backup_path = None;
+    cfg.last_backup_at = None;
+    cfg.last_backup_bytes = None;
+}
+
+fn is_incompatible_tool_path(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if cfg!(not(target_os = "windows"))
+        && (trimmed.to_ascii_lowercase().ends_with(".exe") || trimmed.contains('\\'))
+    {
+        return true;
+    }
+    (trimmed.contains('/') || trimmed.contains('\\')) && !Path::new(trimmed).exists()
+}
+
+fn is_incompatible_external_command(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let macos_only = trimmed == "macos-preview-applescript"
+        || trimmed.starts_with("/Applications/")
+        || lower.contains(".app/");
+    if cfg!(not(target_os = "macos")) && macos_only {
+        return true;
+    }
+    if cfg!(not(target_os = "windows")) && lower.contains(".exe") {
+        return true;
+    }
+    cfg!(target_os = "windows") && trimmed.starts_with('/')
+}
+
+/// Sanitizes an imported `AppConfig` so backup files remain portable across macOS, Windows, and Linux.
+pub fn sanitize_config_for_cross_os_restore(cfg: &mut AppConfig) {
+    sanitize_config_for_backup(cfg);
+
+    if cfg.pdfium_lib_path.as_ref().is_some_and(|p| !p.exists()) {
+        cfg.pdfium_lib_path = None;
+    }
+    if cfg
+        .onnxruntime_lib_path
+        .as_ref()
+        .is_some_and(|p| !p.exists())
+    {
+        cfg.onnxruntime_lib_path = None;
+    }
+    for slot in [
+        &mut cfg.djvused_bin,
+        &mut cfg.ddjvu_bin,
+        &mut cfg.tesseract_bin,
+    ] {
+        if slot.as_deref().is_some_and(is_incompatible_tool_path) {
+            *slot = None;
+        }
+    }
+    for slot in [
+        &mut cfg.external_pdf_command,
+        &mut cfg.external_djvu_command,
+    ] {
+        if slot.as_deref().is_some_and(is_incompatible_external_command) {
+            *slot = None;
+        }
     }
 }
 

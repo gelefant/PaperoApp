@@ -1,13 +1,16 @@
-use crate::config::{AppConfig, AppPaths};
+use crate::config::{
+    sanitize_config_for_backup, sanitize_config_for_cross_os_restore, AppConfig, AppPaths,
+};
+use crate::db::repos::roots::reconcile_source_roots_with_local_map;
 use crate::db::Database;
 use crate::error::{CoreError, Result};
 use crate::index::bm25::Bm25Index;
-use rusqlite::{backup::Backup, Connection};
+use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -47,6 +50,8 @@ fn should_skip_transient_file(name: &str) -> bool {
     name.ends_with(".lock")
         || name.ends_with(".tmp")
         || name == ".DS_Store"
+        || name == "Thumbs.db"
+        || name == "desktop.ini"
         || name.starts_with(".tantivy-meta.")
         || name.starts_with(".tantivy-writer.")
 }
@@ -115,28 +120,25 @@ fn stream_copy_exact<R: Read, W: Write>(
 }
 
 fn validate_safe_rel_path(raw: &str) -> Result<PathBuf> {
-    let p = Path::new(raw);
-    if p.is_absolute() {
+    let normalized = raw.replace('\\', "/");
+    if normalized.starts_with('/')
+        || normalized.contains('\0')
+        || normalized.as_bytes().get(1) == Some(&b':')
+    {
         return Err(CoreError::Config(format!(
             "backup contains absolute path: {raw}"
         )));
     }
     let mut clean = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Normal(seg) => clean.push(seg),
-            _ => {
-                return Err(CoreError::Config(format!(
-                    "backup contains unsafe path component: {raw}"
-                )));
-            }
+    for seg in normalized.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." || seg.contains(':') {
+            return Err(CoreError::Config(format!(
+                "backup contains unsafe path component: {raw}"
+            )));
         }
+        clean.push(seg);
     }
-    let first = clean
-        .components()
-        .next()
-        .and_then(|c| c.as_os_str().to_str())
-        .unwrap_or("");
+    let first = normalized.split('/').next().unwrap_or("");
     if !matches!(first, "papero.db" | "config.json" | "tantivy" | "indices") {
         return Err(CoreError::Config(format!(
             "backup entry outside allowed scope: {raw}"
@@ -216,10 +218,12 @@ pub(crate) fn copy_dir_excluding_locks(src_dir: &Path, dst_dir: &Path) -> Result
     Ok(())
 }
 
-struct StagingCleanup(PathBuf);
+struct StagingCleanup(Option<PathBuf>);
 impl Drop for StagingCleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if let Some(ref p) = self.0 {
+            let _ = fs::remove_dir_all(p);
+        }
     }
 }
 
@@ -285,7 +289,7 @@ pub fn create_backup_bundle_with_bm25(
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&tmp_dir)?;
-    let _cleanup = StagingCleanup(tmp_dir.clone());
+    let _cleanup = StagingCleanup(Some(tmp_dir.clone()));
 
     let snap_db_path = tmp_dir.join("papero.db");
     {
@@ -297,11 +301,7 @@ pub fn create_backup_bundle_with_bm25(
     }
 
     let mut cfg = AppConfig::load_or_default(&paths.config_path)?;
-    // Never export personal fallback email, secrets, or host-specific backup targets
-    cfg.polite_email_fallback = None;
-    cfg.backup_path = None;
-    cfg.last_backup_at = None;
-    cfg.last_backup_bytes = None;
+    sanitize_config_for_backup(&mut cfg);
     let snap_cfg_path = tmp_dir.join("config.json");
     cfg.save(&snap_cfg_path)?;
 
@@ -370,10 +370,33 @@ pub fn create_backup_bundle_with_bm25(
     })
 }
 
-/// Verifies integrity (magic header + per-file SHA-256 + path safety) and restores
-/// `papero.db`, `config.json`, `tantivy/`, and `indices/` into `paths.data_dir`.
-/// Supports both legacy uncompressed V1 and Zstd-compressed V2 `.papero-backup` archives.
-pub fn restore_backup_bundle(paths: &AppPaths, src_file: &Path) -> Result<RestoreReport> {
+const PENDING_READY_MARKER: &str = ".ready";
+
+fn is_transient_sharing_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+        || (cfg!(target_os = "windows")
+            && matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33)))
+}
+
+fn retry_transient_fs_op<T, F>(mut op: F) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    let mut last_err = None;
+    for attempt in 0..60 {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < 59 && is_transient_sharing_error(&e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("filesystem retry exhausted")))
+}
+
+fn unpack_and_verify_archive(src_file: &Path, staging: &Path) -> Result<(usize, u64)> {
     let mut r = BufReader::new(File::open(src_file)?);
     let mut magic = [0u8; 14];
     r.read_exact(&mut magic)?;
@@ -412,13 +435,6 @@ pub fn restore_backup_bundle(paths: &AppPaths, src_file: &Path) -> Result<Restor
         Box::new(r)
     };
 
-    let staging = paths.data_dir.join(format!(".restore_staging_{}", uuid::Uuid::new_v4()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
-    let _staging_guard = StagingCleanup(staging.clone());
-
     let mut buf = vec![0u8; STREAM_BUF_SIZE];
     let mut total_bytes = 0u64;
     for entry in &manifest.files {
@@ -453,20 +469,76 @@ pub fn restore_backup_bundle(paths: &AppPaths, src_file: &Path) -> Result<Restor
         }
     }
 
-    // Apply verified staging files into live data directory
+    Ok((manifest.files.len(), total_bytes))
+}
+
+/// Validates staged DB integrity, sanitizes OS-specific settings in `config.json`, and
+/// reconciles `source_roots` against `local_root_paths.json` for cross-OS portability.
+fn prepare_staged_restore_artifacts(paths: &AppPaths, staging: &Path) -> Result<()> {
+    let staged_cfg = staging.join("config.json");
+    if staged_cfg.exists() {
+        let mut cfg = AppConfig::load_or_default(&staged_cfg)?;
+        sanitize_config_for_cross_os_restore(&mut cfg);
+        cfg.save(&staged_cfg)?;
+    }
+
+    let staged_db = staging.join("papero.db");
+    if staged_db.exists() {
+        {
+            let conn = Connection::open_with_flags(
+                &staged_db,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            let _ = conn.execute_batch("PRAGMA journal_mode = DELETE;");
+            let qc: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
+            if !qc.eq_ignore_ascii_case("ok") {
+                return Err(CoreError::Config(format!(
+                    "Staged backup SQLite integrity check failed: {qc}"
+                )));
+            }
+            let has_roots_table: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='source_roots'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_roots_table {
+                reconcile_source_roots_with_local_map(&conn, &paths.local_roots_path())?;
+            }
+        }
+        for sidecar in ["papero.db-wal", "papero.db-shm"] {
+            let p = staging.join(sidecar);
+            if p.exists() {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_staged_dir_to_live(paths: &AppPaths, staging: &Path) -> Result<()> {
+    fs::create_dir_all(&paths.data_dir)?;
     let staged_db = staging.join("papero.db");
     if staged_db.exists() {
         for sidecar in ["papero.db-wal", "papero.db-shm"] {
             let p = paths.data_dir.join(sidecar);
             if p.exists() {
-                let _ = fs::remove_file(p);
+                retry_transient_fs_op(|| {
+                    if p.exists() {
+                        fs::remove_file(&p)
+                    } else {
+                        Ok(())
+                    }
+                })?;
             }
         }
-        fs::copy(&staged_db, &paths.db_path)?;
+        retry_transient_fs_op(|| fs::copy(&staged_db, &paths.db_path).map(|_| ()))?;
     }
     let staged_cfg = staging.join("config.json");
     if staged_cfg.exists() {
-        fs::copy(&staged_cfg, &paths.config_path)?;
+        retry_transient_fs_op(|| fs::copy(&staged_cfg, &paths.config_path).map(|_| ()))?;
     }
     for (sub, dst_dir) in [
         ("tantivy", &paths.tantivy_dir),
@@ -474,21 +546,91 @@ pub fn restore_backup_bundle(paths: &AppPaths, src_file: &Path) -> Result<Restor
     ] {
         let staged_sub = staging.join(sub);
         if dst_dir.exists() {
-            fs::remove_dir_all(dst_dir)?;
+            retry_transient_fs_op(|| {
+                if dst_dir.exists() {
+                    fs::remove_dir_all(dst_dir)
+                } else {
+                    Ok(())
+                }
+            })?;
         }
         fs::create_dir_all(dst_dir)?;
         if staged_sub.exists() {
             copy_dir_recursive(&staged_sub, dst_dir)?;
         }
     }
+    Ok(())
+}
 
-    let _ = fs::remove_dir_all(&staging);
+/// Verifies integrity (magic header + per-file SHA-256 + path safety) and restores
+/// `papero.db`, `config.json`, `tantivy/`, and `indices/` into `paths.data_dir`.
+/// Supports both legacy uncompressed V1 and Zstd-compressed V2 `.papero-backup` archives.
+pub fn restore_backup_bundle(paths: &AppPaths, src_file: &Path) -> Result<RestoreReport> {
+    fs::create_dir_all(&paths.data_dir)?;
+    let staging = paths
+        .data_dir
+        .join(format!(".restore_staging_{}", uuid::Uuid::new_v4()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let _staging_guard = StagingCleanup(Some(staging.clone()));
+
+    let (files_restored, total_bytes) = unpack_and_verify_archive(src_file, &staging)?;
+    prepare_staged_restore_artifacts(paths, &staging)?;
+    apply_staged_dir_to_live(paths, &staging)?;
 
     Ok(RestoreReport {
-        files_restored: manifest.files.len(),
+        files_restored,
         total_bytes,
         restart_recommended: true,
     })
+}
+
+/// Verifies and stages a `.papero-backup` archive into `<data_dir>/.pending_restore`
+/// without touching currently open SQLite, Tantivy, or memory-mapped USearch files.
+/// Required on Windows (and clean on all OSes), where replacing open/mmapped files in-process
+/// fails with OS sharing violations; applied on next startup by `apply_pending_restore_if_ready`.
+pub fn stage_pending_restore(paths: &AppPaths, src_file: &Path) -> Result<RestoreReport> {
+    fs::create_dir_all(&paths.data_dir)?;
+    let tmp_staging = paths
+        .data_dir
+        .join(format!(".pending_restore_tmp_{}", uuid::Uuid::new_v4()));
+    if tmp_staging.exists() {
+        fs::remove_dir_all(&tmp_staging)?;
+    }
+    fs::create_dir_all(&tmp_staging)?;
+    let mut staging_guard = StagingCleanup(Some(tmp_staging.clone()));
+
+    let (files_restored, total_bytes) = unpack_and_verify_archive(src_file, &tmp_staging)?;
+    prepare_staged_restore_artifacts(paths, &tmp_staging)?;
+
+    let pending_dir = paths.pending_restore_dir();
+    if pending_dir.exists() {
+        fs::remove_dir_all(&pending_dir)?;
+    }
+    fs::rename(&tmp_staging, &pending_dir)?;
+    staging_guard.0 = None;
+    fs::write(pending_dir.join(PENDING_READY_MARKER), b"ready\n")?;
+
+    Ok(RestoreReport {
+        files_restored,
+        total_bytes,
+        restart_recommended: true,
+    })
+}
+
+/// Applies a verified `.pending_restore` snapshot before any DB/Tantivy/USearch handles are opened.
+/// Returns `Ok(true)` if a pending restore was applied.
+pub fn apply_pending_restore_if_ready(paths: &AppPaths) -> Result<bool> {
+    let pending_dir = paths.pending_restore_dir();
+    let ready_marker = pending_dir.join(PENDING_READY_MARKER);
+    if !ready_marker.exists() {
+        return Ok(false);
+    }
+    apply_staged_dir_to_live(paths, &pending_dir)?;
+    let _ = fs::remove_dir_all(&pending_dir);
+    Ok(true)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -723,5 +865,161 @@ mod tests {
         let res_v1 = restore_backup_bundle(&dst_v1, &archive_v1).unwrap();
         assert_eq!(res_v1.files_restored, 2);
         assert_eq!(fs::read(dst_v1.tantivy_dir.join("legacy_seg")).unwrap(), v1_seg);
+    }
+
+    #[test]
+    fn staged_pending_restore_works_across_live_handles_and_remaps_cross_os_roots() {
+        use crate::db::repos::docs::{insert_file_record, NewFileRecord};
+        use crate::db::repos::roots::{
+            get_source_root, insert_source_root, record_local_root_path, NewSourceRoot,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_paths = AppPaths::from_data_dir(tmp.path().join("src_macos"));
+        src_paths.ensure_dirs().unwrap();
+
+        let src_db = Database::open(&src_paths.db_path, 2).unwrap();
+        {
+            let w = src_db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "root-drive".into(),
+                    label: "Drive Papers".into(),
+                    root_path: "/Users/other-os/GoogleDrive/Papers".into(),
+                    is_network_or_cloud: true,
+                },
+            )
+            .unwrap();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "root-missing".into(),
+                    label: "Unmapped Drive".into(),
+                    root_path: "/Users/other-os/MissingFolder".into(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+
+            let d1 = create_heuristic_document(&w, "Portable Paper One").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d1,
+                    root_id: "root-drive",
+                    rel_path: "sub/one.pdf",
+                    format: "pdf",
+                    size_bytes: 123,
+                    mtime_ns: 456,
+                    blake3_hash: "aaaa",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+
+            let d2 = create_heuristic_document(&w, "Offline Paper Two").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d2,
+                    root_id: "root-missing",
+                    rel_path: "two.pdf",
+                    format: "pdf",
+                    size_bytes: 321,
+                    mtime_ns: 654,
+                    blake3_hash: "bbbb",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+        }
+
+        let src_cfg = AppConfig {
+            ui_language: "en".into(),
+            first_run_completed: true,
+            pdfium_lib_path: Some(PathBuf::from("/nonexistent/other-os/libpdfium.dylib")),
+            tesseract_bin: Some("/nonexistent/other-os/tesseract".into()),
+            ..Default::default()
+        };
+        src_cfg.save(&src_paths.config_path).unwrap();
+
+        let archive = tmp.path().join("shared.papero-backup");
+        create_backup_bundle(&src_paths, &src_db, &archive).unwrap();
+
+        // Destination machine has a live open DB + Tantivy + a local path mapping for "root-drive"
+        let dst_paths = AppPaths::from_data_dir(tmp.path().join("dst_win"));
+        dst_paths.ensure_dirs().unwrap();
+        let local_drive_dir = tmp.path().join("LocalDriveMount/Papers");
+        fs::create_dir_all(&local_drive_dir).unwrap();
+        fs::write(local_drive_dir.join("placeholder.pdf"), b"%PDF-1.4").unwrap();
+        record_local_root_path(
+            &dst_paths.local_roots_path(),
+            "root-drive",
+            &local_drive_dir.to_string_lossy(),
+        )
+        .unwrap();
+
+        {
+            let live_db = Database::open(&dst_paths.db_path, 2).unwrap();
+            let _live_bm25 = Bm25Index::open_or_create(&dst_paths.tantivy_dir).unwrap();
+            // Staging succeeds without touching live open DB/Tantivy files
+            let rep = stage_pending_restore(&dst_paths, &archive).unwrap();
+            assert!(rep.files_restored >= 2);
+            assert!(dst_paths.pending_restore_dir().join(".ready").exists());
+            let live_docs: i64 = live_db
+                .reader()
+                .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(live_docs, 0);
+        }
+
+        // Simulate next startup applying pending restore before opening DB/indices
+        assert!(apply_pending_restore_if_ready(&dst_paths).unwrap());
+        assert!(!dst_paths.pending_restore_dir().exists());
+        assert!(!apply_pending_restore_if_ready(&dst_paths).unwrap());
+
+        let restored_cfg = AppConfig::load_or_default(&dst_paths.config_path).unwrap();
+        assert_eq!(restored_cfg.ui_language, "en");
+        assert!(restored_cfg.first_run_completed);
+        assert_eq!(restored_cfg.pdfium_lib_path, None);
+        assert_eq!(restored_cfg.tesseract_bin, None);
+
+        let restored_db = Database::open(&dst_paths.db_path, 2).unwrap();
+        let r = restored_db.reader();
+        let mapped = get_source_root(&r, "root-drive").unwrap().unwrap();
+        assert_eq!(mapped.root_path, local_drive_dir.to_string_lossy());
+        assert!(mapped.is_reachable);
+
+        let unmapped = get_source_root(&r, "root-missing").unwrap().unwrap();
+        assert!(!unmapped.is_reachable);
+
+        let avail_one: i64 = r
+            .query_row(
+                "SELECT is_available FROM files WHERE rel_path = 'sub/one.pdf'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let avail_two: i64 = r
+            .query_row(
+                "SELECT is_available FROM files WHERE rel_path = 'two.pdf'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(avail_one, 1);
+        assert_eq!(avail_two, 0);
+    }
+
+    #[test]
+    fn validate_safe_rel_path_accepts_posix_and_backslash_and_rejects_traversal() {
+        assert!(validate_safe_rel_path("papero.db").is_ok());
+        assert!(validate_safe_rel_path("tantivy/meta.json").is_ok());
+        assert!(validate_safe_rel_path("tantivy\\meta.json").is_ok());
+        assert!(validate_safe_rel_path("../papero.db").is_err());
+        assert!(validate_safe_rel_path("..\\papero.db").is_err());
+        assert!(validate_safe_rel_path("C:\\papero.db").is_err());
+        assert!(validate_safe_rel_path("/etc/passwd").is_err());
     }
 }

@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use papero_core::backup::{restore_backup_bundle, BackupReport, RestoreReport};
+use papero_core::backup::{stage_pending_restore, BackupReport, RestoreReport};
 use papero_core::bibtex::{format_mrlookup_bibtex, BibtexExportOptions};
 use papero_core::classify::{
     add_tag_to_document, build_msc_tree, confirm_document_msc, list_all_tags,
@@ -18,8 +18,9 @@ use papero_core::db::repos::docs::{
     ContentSearchDocResult, DocumentListItem, FileViewerInfo,
 };
 use papero_core::db::repos::roots::{
-    insert_source_root, list_source_roots, remove_source_root_with_cleanup, set_root_enabled,
-    set_root_exclude_from_cloud_llm, NewSourceRoot, SourceRoot,
+    insert_source_root, list_source_roots, normalize_root_dir_path, rebind_source_root_path,
+    record_local_root_path, remove_local_root_path, remove_source_root_with_cleanup,
+    set_root_enabled, set_root_exclude_from_cloud_llm, NewSourceRoot, SourceRoot,
 };
 use papero_core::db::repos::scans::ScanSummary;
 use papero_core::dedup::{
@@ -171,6 +172,15 @@ pub fn list_roots(state: State<'_, Arc<AppState>>) -> Result<Vec<SourceRoot>, St
     list_source_roots(&r).map_err(|e| e.to_string())
 }
 
+fn validate_and_canonicalize_dir(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let p = Path::new(trimmed);
+    if !p.is_dir() {
+        return Err(format!("Path is not a readable directory: {trimmed}"));
+    }
+    Ok(normalize_root_dir_path(p))
+}
+
 #[tauri::command]
 pub fn add_source_root(
     state: State<'_, Arc<AppState>>,
@@ -178,15 +188,7 @@ pub fn add_source_root(
     label: Option<String>,
     is_network_or_cloud: Option<bool>,
 ) -> Result<SourceRoot, String> {
-    let trimmed = path.trim();
-    let p = Path::new(trimmed);
-    if !p.is_dir() {
-        return Err(format!("Path is not a readable directory: {trimmed}"));
-    }
-    let canonical = std::fs::canonicalize(p)
-        .unwrap_or_else(|_| p.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+    let canonical = validate_and_canonicalize_dir(&path)?;
     let final_label = label
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -210,6 +212,24 @@ pub fn add_source_root(
             },
         )
         .map_err(|e| e.to_string())?
+    };
+    let _ = record_local_root_path(&state.paths.local_roots_path(), &root.id, &root.root_path);
+    AppState::refresh_watcher(&state, None);
+    state.schedule_auto_backup();
+    Ok(root)
+}
+
+#[tauri::command]
+pub fn rebind_source_root(
+    state: State<'_, Arc<AppState>>,
+    root_id: String,
+    new_path: String,
+) -> Result<SourceRoot, String> {
+    let canonical = validate_and_canonicalize_dir(&new_path)?;
+    let root = {
+        let w = state.db.writer();
+        rebind_source_root_path(&w, &state.paths.local_roots_path(), &root_id, &canonical)
+            .map_err(|e| e.to_string())?
     };
     AppState::refresh_watcher(&state, None);
     state.schedule_auto_backup();
@@ -248,6 +268,7 @@ pub fn delete_source_root(state: State<'_, Arc<AppState>>, root_id: String) -> R
             let _ = state.vector_quality.remove_keys(&report.deleted_passage_ids);
         }
     }
+    let _ = remove_local_root_path(&state.paths.local_roots_path(), &root_id);
     AppState::refresh_watcher(&state, None);
     state.schedule_auto_backup();
     Ok(())
@@ -1551,22 +1572,23 @@ pub async fn update_backup_now_cmd(
 
 #[tauri::command]
 pub async fn restore_backup_cmd(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     src_path: String,
 ) -> Result<RestoreReport, String> {
     let _guard = state.backup_mutex.lock().await;
-    state.auto_backup_dirty.store(false, Ordering::SeqCst);
+    state.stop_background_activity();
     let st = Arc::clone(&state);
-    st.embedder_slot.unload();
-    st.reranker_slot.unload();
     let rep = tokio::task::spawn_blocking(move || {
-        restore_backup_bundle(&st.paths, Path::new(&src_path)).map_err(|e| e.to_string())
+        stage_pending_restore(&st.paths, Path::new(&src_path)).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
-    if let Ok(reloaded) = AppConfig::load_or_default(&state.paths.config_path) {
-        *state.config.write().expect("config poisoned") = reloaded;
-    }
+
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        app.restart();
+    });
     Ok(rep)
 }
 

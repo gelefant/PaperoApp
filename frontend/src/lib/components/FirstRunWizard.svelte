@@ -14,6 +14,10 @@
     mlStatus: MlEnvironmentStatus | null;
     mlDownloadProgress: DownloadProgressEvent | null;
     onAddFolder: () => Promise<void>;
+    onRestoreBackup?: () => Promise<void>;
+    backupBusy?: boolean;
+    backupNotice?: string;
+    backupError?: string;
     onDownloadMlProfile: (profile: 'light' | 'quality') => Promise<void>;
     onSaveSettings: (next: UiSettingsPayload) => Promise<void>;
     onCompleteAndScan: () => Promise<void>;
@@ -27,6 +31,10 @@
     mlStatus,
     mlDownloadProgress,
     onAddFolder,
+    onRestoreBackup,
+    backupBusy = false,
+    backupNotice = '',
+    backupError = '',
     onDownloadMlProfile,
     onSaveSettings,
     onCompleteAndScan,
@@ -146,7 +154,18 @@
             <button type="button" class="primary" onclick={onAddFolder}>
               {selectedLang === 'en' ? '+ Add folder…' : '+ Aggiungi cartella…'}
             </button>
+            {#if onRestoreBackup}
+              <button type="button" disabled={backupBusy} onclick={onRestoreBackup}>
+                {tr(selectedLang, 'wizardRestoreBackupBtn')}
+              </button>
+            {/if}
           </div>
+          {#if backupNotice}
+            <p class="prog-txt">{backupNotice}</p>
+          {/if}
+          {#if backupError}
+            <p class="err-txt">{backupError}</p>
+          {/if}
           {#if roots.length === 0}
             <p class="empty-msg">
               {selectedLang === 'en'
@@ -390,6 +409,11 @@
   .wiz-body h3 {
     margin: 0;
     font-size: 14px;
+  }
+  .action-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
   }
   .hint-text,
   .empty-msg {

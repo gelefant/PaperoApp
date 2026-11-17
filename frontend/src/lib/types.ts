@@ -508,6 +508,16 @@ export interface TagSummary {
   document_count: number;
 }
 
+export type SettingsTabId =
+  | 'general'
+  | 'folders'
+  | 'ml'
+  | 'ocr'
+  | 'metadata'
+  | 'llm'
+  | 'backup'
+  | 'shortcuts';
+
 export interface BackupReport {
   archive_path: string;
   files_count: number;

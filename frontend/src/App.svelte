@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
   import { api } from './lib/api';
-  import { normalizeLang } from './lib/i18n';
+  import { normalizeLang, tr } from './lib/i18n';
   import type {
     BackupReport,
     ContentSearchDocResult,
@@ -26,6 +26,7 @@
     NormalizedRect,
     OcrEnvironmentStatus,
     ScanProgressEvent,
+    SettingsTabId,
     SortDirection,
     SortField,
     SourceRoot,
@@ -98,7 +99,10 @@
   let contextTarget = $state<ContextTarget | null>(null);
   let topBarRef = $state<{ focusSearch?: () => void } | null>(null);
   let settingsOpen = $state(false);
+  let settingsInitialTab = $state<SettingsTabId | null>(null);
   let wizardOpen = $state(false);
+  let unreachableBannerDismissed = $state(false);
+  let unreachableRoots = $derived(roots.filter((r) => !r.is_reachable));
   let ocrStatus = $state<OcrEnvironmentStatus | null>(null);
   let llmPreview = $state<LlmPromptPreview | null>(null);
   let llmAnswer = $state<LlmAnswerResult | null>(null);
@@ -870,6 +874,30 @@
     await refreshLlmPreview();
   }
 
+  async function handleRebindRoot(rootId: string) {
+    const targetRoot = roots.find((r) => r.id === rootId);
+    const selected = await openFileDialog({
+      directory: true,
+      multiple: false,
+      title:
+        lang === 'en'
+          ? `Select local folder for "${targetRoot?.label ?? 'Library'}"`
+          : `Seleziona cartella locale per "${targetRoot?.label ?? 'Libreria'}"`,
+    });
+    if (typeof selected !== 'string' || !selected) return;
+    try {
+      const updated = await api.rebindSourceRoot(rootId, selected);
+      unreachableBannerDismissed = false;
+      await refreshLibrary();
+      scanStatusText =
+        lang === 'en'
+          ? `Folder "${updated.label}" relocated to ${updated.root_path}`
+          : `Cartella "${updated.label}" ricollegata in ${updated.root_path}`;
+    } catch (e) {
+      scanStatusText = `Errore ricollegamento cartella: ${String(e)}`;
+    }
+  }
+
   async function handleSetRootCloudExclusion(rootId: string, excluded: boolean) {
     await api.setRootCloudExclusion(rootId, excluded);
     await refreshLibrary();
@@ -988,18 +1016,22 @@
       backupDialogOpen = false;
     }
     if (typeof selected !== 'string' || !selected) return;
-    await runBackupAction(async () => {
+    backupBusy = true;
+    backupError = '';
+    try {
       const rep = await api.restoreBackup(selected);
-      settings = await api.getUiSettings();
-      mlStatus = await api.listModelStatuses();
-      await refreshLibrary();
       const msg =
         lang === 'en'
-          ? `Backup restored (${rep.files_restored} files).`
-          : `Backup ripristinato (${rep.files_restored} file).`;
+          ? `Backup verified (${rep.files_restored} files). Restarting Papero to complete restore…`
+          : `Backup verificato (${rep.files_restored} file). Riavvio di Papero per completare il ripristino…`;
       backupNotice = msg;
       scanStatusText = msg;
-    });
+    } catch (e) {
+      const msg = String(e);
+      backupError = msg;
+      scanStatusText = msg;
+      backupBusy = false;
+    }
   }
 
   function handleGlobalKeydown(e: KeyboardEvent) {
@@ -1379,8 +1411,47 @@
       onRefreshMlStatus={refreshMlStatus}
       onDownloadMlProfile={handleDownloadMlProfile}
       onUnloadMlModels={handleUnloadMlModels}
-      onOpenSettings={() => (settingsOpen = true)}
+      onOpenSettings={() => {
+        settingsInitialTab = null;
+        settingsOpen = true;
+      }}
     />
+
+    {#if !wizardOpen && !unreachableBannerDismissed && unreachableRoots.length > 0}
+      <div class="unreachable-banner" role="status">
+        <span class="unreachable-msg">
+          <strong>{unreachableRoots.map((r) => r.label).join(', ')}:</strong>
+          {tr(lang, 'unreachableRootsBanner')}
+        </span>
+        <div class="unreachable-actions">
+          {#if unreachableRoots.length === 1}
+            <button
+              type="button"
+              class="primary"
+              onclick={() => handleRebindRoot(unreachableRoots[0].id)}
+            >
+              {tr(lang, 'rebindNowBtn')}
+            </button>
+          {/if}
+          <button
+            type="button"
+            onclick={() => {
+              settingsInitialTab = 'folders';
+              settingsOpen = true;
+            }}
+          >
+            {tr(lang, 'tabFolders')}
+          </button>
+          <button
+            type="button"
+            title={tr(lang, 'close')}
+            onclick={() => (unreachableBannerDismissed = true)}
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+    {/if}
 
     <div class="workspace-body">
       <div class="sidebar-slot" class:collapsed={sidebarCollapsed}>
@@ -1581,6 +1652,10 @@
         {mlStatus}
         {mlDownloadProgress}
         onAddFolder={handleAddFolder}
+        onRestoreBackup={handleRestoreBackup}
+        {backupBusy}
+        {backupNotice}
+        {backupError}
         onDownloadMlProfile={handleDownloadMlProfile}
         onSaveSettings={handleSaveSettings}
         onCompleteAndScan={async () => {
@@ -1592,6 +1667,7 @@
 
       <SettingsModal
         open={settingsOpen}
+        initialTab={settingsInitialTab}
         {settings}
         {roots}
         {presets}
@@ -1601,6 +1677,7 @@
         onSaveSettings={handleSaveSettings}
         onToggleRoot={handleToggleRoot}
         onSetRootCloudExclusion={handleSetRootCloudExclusion}
+        onRebindRoot={handleRebindRoot}
         onDeleteRoot={handleDeleteRoot}
         onAddFolder={handleAddFolder}
         onDownloadMlProfile={handleDownloadMlProfile}
@@ -1616,9 +1693,13 @@
         onRestoreBackup={handleRestoreBackup}
         onLaunchWizard={() => {
           settingsOpen = false;
+          settingsInitialTab = null;
           wizardOpen = true;
         }}
-        onClose={() => (settingsOpen = false)}
+        onClose={() => {
+          settingsOpen = false;
+          settingsInitialTab = null;
+        }}
       />
 
       {#if cloudConsentModal}
@@ -1777,5 +1858,25 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 4px;
+  }
+  .unreachable-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 12px;
+    background: rgba(245, 158, 11, 0.14);
+    border-bottom: 1px solid rgba(217, 119, 6, 0.45);
+    font-size: 12px;
+  }
+  .unreachable-msg {
+    min-width: 0;
+    line-height: 1.35;
+  }
+  .unreachable-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
   }
 </style>

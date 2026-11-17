@@ -9,6 +9,7 @@
     LlmProvider,
     MlEnvironmentStatus,
     OcrEnvironmentStatus,
+    SettingsTabId,
     SourceRoot,
     UiSettingsPayload,
   } from '../types';
@@ -16,6 +17,7 @@
 
   interface Props {
     open: boolean;
+    initialTab?: SettingsTabId | null;
     settings: UiSettingsPayload;
     roots: SourceRoot[];
     presets: ExternalReaderPreset[];
@@ -25,6 +27,7 @@
     onSaveSettings: (next: UiSettingsPayload) => Promise<void>;
     onToggleRoot: (rootId: string, enabled: boolean) => Promise<void>;
     onSetRootCloudExclusion?: (rootId: string, excluded: boolean) => Promise<void>;
+    onRebindRoot?: (rootId: string) => Promise<void>;
     onDeleteRoot: (rootId: string) => Promise<void>;
     onAddFolder: () => Promise<void>;
     onDownloadMlProfile: (profile: 'light' | 'quality') => Promise<void>;
@@ -44,6 +47,7 @@
 
   let {
     open,
+    initialTab = null,
     settings,
     roots,
     presets,
@@ -53,6 +57,7 @@
     onSaveSettings,
     onToggleRoot,
     onSetRootCloudExclusion,
+    onRebindRoot,
     onDeleteRoot,
     onAddFolder,
     onDownloadMlProfile,
@@ -70,7 +75,7 @@
     onClose,
   }: Props = $props();
 
-  type TabId = 'general' | 'folders' | 'ml' | 'ocr' | 'metadata' | 'llm' | 'backup' | 'shortcuts';
+  type TabId = SettingsTabId;
 
   const DEFAULT_SOURCE_PRIORITY = [
     'mrlookup',
@@ -212,6 +217,9 @@
 
   $effect(() => {
     if (open) {
+      if (initialTab) {
+        activeTab = initialTab;
+      }
       draft = {
         ...settings,
         metadata_source_priority: normalizeSourcePriority(settings.metadata_source_priority),
@@ -454,7 +462,7 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true" aria-label={tr(lang, 'settingsTitle')}>
     <div class="settings-modal">
       <header class="modal-head">
-        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.2.1</span></h2>
+        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.3.0</span></h2>
         <button type="button" onclick={onClose}>{tr(lang, 'close')}</button>
       </header>
 
@@ -600,7 +608,7 @@
               </div>
               <ul class="roots-table">
                 {#each roots as root (root.id)}
-                  <li>
+                  <li class:unreachable-root={!root.is_reachable}>
                     <label class="check">
                       <input
                         type="checkbox"
@@ -609,11 +617,29 @@
                           onToggleRoot(root.id, (e.currentTarget as HTMLInputElement).checked)}
                       />
                       <span>
-                        <strong>{root.label}</strong>
+                        <strong>
+                          {root.label}
+                          {#if !root.is_reachable}
+                            <span class="root-warn-badge">{tr(lang, 'rootUnreachableBadge')}</span>
+                          {/if}
+                        </strong>
                         <small class="mono">{root.root_path}</small>
                       </span>
                     </label>
                     <div class="root-actions">
+                      {#if onRebindRoot}
+                        <button
+                          type="button"
+                          class="rebind-btn"
+                          class:primary={!root.is_reachable}
+                          title={lang === 'en'
+                            ? 'Point this folder to its local path on this device without losing metadata or indices'
+                            : 'Collega questa cartella al percorso locale su questo dispositivo senza perdere metadati o indici'}
+                          onclick={() => onRebindRoot(root.id)}
+                        >
+                          {tr(lang, 'rebindFolderBtn')}
+                        </button>
+                      {/if}
                       <label class="cloud-excl" title={lang === 'en' ? 'Never send passages from this folder to cloud LLMs' : 'Non inviare mai i passaggi di questa cartella a LLM cloud'}>
                         <input
                           type="checkbox"
@@ -1326,13 +1352,33 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
     padding: 6px 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
   }
+  .roots-table li.unreachable-root {
+    border-color: rgba(217, 119, 6, 0.55);
+    background: rgba(245, 158, 11, 0.08);
+  }
   .roots-table li span {
     display: flex;
     flex-direction: column;
+  }
+  .root-warn-badge {
+    display: inline !important;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 600;
+    background: rgba(217, 119, 6, 0.16);
+    color: var(--warn);
+  }
+  .rebind-btn {
+    font-size: 11px;
+    padding: 3px 8px;
+    white-space: nowrap;
   }
   .root-actions {
     display: flex;

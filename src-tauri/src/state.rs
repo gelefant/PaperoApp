@@ -1,6 +1,10 @@
-use papero_core::backup::{create_backup_bundle_with_bm25, BackupReport};
+use papero_core::backup::{
+    apply_pending_restore_if_ready, create_backup_bundle_with_bm25, BackupReport,
+};
 use papero_core::config::{init_logging, AppConfig, AppPaths, WorkerGuard};
-use papero_core::db::repos::roots::{list_source_roots, prune_orphaned_catalog_entities};
+use papero_core::db::repos::roots::{
+    list_source_roots, prune_orphaned_catalog_entities, reconcile_source_roots_with_local_map,
+};
 use papero_core::db::Database;
 use papero_core::error::Result;
 use papero_core::fs::scanner::{rescan_sources, ScanControl};
@@ -44,14 +48,22 @@ impl AppState {
     pub fn initialize() -> Result<Self> {
         let data_dir = AppPaths::default_app_dir();
         let paths = AppPaths::from_data_dir(data_dir);
+        std::fs::create_dir_all(&paths.data_dir)?;
+        let restored_on_boot = apply_pending_restore_if_ready(&paths)?;
         paths.ensure_dirs()?;
 
         let log_guard = init_logging(&paths.logs_dir)?;
+        if restored_on_boot {
+            tracing::info!("applied pending backup restore on startup");
+        }
         let config = AppConfig::load_or_default(&paths.config_path)?;
         let db = Arc::new(Database::open(&paths.db_path, 4)?);
         let bm25 = Arc::new(Bm25Index::open_or_create(&paths.tantivy_dir)?);
         {
             let w = db.writer();
+            if let Err(err) = reconcile_source_roots_with_local_map(&w, &paths.local_roots_path()) {
+                tracing::warn!(error = %err, "failed reconciling source roots on startup");
+            }
             if let Ok(orphan_docs) = prune_orphaned_catalog_entities(&w) {
                 if !orphan_docs.is_empty() {
                     for doc_id in orphan_docs {
@@ -93,6 +105,26 @@ impl AppState {
             auto_backup_notify: Arc::new(Notify::new()),
             _log_guard: Some(log_guard),
         })
+    }
+
+    pub fn stop_background_activity(&self) {
+        self.auto_backup_dirty.store(false, Ordering::SeqCst);
+        self.metadata_batch_cancel.store(true, Ordering::SeqCst);
+        if let Ok(g) = self.scan_control.lock() {
+            if let Some(ctrl) = g.as_ref() {
+                ctrl.cancel();
+            }
+        }
+        if let Ok(mut t) = self.watcher_task.lock() {
+            if let Some(prev) = t.take() {
+                prev.abort();
+            }
+        }
+        if let Ok(mut w) = self.watcher.lock() {
+            *w = None;
+        }
+        self.embedder_slot.unload();
+        self.reranker_slot.unload();
     }
 
     pub fn refresh_watcher(state: &Arc<Self>, handle: Option<AppHandle>) {

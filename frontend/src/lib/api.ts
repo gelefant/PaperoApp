@@ -47,6 +47,8 @@ export const api = {
       label: label ?? null,
       isNetworkOrCloud,
     }),
+  rebindSourceRoot: (rootId: string, newPath: string) =>
+    invoke<SourceRoot>('rebind_source_root', { rootId, newPath }),
   toggleSourceRoot: (rootId: string, enabled: boolean) =>
     invoke<void>('toggle_source_root', { rootId, enabled }),
   setRootCloudExclusion: (rootId: string, excluded: boolean) =>

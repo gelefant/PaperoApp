@@ -318,8 +318,18 @@ pub fn rescan_sources(
 
             let path_key = (item.entry.root_id.clone(), item.entry.rel_path.clone());
 
-            // Case A: Path already existed -> content was MODIFIED.
+            // Case A: Path already existed -> check BLAKE3 before treating mtime change as modified!
+            // Cross-OS cloud sync (e.g. macOS APFS <-> Windows NTFS Google Drive) frequently shifts
+            // `mtime_ns` without altering bytes; avoid wiping extracted passages/embeddings in that case.
             if let Some(existing) = known_by_path.get(&path_key) {
+                if existing.size_bytes == item.entry.size_bytes && existing.blake3_hash == hash {
+                    tx.execute(
+                        "UPDATE files SET mtime_ns = ?1, is_available = 1 WHERE id = ?2",
+                        rusqlite::params![item.entry.mtime_ns, existing.file_id],
+                    )?;
+                    summary.cnt_unchanged += 1;
+                    continue;
+                }
                 summary.cnt_modified += 1;
                 let pids = get_file_passage_ids(&tx, existing.file_id)?;
                 tantivy_delete_passages.extend(pids);

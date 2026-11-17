@@ -1,8 +1,11 @@
 use crate::db::repos::archive::archive_if_manual;
 use crate::error::{CoreError, Result};
+use crate::fs::availability::{check_root_reachability, Reachability};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
 pub struct RemovedRootReport {
@@ -114,6 +117,144 @@ pub fn update_root_path(conn: &Connection, id: &str, new_root_path: &str) -> Res
         return Err(CoreError::RootNotFound(id.to_string()));
     }
     Ok(())
+}
+
+/// Strips Windows `\\?\` / `\\?\UNC\` verbatim path prefixes so stored paths stay readable
+/// and compatible with external tools (Explorer, SumatraPDF, DjView).
+pub fn strip_windows_verbatim_prefix(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        if !rest.starts_with("Volume{") {
+            return rest.to_string();
+        }
+    }
+    raw.to_string()
+}
+
+/// Canonicalizes a directory path while keeping Windows drive-letter paths clean.
+pub fn normalize_root_dir_path(path: &Path) -> String {
+    match fs::canonicalize(path) {
+        Ok(canon) => {
+            let s = canon.to_string_lossy().into_owned();
+            #[cfg(target_os = "windows")]
+            {
+                if s.starts_with(r"\\?\Volume{") && path.is_dir() {
+                    return path.to_string_lossy().into_owned();
+                }
+                return strip_windows_verbatim_prefix(&s);
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                s
+            }
+        }
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
+pub fn load_local_root_paths(path: &Path) -> HashMap<String, String> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+pub fn save_local_root_paths(path: &Path, map: &HashMap<String, String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(map)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+pub fn record_local_root_path(path: &Path, root_id: &str, root_path: &str) -> Result<()> {
+    let mut map = load_local_root_paths(path);
+    if map.get(root_id).map(String::as_str) == Some(root_path) {
+        return Ok(());
+    }
+    map.insert(root_id.to_string(), root_path.to_string());
+    save_local_root_paths(path, &map)
+}
+
+pub fn remove_local_root_path(path: &Path, root_id: &str) -> Result<()> {
+    let mut map = load_local_root_paths(path);
+    if map.remove(root_id).is_some() {
+        save_local_root_paths(path, &map)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileRootsReport {
+    pub remapped: usize,
+    pub reachable: usize,
+    pub unreachable: usize,
+}
+
+/// Reconciles `source_roots` against the local filesystem and `local_root_paths.json`.
+/// When a backup created on another OS is restored, any `root_id` already rebound on this
+/// device is automatically remapped; otherwise unreachable roots are flagged cleanly without
+/// deleting any catalog data.
+pub fn reconcile_source_roots_with_local_map(
+    conn: &Connection,
+    local_map_path: &Path,
+) -> Result<ReconcileRootsReport> {
+    let roots = list_source_roots(conn)?;
+    let mut local_map = load_local_root_paths(local_map_path);
+    let mut map_dirty = false;
+    let mut report = ReconcileRootsReport::default();
+
+    for root in roots {
+        let prev_count = count_files_in_root(conn, &root.id)?;
+        let current_ok =
+            check_root_reachability(Path::new(&root.root_path), prev_count) == Reachability::Reachable;
+        if current_ok {
+            set_root_reachability(conn, &root.id, true)?;
+            if local_map.get(&root.id).map(String::as_str) != Some(root.root_path.as_str()) {
+                local_map.insert(root.id.clone(), root.root_path.clone());
+                map_dirty = true;
+            }
+            report.reachable += 1;
+            continue;
+        }
+
+        if let Some(mapped) = local_map.get(&root.id).cloned() {
+            if mapped != root.root_path
+                && check_root_reachability(Path::new(&mapped), prev_count) == Reachability::Reachable
+            {
+                update_root_path(conn, &root.id, &mapped)?;
+                set_root_reachability(conn, &root.id, true)?;
+                report.remapped += 1;
+                report.reachable += 1;
+                continue;
+            }
+        }
+
+        set_root_reachability(conn, &root.id, false)?;
+        report.unreachable += 1;
+    }
+
+    if map_dirty {
+        save_local_root_paths(local_map_path, &local_map)?;
+    }
+    Ok(report)
+}
+
+/// Rebinds an existing source root to a new native directory path on this device, marks all
+/// files in that root available, and remembers the mapping locally for future cross-OS restores.
+pub fn rebind_source_root_path(
+    conn: &Connection,
+    local_map_path: &Path,
+    root_id: &str,
+    new_root_path: &str,
+) -> Result<SourceRoot> {
+    update_root_path(conn, root_id, new_root_path)?;
+    set_root_reachability(conn, root_id, true)?;
+    record_local_root_path(local_map_path, root_id, new_root_path)?;
+    get_source_root(conn, root_id)?.ok_or_else(|| CoreError::RootNotFound(root_id.to_string()))
 }
 
 /// Cleans up orphaned tags, empty topic clusters, and `<2`-member duplicate groups.
@@ -396,5 +537,21 @@ mod tests {
         let archived = load_archive(&w, "deadbeef1234567890").unwrap().unwrap();
         assert_eq!(archived.snapshot.msc_primary.as_deref(), Some("65N30"));
         assert_eq!(archived.tags, vec!["fem".to_string()]);
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_normalizes_drive_and_unc_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\G:\Il mio Drive\Papers"),
+            r"G:\Il mio Drive\Papers"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\Papers"),
+            r"\\server\share\Papers"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\Volume{1234}\Papers"),
+            r"\\?\Volume{1234}\Papers"
+        );
     }
 }

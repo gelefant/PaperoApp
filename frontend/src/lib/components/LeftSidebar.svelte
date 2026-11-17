@@ -338,7 +338,9 @@
                 <button
                   class="row-label-btn"
                   onclick={() => onSelectRoot(rtSelected ? null : root.id)}
-                  title={root.root_path}
+                  title={root.is_reachable
+                    ? root.root_path
+                    : `${root.root_path} — ${tr(lang, 'rootUnreachableBadge')}`}
                 >
                   <span class="row-text">{root.label}</span>
                 </button>

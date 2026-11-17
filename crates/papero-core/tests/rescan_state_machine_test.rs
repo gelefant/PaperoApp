@@ -311,3 +311,75 @@ fn end_to_end_djvu_extraction_chunking_and_bm25_search() {
     // ymin=320, ymax=350 on H=400 -> top-left y = (400-350)/400 = 0.125
     assert!((passage.bboxes[0].y - 0.125).abs() < 1e-4);
 }
+
+#[test]
+fn rescan_with_changed_mtime_and_identical_blake3_keeps_passages_and_marks_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("papero.db"), 2).unwrap();
+    let bm25 = Bm25Index::open_or_create(&tmp.path().join("tantivy")).unwrap();
+    let root_dir = tmp.path().join("drive");
+    fs::create_dir_all(&root_dir).unwrap();
+
+    let root_id = new_root_id();
+    {
+        let w = db.writer();
+        insert_source_root(
+            &w,
+            &NewSourceRoot {
+                id: root_id.clone(),
+                label: "Drive".into(),
+                root_path: root_dir.to_string_lossy().into_owned(),
+                is_network_or_cloud: true,
+            },
+        )
+        .unwrap();
+    }
+
+    let pdf_path = root_dir.join("synced.pdf");
+    let payload = b"%PDF-1.4\nCross-OS identical bytes\n";
+    fs::write(&pdf_path, payload).unwrap();
+
+    let s1 = rescan_sources(&db, Some(&bm25), None, None).unwrap();
+    assert_eq!(s1.cnt_new, 1);
+
+    // Seed a passage and mark embedded_light=1, then simulate cross-OS mtime_ns shift in DB
+    {
+        let w = db.writer();
+        let (file_id, doc_id): (i64, i64) = w
+            .query_row(
+                "SELECT id, document_id FROM files WHERE rel_path = 'synced.pdf'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        w.execute(
+            "UPDATE files SET mtime_ns = mtime_ns - 999999, index_state = 'ready', embedded_light = 1 WHERE id = ?1",
+            params![file_id],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO passages (document_id, file_id, page_ord, chunk_index, is_alt_formula, token_count, text_content, bboxes_blob)
+             VALUES (?1, ?2, 1, 0, 0, 5, 'Preserved passage content', X'')",
+            params![doc_id, file_id],
+        )
+        .unwrap();
+    }
+
+    let s2 = rescan_sources(&db, Some(&bm25), None, None).unwrap();
+    assert_eq!(s2.cnt_unchanged, 1);
+    assert_eq!(s2.cnt_modified, 0);
+
+    let r = db.reader();
+    let (passage_cnt, notice, embedded_light): (i64, i64, i64) = r
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM passages), d.content_modified_notice, f.embedded_light
+             FROM files f JOIN documents d ON d.id = f.document_id
+             WHERE f.rel_path = 'synced.pdf'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(passage_cnt, 1);
+    assert_eq!(notice, 0);
+    assert_eq!(embedded_light, 1);
+}
