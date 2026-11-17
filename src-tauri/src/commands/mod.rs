@@ -104,6 +104,12 @@ pub struct UiSettingsPayload {
     pub zbmath_enabled: bool,
     pub crossref_enabled: bool,
     pub arxiv_enabled: bool,
+    #[serde(default = "default_true_setting")]
+    pub harvard_enabled: bool,
+    #[serde(default = "default_true_setting")]
+    pub loc_enabled: bool,
+    #[serde(default = "default_true_setting")]
+    pub googlebooks_enabled: bool,
     pub openlibrary_enabled: bool,
     pub dblp_enabled: bool,
     pub openalex_enabled: bool,
@@ -652,6 +658,9 @@ pub async fn get_ui_settings(state: State<'_, Arc<AppState>>) -> Result<UiSettin
             zbmath_enabled: cfg.zbmath_enabled,
             crossref_enabled: cfg.crossref_enabled,
             arxiv_enabled: cfg.arxiv_enabled,
+            harvard_enabled: cfg.harvard_enabled,
+            loc_enabled: cfg.loc_enabled,
+            googlebooks_enabled: cfg.googlebooks_enabled,
             openlibrary_enabled: cfg.openlibrary_enabled,
             dblp_enabled: cfg.dblp_enabled,
             openalex_enabled: cfg.openalex_enabled,
@@ -718,6 +727,9 @@ pub async fn save_ui_settings(
         cfg.zbmath_enabled = settings.zbmath_enabled;
         cfg.crossref_enabled = settings.crossref_enabled;
         cfg.arxiv_enabled = settings.arxiv_enabled;
+        cfg.harvard_enabled = settings.harvard_enabled;
+        cfg.loc_enabled = settings.loc_enabled;
+        cfg.googlebooks_enabled = settings.googlebooks_enabled;
         cfg.openlibrary_enabled = settings.openlibrary_enabled;
         cfg.dblp_enabled = settings.dblp_enabled;
         cfg.openalex_enabled = settings.openalex_enabled;

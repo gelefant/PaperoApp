@@ -209,8 +209,8 @@
       <polygon points="17,5 22,7 19,8.5" fill="#ea580c" />
       <polygon points="6,15 17,15 13,20 4,18" fill="#fcd34d" />
     </svg>
-    <strong class="brand-name" title="Papero v0.3.1">Papero</strong>
-    <span class="brand-version" title="Papero v0.3.1">0.3.1</span>
+    <strong class="brand-name" title="Papero v0.3.2">Papero</strong>
+    <span class="brand-version" title="Papero v0.3.2">0.3.2</span>
     <span
       class="roots-pill"
       title={roots.length > 0
@@ -826,12 +826,42 @@
         <label class="row">
           <input
             type="checkbox"
+            checked={settings.harvard_enabled}
+            disabled={!settings.network_lookups_enabled}
+            onchange={(e) =>
+              patchSettings({ harvard_enabled: (e.currentTarget as HTMLInputElement).checked })}
+          />
+          Harvard LibraryCloud (MARC21 — editore, città, collana, pagine, ISBN)
+        </label>
+        <label class="row">
+          <input
+            type="checkbox"
+            checked={settings.loc_enabled}
+            disabled={!settings.network_lookups_enabled}
+            onchange={(e) =>
+              patchSettings({ loc_enabled: (e.currentTarget as HTMLInputElement).checked })}
+          />
+          Library of Congress SRU (libri e monografie accademiche)
+        </label>
+        <label class="row">
+          <input
+            type="checkbox"
+            checked={settings.googlebooks_enabled}
+            disabled={!settings.network_lookups_enabled}
+            onchange={(e) =>
+              patchSettings({ googlebooks_enabled: (e.currentTarget as HTMLInputElement).checked })}
+          />
+          Google Books (libri scientifici e commerciali)
+        </label>
+        <label class="row">
+          <input
+            type="checkbox"
             checked={settings.openlibrary_enabled}
             disabled={!settings.network_lookups_enabled}
             onchange={(e) =>
               patchSettings({ openlibrary_enabled: (e.currentTarget as HTMLInputElement).checked })}
           />
-          Open Library (solo fallback libri, max 1 req/s con cache permanente)
+          Open Library (fallback finale libri, max 1 req/s con cache permanente)
         </label>
       </div>
 

@@ -174,6 +174,40 @@ pub fn normalize_isbn(raw: &str) -> Option<String> {
     None
 }
 
+/// Converts a normalized ISBN-13 (`978...`) to its equivalent ISBN-10, or an ISBN-10 to its
+/// equivalent `978` ISBN-13, so library catalogs indexing only one form still match cleanly.
+pub fn alternate_isbn_form(isbn: &str) -> Option<String> {
+    let norm = normalize_isbn(isbn)?;
+    if norm.len() == 13 && norm.starts_with("978") {
+        let core = &norm[3..12];
+        let mut sum: u32 = 0;
+        for (i, ch) in core.chars().enumerate() {
+            sum += (10 - i as u32) * ch.to_digit(10)?;
+        }
+        let rem = (11 - (sum % 11)) % 11;
+        let check = if rem == 10 {
+            'X'
+        } else {
+            char::from_digit(rem, 10)?
+        };
+        let mut out = String::with_capacity(10);
+        out.push_str(core);
+        out.push(check);
+        Some(out)
+    } else if norm.len() == 10 {
+        let prefix_core = format!("978{}", &norm[..9]);
+        let mut sum: u32 = 0;
+        for (i, ch) in prefix_core.chars().enumerate() {
+            let d = ch.to_digit(10)?;
+            sum += if i % 2 == 0 { d } else { d * 3 };
+        }
+        let check = (10 - (sum % 10)) % 10;
+        Some(format!("{prefix_core}{check}"))
+    } else {
+        None
+    }
+}
+
 /// Extracts bibliographic identifiers and first-page title/author/year heuristics from
 /// optional XMP XML, PDF/DjVu embedded doc title/author, first few pages, last page, and filename.
 pub fn extract_identifiers_and_heuristics(

@@ -4,10 +4,13 @@ pub mod datacite;
 pub mod dblp;
 pub mod europepmc;
 pub mod extract;
+pub mod googlebooks;
+pub mod harvard;
 pub mod inspirehep;
 pub mod io;
 pub mod journal_abbrev;
 pub mod limiter;
+pub mod loc;
 pub mod models;
 pub mod mrlookup;
 pub mod openalex;
@@ -17,7 +20,8 @@ pub mod semanticscholar;
 pub mod zbmath;
 
 pub use extract::{
-    extract_identifiers_and_heuristics, extract_identifiers_and_heuristics_with_front_pages,
+    alternate_isbn_form, extract_identifiers_and_heuristics,
+    extract_identifiers_and_heuristics_with_front_pages,
     extract_identifiers_and_heuristics_with_layout, normalize_isbn,
 };
 pub use models::{

@@ -88,6 +88,9 @@
     'datacite',
     'semanticscholar',
     'europepmc',
+    'harvard',
+    'loc',
+    'googlebooks',
     'openlibrary',
   ] as const;
 
@@ -101,6 +104,9 @@
     | 'arxiv_enabled'
     | 'semanticscholar_enabled'
     | 'europepmc_enabled'
+    | 'harvard_enabled'
+    | 'loc_enabled'
+    | 'googlebooks_enabled'
     | 'openlibrary_enabled';
 
   const SOURCE_META: Record<
@@ -166,10 +172,28 @@
       descEn: 'Biomathematics / Life Sciences',
       toggleKey: 'europepmc_enabled',
     },
+    harvard: {
+      label: 'Harvard LibraryCloud',
+      descIt: 'Catalogo universitario MARC21 (editore, città, collana, edizione, pagine, ISBN)',
+      descEn: 'University MARC21 catalog (publisher, place, series, edition, pages, ISBN)',
+      toggleKey: 'harvard_enabled',
+    },
+    loc: {
+      label: 'Library of Congress (SRU)',
+      descIt: 'Catalogo ufficiale LoC per libri e monografie accademiche',
+      descEn: 'Official LoC catalog for academic books & monographs',
+      toggleKey: 'loc_enabled',
+    },
+    googlebooks: {
+      label: 'Google Books',
+      descIt: 'Libri scientifici e commerciali (editore, pagine, ISBN)',
+      descEn: 'Academic & commercial books (publisher, pages, ISBN)',
+      toggleKey: 'googlebooks_enabled',
+    },
     openlibrary: {
       label: 'Open Library',
-      descIt: 'Libri e monografie (ISBN)',
-      descEn: 'Books & monographs (ISBN)',
+      descIt: 'Fallback finale per libri e monografie (ISBN)',
+      descEn: 'Final fallback for books & monographs (ISBN)',
       toggleKey: 'openlibrary_enabled',
     },
   };
@@ -184,6 +208,13 @@
     }
     for (const def of DEFAULT_SOURCE_PRIORITY) {
       if (!out.includes(def)) {
+        if (def === 'harvard' || def === 'loc' || def === 'googlebooks') {
+          const olIdx = out.indexOf('openlibrary');
+          if (olIdx !== -1) {
+            out.splice(olIdx, 0, def);
+            continue;
+          }
+        }
         out.push(def);
       }
     }
@@ -462,7 +493,7 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true" aria-label={tr(lang, 'settingsTitle')}>
     <div class="settings-modal">
       <header class="modal-head">
-        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.3.1</span></h2>
+        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.3.2</span></h2>
         <button type="button" onclick={onClose}>{tr(lang, 'close')}</button>
       </header>
 

@@ -1174,6 +1174,9 @@
     datacite: 'DataCite',
     semanticscholar: 'S2',
     europepmc: 'Europe PMC',
+    harvard: 'Harvard',
+    loc: 'LoC',
+    googlebooks: 'Google Books',
     openlibrary: 'Open Library',
   };
 
@@ -1192,6 +1195,9 @@
             'datacite',
             'semanticscholar',
             'europepmc',
+            'harvard',
+            'loc',
+            'googlebooks',
             'openlibrary',
           ];
     const active = order.filter((id) => {
@@ -1206,6 +1212,9 @@
       if (id === 'datacite') return cfg.datacite_enabled;
       if (id === 'semanticscholar') return cfg.semanticscholar_enabled;
       if (id === 'europepmc') return cfg.europepmc_enabled;
+      if (id === 'harvard') return cfg.harvard_enabled;
+      if (id === 'loc') return cfg.loc_enabled;
+      if (id === 'googlebooks') return cfg.googlebooks_enabled;
       if (id === 'openlibrary') return cfg.openlibrary_enabled;
       return false;
     });

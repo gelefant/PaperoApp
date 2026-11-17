@@ -134,6 +134,9 @@ export interface UiSettingsPayload {
   zbmath_enabled: boolean;
   crossref_enabled: boolean;
   arxiv_enabled: boolean;
+  harvard_enabled: boolean;
+  loc_enabled: boolean;
+  googlebooks_enabled: boolean;
   openlibrary_enabled: boolean;
   dblp_enabled: boolean;
   openalex_enabled: boolean;

@@ -15,12 +15,15 @@ use crate::metadata::extract::{
     extract_identifiers_and_heuristics_with_front_pages, extract_prose_core_title,
     looks_like_garbage_title, strip_inline_markup_tags,
 };
+use crate::metadata::googlebooks::GoogleBooksClient;
+use crate::metadata::harvard::HarvardClient;
 use crate::metadata::inspirehep::InspireHepClient;
 use crate::metadata::journal_abbrev::{
     apply_iso4_journal_fallback, is_preprint_or_generic_venue, journal_name_needing_abbrev,
     looks_abbreviated_journal, lookup_curated_journal_abbrev, normalize_record_curated_journal,
     normalize_record_journals_locally, resolve_local_journal_abbrev,
 };
+use crate::metadata::loc::LocClient;
 use crate::metadata::models::{
     clean_author_surname, clean_metadata_text, normalize_doi, normalize_mr_digits, normalize_pages,
     BibliographicAuthor, BibliographicRecord, CandidateMatch, CandidateRow, DocumentMetadataView,
@@ -60,6 +63,9 @@ pub struct WaterfallClients {
     pub europepmc: EuropePmcClient,
     pub semanticscholar: SemanticScholarClient,
     pub arxiv: ArxivClient,
+    pub harvard: HarvardClient,
+    pub loc: LocClient,
+    pub googlebooks: GoogleBooksClient,
     pub openlibrary: OpenLibraryClient,
 }
 
@@ -83,7 +89,10 @@ impl WaterfallClients {
             inspirehep: InspireHepClient::new(ua.clone())?,
             europepmc: EuropePmcClient::new(ua.clone())?,
             semanticscholar: SemanticScholarClient::new(ua.clone())?,
-            arxiv: ArxivClient::new(ua)?,
+            arxiv: ArxivClient::new(ua.clone())?,
+            harvard: HarvardClient::new(ua.clone())?,
+            loc: LocClient::new(ua.clone())?,
+            googlebooks: GoogleBooksClient::new(ua)?,
             openlibrary: OpenLibraryClient::new(APP_VERSION, email)?,
         })
     }
@@ -460,10 +469,16 @@ async fn resolve_document_metadata_inner(
         }
     }
 
-    // ISBN Bridge for books: resolve canonical book Title + Author (+ publisher DOI) via Crossref / Open Library
+    // ISBN Bridge for books: resolve canonical book Title + Author (+ publisher, place, series, DOI)
+    // via Crossref / Harvard LibraryCloud / Library of Congress / Google Books / Open Library
     // before running the title waterfall so prioritized math sources (MRLookup / zbMATH) get clean book queries.
     if bridge_record.is_none() {
         if let Some(isbn_val) = working_ids.isbn.clone() {
+            let isbn_only = ExtractedIdentifiers {
+                isbn: Some(isbn_val.clone()),
+                looks_like_book: true,
+                ..ExtractedIdentifiers::default()
+            };
             let mut isbn_hit = if config.crossref_enabled {
                 clients
                     .crossref
@@ -474,14 +489,42 @@ async fn resolve_document_metadata_inner(
             } else {
                 None
             };
-            if isbn_hit.is_none() && config.openlibrary_enabled {
-                let isbn_only = ExtractedIdentifiers {
-                    isbn: Some(isbn_val),
-                    looks_like_book: true,
-                    ..ExtractedIdentifiers::default()
+            for book_src in ["harvard", "loc", "googlebooks", "openlibrary"] {
+                if isbn_hit.is_some() {
+                    break;
+                }
+                let hits = match book_src {
+                    "harvard" if config.harvard_enabled => {
+                        clients.harvard.lookup_book(db, &isbn_only).await.unwrap_or_default()
+                    }
+                    "loc" if config.loc_enabled => {
+                        clients.loc.lookup_book(db, &isbn_only).await.unwrap_or_default()
+                    }
+                    "googlebooks" if config.googlebooks_enabled => {
+                        clients.googlebooks.lookup_book(db, &isbn_only).await.unwrap_or_default()
+                    }
+                    "openlibrary" if config.openlibrary_enabled => {
+                        clients.openlibrary.lookup_book(db, &isbn_only).await.unwrap_or_default()
+                    }
+                    _ => Vec::new(),
                 };
-                if let Ok(ol_hits) = clients.openlibrary.lookup_book(db, &isbn_only).await {
-                    isbn_hit = ol_hits.into_iter().next().filter(|h| h.score >= 0.95);
+                isbn_hit = hits.into_iter().next().filter(|h| h.score >= 0.95);
+            }
+            // Enrich Crossref ISBN hit with MARC place/series/pages from Harvard when missing
+            if let Some(ref mut cr_hit) = isbn_hit {
+                if cr_hit.source == "crossref"
+                    && config.harvard_enabled
+                    && (cr_hit.record.publisher.is_none()
+                        || cr_hit.record.address.is_none()
+                        || cr_hit.record.pages.is_none())
+                {
+                    if let Ok(h_hits) = clients.harvard.lookup_book(db, &isbn_only).await {
+                        if let Some(h_top) = h_hits.first() {
+                            if is_same_work(&cr_hit.record, &h_top.record) {
+                                enrich_record_from_same_work(&mut cr_hit.record, &h_top.record);
+                            }
+                        }
+                    }
                 }
             }
             if let Some(hit) = isbn_hit {
@@ -593,6 +636,47 @@ async fn resolve_document_metadata_inner(
                 && is_same_work(&chosen.record, &cand.record)
             {
                 enrich_record_from_same_work(&mut chosen.record, &cand.record);
+            }
+        }
+        // If a book matched a math/article index (e.g. zbMATH / OpenAlex) that lacked publisher or place,
+        // enrich missing book fields from Harvard LibraryCloud / Library of Congress MARC catalogs.
+        if (chosen.record.work_type == WorkType::Book || working_ids.looks_like_book)
+            && (chosen.record.publisher.is_none() || chosen.record.address.is_none())
+            && chosen.source != "harvard"
+            && chosen.source != "loc"
+        {
+            let enrich_ids = ExtractedIdentifiers {
+                isbn: chosen.record.isbn.clone().or_else(|| working_ids.isbn.clone()),
+                heuristic_title: Some(chosen.record.title.clone()),
+                heuristic_first_author: chosen
+                    .record
+                    .authors
+                    .first()
+                    .map(|a| a.family_name.clone())
+                    .or_else(|| working_ids.heuristic_first_author.clone()),
+                heuristic_year: chosen.record.year.or(working_ids.heuristic_year),
+                looks_like_book: true,
+                ..ExtractedIdentifiers::default()
+            };
+            if config.harvard_enabled {
+                if let Ok(h_hits) = clients.harvard.lookup_book(db, &enrich_ids).await {
+                    if let Some(best_h) = h_hits
+                        .into_iter()
+                        .find(|h| h.score >= 0.85 && is_same_work(&chosen.record, &h.record))
+                    {
+                        enrich_record_from_same_work(&mut chosen.record, &best_h.record);
+                    }
+                }
+            }
+            if chosen.record.publisher.is_none() && config.loc_enabled {
+                if let Ok(l_hits) = clients.loc.lookup_book(db, &enrich_ids).await {
+                    if let Some(best_l) = l_hits
+                        .into_iter()
+                        .find(|h| h.score >= 0.85 && is_same_work(&chosen.record, &h.record))
+                    {
+                        enrich_record_from_same_work(&mut chosen.record, &best_l.record);
+                    }
+                }
             }
         }
         let lock_abbrev = {
@@ -722,6 +806,19 @@ async fn fetch_source_hits(
             clients.semanticscholar.lookup(db, ids).await
         }
         "europepmc" if config.europepmc_enabled => clients.europepmc.lookup(db, ids).await,
+        "harvard"
+            if config.harvard_enabled && (ids.looks_like_book || ids.isbn.is_some()) =>
+        {
+            clients.harvard.lookup_book(db, ids).await
+        }
+        "loc" if config.loc_enabled && (ids.looks_like_book || ids.isbn.is_some()) => {
+            clients.loc.lookup_book(db, ids).await
+        }
+        "googlebooks"
+            if config.googlebooks_enabled && (ids.looks_like_book || ids.isbn.is_some()) =>
+        {
+            clients.googlebooks.lookup_book(db, ids).await
+        }
         "openlibrary"
             if config.openlibrary_enabled && (ids.looks_like_book || ids.isbn.is_some()) =>
         {
@@ -1035,6 +1132,24 @@ fn enrich_record_from_same_work(
     }
     if target.isbn.is_none() {
         target.isbn = donor.isbn.clone();
+    }
+    if target.publisher.is_none() && donor.publisher.is_some() {
+        target.publisher = donor.publisher.clone();
+    }
+    if target.address.is_none() && donor.address.is_some() {
+        target.address = donor.address.clone();
+    }
+    if target.series.is_none() && donor.series.is_some() {
+        target.series = donor.series.clone();
+    }
+    if target.volume.is_none() && donor.volume.is_some() {
+        target.volume = donor.volume.clone();
+    }
+    if target.edition.is_none() && donor.edition.is_some() {
+        target.edition = donor.edition.clone();
+    }
+    if target.pages.is_none() && donor.pages.is_some() {
+        target.pages = donor.pages.clone();
     }
     if target.abstract_text.is_none() {
         target.abstract_text = donor.abstract_text.clone();
@@ -3979,6 +4094,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -4319,6 +4437,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -4443,6 +4564,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -4571,6 +4695,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -4691,6 +4818,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -4922,6 +5052,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -5221,6 +5354,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -5487,6 +5623,9 @@ mod tests {
             arxiv_enabled: false,
             semanticscholar_enabled: false,
             europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..Default::default()
         };
@@ -5847,6 +5986,9 @@ mod tests {
             openalex_enabled: false,
             datacite_enabled: false,
             semanticscholar_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
             openlibrary_enabled: false,
             ..AppConfig::default()
         };

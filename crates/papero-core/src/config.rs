@@ -112,12 +112,16 @@ pub const DEFAULT_METADATA_SOURCE_PRIORITY: &[&str] = &[
     "datacite",
     "semanticscholar",
     "europepmc",
+    "harvard",
+    "loc",
+    "googlebooks",
     "openlibrary",
 ];
 
 /// Normalizes a user-supplied source priority slice so every known source appears
-/// exactly once: preserving valid user-ordered IDs first and appending any missing
-/// canonical sources in default order.
+/// exactly once: preserving valid user-ordered IDs first and inserting any newly
+/// added book catalogs (`harvard`, `loc`, `googlebooks`) right above `openlibrary`
+/// when migrating older configs.
 pub fn normalize_metadata_source_priority(raw: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(DEFAULT_METADATA_SOURCE_PRIORITY.len());
     for item in raw {
@@ -133,6 +137,12 @@ pub fn normalize_metadata_source_priority(raw: &[String]) -> Vec<String> {
     }
     for &canon in DEFAULT_METADATA_SOURCE_PRIORITY {
         if !out.iter().any(|existing| existing == canon) {
+            if matches!(canon, "harvard" | "loc" | "googlebooks") {
+                if let Some(ol_pos) = out.iter().position(|s| s == "openlibrary") {
+                    out.insert(ol_pos, canon.to_string());
+                    continue;
+                }
+            }
             out.push(canon.to_string());
         }
     }
@@ -188,6 +198,12 @@ pub struct AppConfig {
     pub crossref_enabled: bool,
     /// Enable arXiv Atom metadata lookup.
     pub arxiv_enabled: bool,
+    /// Enable Harvard LibraryCloud academic book catalog lookup.
+    pub harvard_enabled: bool,
+    /// Enable Library of Congress SRU book catalog lookup.
+    pub loc_enabled: bool,
+    /// Enable Google Books metadata lookup.
+    pub googlebooks_enabled: bool,
     /// Enable Open Library single-book fallback lookup.
     pub openlibrary_enabled: bool,
     /// Enable DBLP Computer Science Bibliography metadata lookup.
@@ -290,6 +306,9 @@ impl Default for AppConfig {
             zbmath_enabled: true,
             crossref_enabled: true,
             arxiv_enabled: true,
+            harvard_enabled: true,
+            loc_enabled: true,
+            googlebooks_enabled: true,
             openlibrary_enabled: true,
             dblp_enabled: true,
             openalex_enabled: true,
@@ -596,5 +615,32 @@ mod tests {
         let cfg2 = AppConfig::load_or_default(&cfg_path).unwrap();
         assert_eq!(cfg2.ml_profile, "light");
         assert!(tmp.path().join("config.json.corrupt").exists());
+    }
+
+    #[test]
+    fn normalize_source_priority_places_harvard_loc_googlebooks_above_openlibrary() {
+        let legacy: Vec<String> = vec![
+            "mrlookup",
+            "zbmath",
+            "crossref",
+            "dblp",
+            "openalex",
+            "inspirehep",
+            "arxiv",
+            "datacite",
+            "semanticscholar",
+            "europepmc",
+            "openlibrary",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let migrated = normalize_metadata_source_priority(&legacy);
+        let pos = |id: &str| migrated.iter().position(|s| s == id).unwrap();
+        assert!(pos("harvard") < pos("loc"));
+        assert!(pos("loc") < pos("googlebooks"));
+        assert!(pos("googlebooks") < pos("openlibrary"));
+        assert_eq!(pos("openlibrary"), migrated.len() - 1);
     }
 }
