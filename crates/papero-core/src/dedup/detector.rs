@@ -2414,11 +2414,25 @@ mod tests {
         let warm_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         println!(
-            "2000-doc dedup benchmark (debug profile): cold={cold_ms:.1}ms (checked={}), incremental={warm_ms:.1}ms (checked={}, cached={})",
+            "2000-doc dedup benchmark: cold={cold_ms:.1}ms (checked={}), incremental={warm_ms:.1}ms (checked={}, cached={})",
             cold.pairs_checked, warm.pairs_checked, warm.pairs_skipped_cached
         );
-        // Even in unoptimized debug profile (opt-level=0), 34k pairs runs < 600ms (< 25ms in release)!
-        assert!(cold_ms < 800.0, "cold dedup too slow: {cold_ms:.1}ms");
-        assert!(warm_ms < 450.0, "incremental dedup too slow: {warm_ms:.1}ms");
+        assert_eq!(cold.pairs_checked, 34_450);
+        assert_eq!(warm.pairs_checked, 35);
+        assert_eq!(warm.pairs_skipped_cached, 34_415);
+        // Use debug/release-aware budgets so shared 2-vCPU Windows Defender CI VMs in opt-level=0 never flake on NTFS I/O
+        let (cold_budget_ms, warm_budget_ms) = if cfg!(debug_assertions) {
+            (4000.0, 2500.0)
+        } else {
+            (500.0, 250.0)
+        };
+        assert!(
+            cold_ms < cold_budget_ms,
+            "cold dedup too slow: {cold_ms:.1}ms (budget {cold_budget_ms:.0}ms)"
+        );
+        assert!(
+            warm_ms < warm_budget_ms,
+            "incremental dedup too slow: {warm_ms:.1}ms (budget {warm_budget_ms:.0}ms)"
+        );
     }
 }
