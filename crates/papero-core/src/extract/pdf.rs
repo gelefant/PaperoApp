@@ -190,8 +190,8 @@ pub fn extract_pdf_front_matter(
     let mut has_text_layer = false;
     let mut page1_link_uris: Vec<String> = Vec::new();
 
-    let mut target_ords: Vec<u32> = (1..=page_count.min(4)).collect();
-    if page_count > 4 {
+    let mut target_ords: Vec<u32> = (1..=page_count.min(6)).collect();
+    if page_count > 6 {
         target_ords.push(page_count);
     }
 

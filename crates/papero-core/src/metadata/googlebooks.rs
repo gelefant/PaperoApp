@@ -119,15 +119,15 @@ impl GoogleBooksClient {
             }
         }
 
-        let Some(ti) = ids
+        let ti = ids
             .heuristic_title
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(Vec::new());
-        };
+            .unwrap_or("");
         let au = ids.heuristic_first_author.as_deref().unwrap_or("").trim();
+        if ti.is_empty() && (!ids.is_user_query || au.is_empty()) {
+            return Ok(Vec::new());
+        }
         let cache_key = format!(
             "book:ti={}:au={}",
             normalize_math_text(ti),
@@ -143,11 +143,25 @@ impl GoogleBooksClient {
             if self.is_suspended().await {
                 return Ok(Vec::new());
             }
-            let q_expr = if au.is_empty() {
-                format!("intitle:\"{ti}\"")
-            } else {
-                format!("intitle:\"{ti}\" inauthor:\"{au}\"")
-            };
+            // Use word-level `intitle:word` clauses instead of exact phrase quotes so partial
+            // titles, omitted subtitles, and ':' vs '-' differences all match cleanly.
+            let ti_words: Vec<&str> = ti
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 2)
+                .take(8)
+                .collect();
+            let mut q_parts: Vec<String> = ti_words
+                .into_iter()
+                .map(|w| format!("intitle:{w}"))
+                .collect();
+            if !au.is_empty() {
+                let clean_au = au.replace('"', " ");
+                q_parts.push(format!("inauthor:\"{}\"", clean_au.trim()));
+            }
+            if q_parts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let q_expr = q_parts.join(" ");
             let mut url = format!(
                 "{GOOGLE_BOOKS_BASE}?q={}&printType=books&maxResults=5",
                 url::form_urlencoded::byte_serialize(q_expr.as_bytes()).collect::<String>()

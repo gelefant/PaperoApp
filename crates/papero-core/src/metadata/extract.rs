@@ -379,28 +379,42 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
         }
     }
 
-    // ISBNs may appear on copyright pages (pages 1–4) or publisher colophon on the last page,
-    // still excluding bibliography/citation lines.
-    let mut isbn_blobs: Vec<String> = Vec::new();
+    // ISBNs may appear on copyright pages (pages 1–6) or publisher colophon on the last page,
+    // still excluding bibliography/citation lines and series-advertisement catalogs.
     if let Some(xmp) = xmp_xml {
-        isbn_blobs.push(xmp.to_string());
+        out.isbn = extract_isbn_from_page_blob(xmp, true);
     }
-    for p in first_pages_text.iter().take(4) {
-        isbn_blobs.push(strip_references_and_citations(p));
-    }
-    if let Some(last) = last_page_text {
-        isbn_blobs.push(strip_references_and_citations(last));
-    }
-    for blob in &isbn_blobs {
-        if out.isbn.is_none() {
-            if let Some(c) = isbn_re().captures(blob) {
-                if let Some(norm) = normalize_isbn(c.get(1).map(|m| m.as_str()).unwrap_or("")) {
+    if out.isbn.is_none() {
+        let mut front_clean: Vec<String> = first_pages_text
+            .iter()
+            .take(6)
+            .map(|p| strip_references_and_citations(p))
+            .collect();
+        if let Some(last) = last_page_text {
+            front_clean.push(strip_references_and_citations(last));
+        }
+        // Pass 1: copyright/colophon pages (most reliable for THIS volume's ISBN)
+        for blob in &front_clean {
+            if is_copyright_or_colophon_blob(blob) && !looks_like_series_catalog_blob(blob) {
+                if let Some(norm) = extract_isbn_from_page_blob(blob, false) {
                     out.isbn = Some(norm);
-                    if page_count >= 50 {
-                        out.looks_like_book = true;
+                    break;
+                }
+            }
+        }
+        // Pass 2: other non-catalog front/end pages
+        if out.isbn.is_none() {
+            for blob in &front_clean {
+                if !looks_like_series_catalog_blob(blob) {
+                    if let Some(norm) = extract_isbn_from_page_blob(blob, false) {
+                        out.isbn = Some(norm);
+                        break;
                     }
                 }
             }
+        }
+        if out.isbn.is_some() && page_count >= 50 {
+            out.looks_like_book = true;
         }
     }
     if out.isbn.is_none() {
@@ -491,11 +505,11 @@ pub fn extract_identifiers_and_heuristics_with_front_pages(
     };
 
     // Many books have Page 1 = series half-title ("Graduate Texts in Mathematics 142 / Editorial Board"),
-    // Page 2 = series volume list or blank, and Page 3 (or 4) = actual book title page.
+    // Page 2–4 = series volume list / colophon / blank, and Page 3–6 = actual book title page.
     let mut p34_h_authors: Vec<String> = Vec::new();
     let mut p34_h_year: Option<i64> = None;
     if page_title.is_none() {
-        for &pg_txt in first_pages_text.iter().skip(2).take(2) {
+        for &pg_txt in first_pages_text.iter().skip(2).take(4) {
             if is_book_half_title_or_boilerplate_page(pg_txt) {
                 continue;
             }
@@ -698,8 +712,87 @@ fn is_repository_cover_page(page_text: &str) -> bool {
     false
 }
 
+fn is_copyright_or_colophon_blob(blob: &str) -> bool {
+    let low = blob.to_lowercase();
+    low.contains("copyright")
+        || low.contains('©')
+        || low.contains("all rights reserved")
+        || low.contains("tutti i diritti riservati")
+        || low.contains("library of congress")
+        || low.contains("cataloging-in-publication")
+        || low.contains("finito di stampare")
+        || low.contains("printed in ")
+        || low.contains("stampato in ")
+}
+
+fn looks_like_series_catalog_blob(blob: &str) -> bool {
+    let low = blob.to_lowercase().replace(['’', '‘'], "'");
+    if low.contains("nella stessa collana")
+        || low.contains("volumi pubblicati")
+        || low.contains("volumi usciti")
+        || low.contains("elenco dei volumi")
+        || low.contains("piano dell'opera")
+        || low.contains("titles in this series")
+        || low.contains("other titles in this series")
+        || low.contains("volumes in this series")
+        || low.contains("dans la même collection")
+    {
+        return true;
+    }
+    let mut distinct_isbns: Vec<String> = Vec::new();
+    for cap in isbn_re().captures_iter(blob) {
+        if let Some(norm) = normalize_isbn(cap.get(1).map(|m| m.as_str()).unwrap_or("")) {
+            let canon = alternate_isbn_form(&norm)
+                .filter(|alt| alt.len() == 13)
+                .unwrap_or(norm);
+            if !distinct_isbns.contains(&canon) {
+                distinct_isbns.push(canon);
+                if distinct_isbns.len() >= 4 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn extract_isbn_from_page_blob(blob: &str, allow_multi: bool) -> Option<String> {
+    let mut candidates: Vec<(String, bool)> = Vec::new();
+    for cap in isbn_re().captures_iter(blob) {
+        let Some(m_full) = cap.get(0) else { continue };
+        let Some(norm) = normalize_isbn(cap.get(1).map(|m| m.as_str()).unwrap_or("")) else {
+            continue;
+        };
+        let line_slice = {
+            let start = blob[..m_full.start()].rfind('\n').map_or(0, |i| i + 1);
+            let end = blob[m_full.end()..]
+                .find('\n')
+                .map_or(blob.len(), |i| m_full.end() + i);
+            blob[start..end].to_lowercase()
+        };
+        let is_set_isbn = line_slice.contains("(set")
+            || line_slice.contains("set)")
+            || line_slice.contains("collana")
+            || line_slice.contains("opera completa")
+            || line_slice.contains("complete work");
+        candidates.push((norm, is_set_isbn));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    if !allow_multi && candidates.len() >= 6 {
+        return None;
+    }
+    candidates
+        .iter()
+        .find(|(_, is_set)| !*is_set)
+        .or_else(|| candidates.first())
+        .map(|(isbn, _)| isbn.clone())
+}
+
 fn is_editorial_board_heading(low: &str) -> bool {
-    let t = low.trim().trim_end_matches(':').trim();
+    let norm = low.replace(['’', '‘'], "'");
+    let t = norm.trim().trim_end_matches(':').trim();
     matches!(
         t,
         "editorial board"
@@ -714,13 +807,43 @@ fn is_editorial_board_heading(low: &str) -> bool {
             | "honorary editors"
             | "editors-in-chief"
             | "editor-in-chief"
-    ) || low.starts_with("editorial board:")
-        || low.starts_with("advisory board:")
-        || low.starts_with("series editors:")
-        || low.starts_with("series editor:")
-        || low.starts_with("managing editor:")
-        || low.starts_with("founding editors:")
-        || low.starts_with("editors:")
+            | "consulting editors"
+            | "associate editors"
+            | "comitato scientifico"
+            | "comitato editoriale"
+            | "comitato direttivo"
+            | "consiglio scientifico"
+            | "direttore della collana"
+            | "direttori della collana"
+            | "direzione della collana"
+            | "direzione scientifica"
+            | "piano dell'opera"
+            | "presentazione della collana"
+            | "nella stessa collana"
+            | "volumi pubblicati"
+            | "volumi usciti"
+            | "elenco dei volumi"
+            | "titles in this series"
+            | "other titles in this series"
+            | "volumes in this series"
+            | "published titles"
+            | "comité scientifique"
+            | "comité de rédaction"
+            | "directeur de la collection"
+            | "dans la même collection"
+            | "wissenschaftlicher beirat"
+    ) || norm.starts_with("editorial board:")
+        || norm.starts_with("advisory board:")
+        || norm.starts_with("series editors:")
+        || norm.starts_with("series editor:")
+        || norm.starts_with("managing editor:")
+        || norm.starts_with("founding editors:")
+        || norm.starts_with("editors:")
+        || norm.starts_with("collana diretta da")
+        || norm.starts_with("direttore della collana:")
+        || norm.starts_with("comitato scientifico:")
+        || norm.starts_with("collection dirigée par")
+        || norm.starts_with("herausgegeben von")
 }
 
 fn is_book_series_or_publisher_banner(low: &str) -> bool {
@@ -738,6 +861,7 @@ fn is_book_series_or_publisher_banner(low: &str) -> bool {
             | "this page intentionally left blank"
             | "springer"
             | "springer-verlag"
+            | "springer italia"
             | "birkhäuser"
             | "birkhauser"
             | "elsevier"
@@ -747,8 +871,53 @@ fn is_book_series_or_publisher_banner(low: &str) -> bool {
             | "oxford university press"
             | "princeton university press"
             | "american mathematical society"
+            | "european mathematical society"
+            | "siam"
             | "dover publications"
+            | "de gruyter"
+            | "walter de gruyter"
+            | "wiley"
+            | "john wiley & sons"
+            | "north-holland"
+            | "crc press"
+            | "chapman & hall"
+            | "mcgraw-hill"
+            | "mir publishers"
+            | "edizioni mir"
+            | "einaudi"
+            | "giulio einaudi editore"
+            | "adelphi"
+            | "adelphi edizioni"
+            | "bollati boringhieri"
+            | "boringhieri"
+            | "zanichelli"
+            | "carocci"
+            | "carocci editore"
+            | "utet"
+            | "mondadori"
+            | "feltrinelli"
+            | "hoepli"
+            | "il mulino"
+            | "laterza"
+            | "rba"
+            | "rba italia"
+            | "le scienze"
+            | "de agostini"
+            | "hachette"
+            | "codice edizioni"
+            | "raffaello cortina editore"
     ) || is_editorial_board_heading(&t)
+    {
+        return true;
+    }
+
+    if (t.starts_with("collana ")
+        || t.starts_with("supplemento a ")
+        || t.starts_with("supplemento al ")
+        || t.starts_with("edizione speciale per ")
+        || t.starts_with("allegato a "))
+        && !t.contains(':')
+        && t.split_whitespace().count() <= 8
     {
         return true;
     }
@@ -765,14 +934,27 @@ fn is_book_series_or_publisher_banner(low: &str) -> bool {
         "applied mathematical sciences",
         "texts in applied mathematics",
         "universitext",
+        "unitext",
+        "la matematica per il 3+2",
+        "convergenze",
         "classics in mathematics",
         "springer monographs in mathematics",
+        "modern birkhäuser classics",
+        "modern birkhauser classics",
+        "progress in mathematics",
+        "pure and applied mathematics",
+        "encyclopedia of mathematics and its applications",
         "graduate studies in mathematics",
         "student mathematical library",
         "mathematical surveys and monographs",
         "colloquium publications",
+        "ams chelsea publishing",
+        "carus mathematical monographs",
+        "cbms regional conference series",
+        "courant lecture notes",
         "cambridge studies in advanced mathematics",
         "cambridge tracts in mathematics",
+        "cambridge mathematical library",
         "london mathematical society monographs",
         "london mathematical society lecture note series",
         "london mathematical society student texts",
@@ -781,14 +963,27 @@ fn is_book_series_or_publisher_banner(low: &str) -> bool {
         "oxford graduate texts in mathematics",
         "princeton mathematical series",
         "annals of mathematics studies",
-        "carathéodory", // no-op guard; keep exact series below
-        "caratheodory",
+        "de gruyter studies in mathematics",
+        "north-holland mathematical library",
+        "dover books on mathematics",
+        "dover books on physics",
+        "schaum's outline series",
+        "schaum's outlines",
+        "astérisque",
+        "asterisque",
+        "séminaire bourbaki",
+        "seminaire bourbaki",
+        "mondo matematico",
+        "il mondo matematico",
+        "grandi idee della scienza",
+        "quaderni dell'unione matematica italiana",
+        "quaderni umi",
+        "biblioteca scientifica",
+        "piccola biblioteca einaudi",
+        "universale scientifica",
     ];
 
     for &prefix in SERIES_PREFIXES {
-        if prefix == "carathéodory" || prefix == "caratheodory" {
-            continue;
-        }
         if let Some(rest) = t.strip_prefix(prefix) {
             let r = rest.trim();
             if r.is_empty() {
@@ -810,12 +1005,15 @@ fn is_book_series_or_publisher_banner(low: &str) -> bool {
                             | "no"
                             | "nr"
                             | "number"
+                            | "n"
                             | "band"
                             | "heft"
                             | "tome"
+                            | "tomo"
                             | "fasc"
                             | "new"
                             | "series"
+                            | "serie"
                             | "second"
                             | "third"
                             | "fourth"
@@ -845,10 +1043,10 @@ fn is_book_half_title_or_boilerplate_page(page_text: &str) -> bool {
     if word_count == 0 {
         return true;
     }
-    if word_count > 140 {
+    if word_count > 220 {
         return false;
     }
-    let low = page_text.to_ascii_lowercase();
+    let low = page_text.to_lowercase();
     if low.contains("abstract") || low.contains("1. introduction") || low.contains("\nintroduction\n") {
         return false;
     }
@@ -861,6 +1059,19 @@ fn is_book_half_title_or_boilerplate_page(page_text: &str) -> bool {
         || norm_quotes.contains("publishers' page")
         || norm_quotes.contains("publisher's page")
         || norm_quotes.contains("this page intentionally left blank")
+        || norm_quotes.contains("comitato scientifico")
+        || norm_quotes.contains("direttore della collana")
+        || norm_quotes.contains("collana diretta da")
+        || norm_quotes.contains("piano dell'opera")
+        || norm_quotes.contains("presentazione della collana")
+        || norm_quotes.contains("nella stessa collana")
+        || norm_quotes.contains("volumi pubblicati")
+        || norm_quotes.contains("titles in this series")
+        || norm_quotes.contains("other titles in this series")
+        || norm_quotes.contains("volumes in this series")
+        || norm_quotes.contains("non vendibile separatamente")
+        || norm_quotes.contains("edizione speciale per")
+        || (word_count <= 90 && is_copyright_or_colophon_blob(page_text) && !low.contains("university") && !contains_title_topic_word(page_text))
     {
         return true;
     }
@@ -873,7 +1084,7 @@ fn is_book_half_title_or_boilerplate_page(page_text: &str) -> bool {
         && non_empty.iter().all(|l| {
             l.len() < 4
                 || l.chars().all(|c| c.is_ascii_digit() || c.is_whitespace())
-                || is_book_series_or_publisher_banner(&l.to_ascii_lowercase())
+                || is_book_series_or_publisher_banner(&l.to_lowercase())
         })
 }
 
@@ -1206,6 +1417,10 @@ pub(crate) fn looks_like_garbage_title(s: &str) -> bool {
         || low.starts_with("pii:")
         || low.starts_with("doi:")
         || low.starts_with("arxiv:")
+        || low.starts_with("isbn")
+        || low.starts_with("issn")
+        || low.starts_with("finito di stampare")
+        || low.starts_with("tutti i diritti riservati")
         || low.starts_with("http://")
         || low.starts_with("https://")
         || matches!(
@@ -3521,5 +3736,39 @@ mod tests {
             Some("Relativity Visualized")
         );
         assert_eq!(ids_tight_dash.heuristic_year, Some(1994));
+    }
+
+    #[test]
+    fn italian_collana_skips_series_banners_and_catalog_isbns_to_find_page5_title() {
+        let p1 = "Il Mondo Matematico\nCollana diretta da Comitato Scientifico\nEdizione speciale per RBA Italia";
+        let p2 = "Volumi pubblicati nella stessa collana:\n1. ISBN 978-0-387-90244-9\n2. ISBN 978-0-521-79540-1\n3. ISBN 978-0-387-95385-4\n4. ISBN 978-0-387-98592-3";
+        let p3 = "Presentazione della collana\nTutti i diritti riservati.";
+        let p4 = "Copyright © 2011 RBA Contenidos Editoriales\nISBN 978-0-387-94705-1\nFinito di stampare in Italia";
+        let p5 = "Enrique Gracián\nI numeri primi\nUn lungo cammino verso l'infinito";
+
+        let ids = extract_identifiers_and_heuristics(
+            None,
+            Some("Il Mondo Matematico"),
+            None,
+            &[p1, p2, p3, p4, p5],
+            None,
+            152,
+            None,
+        );
+        assert_eq!(ids.isbn.as_deref(), Some("9780387947051"));
+        assert!(
+            ids.heuristic_title
+                .as_deref()
+                .is_some_and(|t| t.starts_with("I numeri primi")),
+            "expected page-5 book title, got {:?}",
+            ids.heuristic_title
+        );
+        assert_eq!(
+            ids.heuristic_first_author
+                .as_deref()
+                .and_then(clean_author_surname)
+                .as_deref(),
+            Some("Gracián")
+        );
     }
 }

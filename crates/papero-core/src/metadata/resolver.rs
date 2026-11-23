@@ -112,6 +112,20 @@ pub struct SaveAndFetchResult {
     pub metadata: DocumentMetadataView,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GuidedSearchHints {
+    pub title: Option<String>,
+    pub authors: Vec<BibliographicAuthor>,
+    pub strict_author_filter: bool,
+    pub year: Option<i64>,
+    pub work_type: Option<String>,
+    pub doi: Option<String>,
+    pub arxiv_id: Option<String>,
+    pub mr_number: Option<String>,
+    pub zbl_number: Option<String>,
+    pub isbn: Option<String>,
+}
+
 pub fn is_document_metadata_verified(conn: &Connection, document_id: i64) -> Result<bool> {
     let flag: i64 = conn.query_row(
         "SELECT COALESCE(metadata_verified, 0) FROM documents WHERE id = ?1",
@@ -286,12 +300,24 @@ pub async fn resolve_document_metadata(
     document_id: i64,
     scope: MetadataLookupScope,
 ) -> Result<ResolveOutcome> {
+    resolve_document_metadata_with_hints(db, clients, config, document_id, scope, None).await
+}
+
+pub async fn resolve_document_metadata_with_hints(
+    db: &Database,
+    clients: &WaterfallClients,
+    config: &AppConfig,
+    document_id: i64,
+    scope: MetadataLookupScope,
+    hints: Option<GuidedSearchHints>,
+) -> Result<ResolveOutcome> {
     match AssertUnwindSafe(resolve_document_metadata_inner(
         db,
         clients,
         config,
         document_id,
         scope,
+        hints,
     ))
     .catch_unwind()
     .await
@@ -321,6 +347,7 @@ async fn resolve_document_metadata_inner(
     config: &AppConfig,
     document_id: i64,
     scope: MetadataLookupScope,
+    hints: Option<GuidedSearchHints>,
 ) -> Result<ResolveOutcome> {
     let verified = {
         let r = db.reader();
@@ -337,9 +364,13 @@ async fn resolve_document_metadata_inner(
         });
     }
 
-    let ctx = gather_document_context_async(db, config, document_id, scope).await?;
+    let ctx = if let Some(h) = hints {
+        build_guided_context_from_hints(db, document_id, h)?
+    } else {
+        gather_document_context_async(db, config, document_id, scope).await?
+    };
     let mut working_ids = ctx.ids.clone();
-    {
+    if !ctx.is_guided {
         let w = db.writer();
         apply_extracted_identifiers_to_doc(&w, document_id, &working_ids, None)?;
     }
@@ -793,6 +824,10 @@ async fn fetch_source_hits(
         }
     }
 
+    let allow_book_catalog = ids.looks_like_book
+        || ids.isbn.is_some()
+        || (ids.is_user_query && scope == MetadataLookupScope::SingleRecordUserAction);
+
     let res = match src {
         "mrlookup" if allow_mrlookup => clients.mrlookup.lookup(db, ids).await,
         "zbmath" if config.zbmath_enabled => clients.zbmath.lookup(db, ids).await,
@@ -806,22 +841,16 @@ async fn fetch_source_hits(
             clients.semanticscholar.lookup(db, ids).await
         }
         "europepmc" if config.europepmc_enabled => clients.europepmc.lookup(db, ids).await,
-        "harvard"
-            if config.harvard_enabled && (ids.looks_like_book || ids.isbn.is_some()) =>
-        {
+        "harvard" if config.harvard_enabled && allow_book_catalog => {
             clients.harvard.lookup_book(db, ids).await
         }
-        "loc" if config.loc_enabled && (ids.looks_like_book || ids.isbn.is_some()) => {
+        "loc" if config.loc_enabled && allow_book_catalog => {
             clients.loc.lookup_book(db, ids).await
         }
-        "googlebooks"
-            if config.googlebooks_enabled && (ids.looks_like_book || ids.isbn.is_some()) =>
-        {
+        "googlebooks" if config.googlebooks_enabled && allow_book_catalog => {
             clients.googlebooks.lookup_book(db, ids).await
         }
-        "openlibrary"
-            if config.openlibrary_enabled && (ids.looks_like_book || ids.isbn.is_some()) =>
-        {
+        "openlibrary" if config.openlibrary_enabled && allow_book_catalog => {
             clients.openlibrary.lookup_book(db, ids).await
         }
         _ => return Vec::new(),
@@ -964,17 +993,18 @@ async fn run_final_title_only_double_check(
     best_certain: &mut Option<CandidateMatch>,
     all_candidates: &mut Vec<CandidateMatch>,
 ) {
-    // If the user already locked non-title fields, respect those constraints rather than dropping them.
+    // If the user already locked or strictly specified non-title fields, respect those constraints rather than dropping them.
     if ctx.is_guided {
-        let only_title_locked = ctx.locked_title
+        let can_try_title_only = working_ids.heuristic_title.is_some()
             && !ctx.locked_authors
+            && !ctx.strict_author_filter
             && !ctx.locked_year
             && working_ids.doi.is_none()
             && working_ids.arxiv_id.is_none()
             && working_ids.mr_number.is_none()
             && working_ids.zbl_number.is_none()
             && working_ids.isbn.is_none();
-        if only_title_locked {
+        if can_try_title_only {
             if let Some(ref q_title) = working_ids.heuristic_title {
                 if let TotalTitlePick::Match(chosen) =
                     pick_unambiguous_total_title_match(q_title, all_candidates, ctx)
@@ -1383,8 +1413,11 @@ fn verify_candidate_against_context(cand: &CandidateMatch, ctx: &GatheredDocCont
 fn context_verification_factor(cand: &CandidateMatch, ctx: &GatheredDocContext) -> f32 {
     let rec = &cand.record;
 
-    // 1. In guided mode, never override an author explicitly locked by the user
-    if ctx.is_guided && ctx.locked_authors && !ctx.ids.heuristic_authors.is_empty() {
+    // 1. In guided mode, never accept a completely unrelated author when the user locked or explicitly queried by author
+    if ctx.is_guided
+        && (ctx.locked_authors || ctx.strict_author_filter)
+        && !ctx.ids.heuristic_authors.is_empty()
+    {
         let locked_surnames: Vec<String> = ctx
             .ids
             .heuristic_authors
@@ -1530,7 +1563,93 @@ struct GatheredDocContext {
     is_guided: bool,
     locked_title: bool,
     locked_authors: bool,
+    strict_author_filter: bool,
     locked_year: bool,
+}
+
+fn build_guided_context_from_hints(
+    db: &Database,
+    document_id: i64,
+    hints: GuidedSearchHints,
+) -> Result<GatheredDocContext> {
+    let conn = db.reader();
+    let locked = load_locked_fields(&conn, document_id)?;
+    let (db_work_type, page_count): (String, u32) = conn
+        .query_row(
+            "SELECT d.work_type,
+                    COALESCE((SELECT MAX(f.page_count) FROM files f WHERE f.document_id = d.id), 0)
+             FROM documents d WHERE d.id = ?1",
+            params![document_id],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32)),
+        )
+        .optional()?
+        .unwrap_or_else(|| ("article".to_string(), 0));
+
+    let effective_work_type = hints.work_type.as_deref().unwrap_or(db_work_type.as_str());
+    let looks_like_book = effective_work_type == "book" || page_count >= 90;
+
+    let clean_title = hints
+        .title
+        .as_deref()
+        .map(strip_inline_markup_tags)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let guided_alt_titles: Vec<String> = clean_title
+        .as_deref()
+        .and_then(extract_prose_core_title)
+        .into_iter()
+        .collect();
+
+    let formatted_authors: Vec<String> = hints
+        .authors
+        .iter()
+        .map(|a| {
+            let fam = a.family_name.trim();
+            let giv = a.given_name.trim();
+            if fam.is_empty() && giv.is_empty() {
+                String::new()
+            } else if giv.is_empty() {
+                fam.to_string()
+            } else if fam.is_empty() {
+                giv.to_string()
+            } else {
+                format!("{fam}, {giv}")
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    let first_author = formatted_authors.first().cloned();
+
+    let locked_title_flag = locked.contains("title");
+    let locked_authors_flag = locked.contains("authors");
+    let locked_year_flag = locked.contains("year");
+
+    Ok(GatheredDocContext {
+        ids: ExtractedIdentifiers {
+            doi: hints.doi.as_deref().and_then(normalize_doi),
+            pii: None,
+            arxiv_id: hints.arxiv_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
+            arxiv_version: None,
+            isbn: hints.isbn.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
+            mr_number: hints.mr_number.as_deref().and_then(normalize_mr_digits),
+            zbl_number: hints.zbl_number.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
+            heuristic_title: clean_title.clone(),
+            alt_heuristic_titles: guided_alt_titles,
+            heuristic_first_author: first_author,
+            heuristic_authors: formatted_authors,
+            heuristic_year: hints.year,
+            filename_keywords: Vec::new(),
+            looks_like_book,
+            is_user_query: true,
+        },
+        db_title: clean_title,
+        verify_text: None,
+        is_guided: true,
+        locked_title: locked_title_flag,
+        locked_authors: locked_authors_flag,
+        strict_author_filter: hints.strict_author_filter || locked_authors_flag,
+        locked_year: locked_year_flag,
+    })
 }
 
 struct DocDbSnapshot {
@@ -1832,12 +1951,14 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
                 heuristic_year: if locked_year_flag { year } else { None },
                 filename_keywords: Vec::new(),
                 looks_like_book,
+                is_user_query: true,
             },
             db_title,
             verify_text: None,
             is_guided: true,
             locked_title: locked_title_flag,
             locked_authors: locked_authors_flag,
+            strict_author_filter: locked_authors_flag,
             locked_year: locked_year_flag,
         })));
     }
@@ -1852,7 +1973,7 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
 
     let mut stmt = conn.prepare(
         "SELECT page_ord, text_content FROM passages
-         WHERE document_id = ?1 AND (page_ord <= 4 OR page_ord = ?2)
+         WHERE document_id = ?1 AND (page_ord <= 6 OR page_ord = ?2)
          ORDER BY page_ord ASC, chunk_index ASC",
     )?;
     let rows = stmt.query_map(params![document_id, max_ord], |r| {
@@ -1862,7 +1983,7 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
     let mut db_first_pages: Vec<String> = Vec::new();
     let mut db_last_page: Option<String> = None;
     for (ord, txt) in rows.filter_map(std::result::Result::ok) {
-        if ord <= 4 {
+        if ord <= 6 {
             db_first_pages.push(txt);
         } else {
             db_last_page = Some(txt);
@@ -1938,7 +2059,7 @@ fn finalize_doc_context(
             .map(|fm| {
                 fm.pages
                     .iter()
-                    .filter(|p| p.page_ord <= 4)
+                    .filter(|p| p.page_ord <= 6)
                     .map(|p| p.raw_text.as_str())
                     .collect()
             })
@@ -1951,7 +2072,7 @@ fn finalize_doc_context(
         front_matter.as_ref().and_then(|fm| {
             fm.pages
                 .iter()
-                .find(|p| p.page_ord > 4)
+                .find(|p| p.page_ord > 6)
                 .map(|p| p.raw_text.as_str())
         })
     } else {
@@ -2094,6 +2215,7 @@ fn finalize_doc_context(
         is_guided: false,
         locked_title: locked_title_flag,
         locked_authors: locked_authors_flag,
+        strict_author_filter: locked_authors_flag,
         locked_year: locked_year_flag,
     }
 }
@@ -2360,7 +2482,7 @@ fn replace_authors_in_tx(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManualMetadataEdit {
     pub document_id: i64,
     pub work_type: String,
@@ -2710,10 +2832,119 @@ pub fn apply_manual_metadata_edit_with_locks(
     get_document_metadata(db, edit.document_id)
 }
 
+/// Prepares a document for an overwriteable user-guided metadata search:
+/// clears stale unlocked fields while keeping `explicit_locks`, stores provisional `title` and
+/// `authors` unlocked (unless explicitly locked) so they remain saved if offline/unchanged yet
+/// get cleanly overwritten with the official database record when matched, and returns `GuidedSearchHints`.
+pub fn prepare_guided_search_edit(
+    db: &Database,
+    edit: &ManualMetadataEdit,
+    explicit_locks: &[String],
+) -> Result<GuidedSearchHints> {
+    apply_manual_metadata_edit_with_locks(db, edit, Some(explicit_locks), true)?;
+
+    let locked_set: HashSet<&str> = explicit_locks
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let edited_set: HashSet<&str> = edit
+        .edited_fields
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let raw_title = strip_inline_markup_tags(edit.title.trim());
+    let trimmed_title = raw_title.trim();
+
+    {
+        let conn = db.writer();
+        let tx = conn.unchecked_transaction()?;
+        if !locked_set.contains("title") && !trimmed_title.is_empty() {
+            let t_norm = normalize_math_text(trimmed_title);
+            tx.execute(
+                "UPDATE documents SET title = ?2, title_norm = ?3 WHERE id = ?1",
+                params![edit.document_id, trimmed_title, t_norm],
+            )?;
+        }
+        if !locked_set.contains("authors") && !edit.authors.is_empty() {
+            replace_authors_in_tx(&tx, edit.document_id, &edit.authors)?;
+        }
+        tx.commit()?;
+    }
+
+    let hint_title = if trimmed_title.is_empty() {
+        None
+    } else if locked_set.contains("title")
+        || edited_set.contains("title")
+        || !looks_like_garbage_title(trimmed_title)
+    {
+        Some(trimmed_title.to_string())
+    } else {
+        None
+    };
+
+    let strict_author_filter = !edit.authors.is_empty()
+        && (locked_set.contains("authors")
+            || edited_set.contains("authors")
+            || hint_title.is_none());
+
+    let keep_hint = |field: &str| locked_set.contains(field) || edited_set.contains(field);
+
+    let work_type = if keep_hint("work_type") || edit.work_type == "book" {
+        Some(WorkType::from_str_lossy(&edit.work_type).as_str().to_string())
+    } else {
+        None
+    };
+
+    Ok(GuidedSearchHints {
+        title: hint_title,
+        authors: edit.authors.clone(),
+        strict_author_filter,
+        year: if keep_hint("year") { edit.year } else { None },
+        work_type,
+        doi: if keep_hint("doi") {
+            edit.doi.as_deref().and_then(normalize_doi)
+        } else {
+            None
+        },
+        arxiv_id: if keep_hint("arxiv_id") {
+            clean_opt(&edit.arxiv_id)
+        } else {
+            None
+        },
+        mr_number: if keep_hint("mr_number") {
+            edit.mr_number.as_deref().and_then(normalize_mr_digits)
+        } else {
+            None
+        },
+        zbl_number: if keep_hint("zbl_number") {
+            clean_opt(&edit.zbl_number)
+        } else {
+            None
+        },
+        isbn: if keep_hint("isbn") {
+            clean_opt(&edit.isbn)
+        } else {
+            None
+        },
+    })
+}
+
 pub fn confirm_metadata_candidate(
     db: &Database,
     document_id: i64,
     candidate_id: i64,
+) -> Result<DocumentMetadataView> {
+    confirm_metadata_candidate_with_options(db, document_id, candidate_id, false)
+}
+
+pub fn confirm_metadata_candidate_with_options(
+    db: &Database,
+    document_id: i64,
+    candidate_id: i64,
+    overwrite_query_fields: bool,
 ) -> Result<DocumentMetadataView> {
     {
         let conn = db.writer();
@@ -2723,7 +2954,20 @@ pub fn confirm_metadata_candidate(
             |r| r.get(0),
         )?;
         let mut rec: BibliographicRecord = serde_json::from_str(&json)?;
-        let lock_abbrev = load_locked_fields(&conn, document_id)?.contains("journal_abbrev");
+        let mut locked = load_locked_fields(&conn, document_id)?;
+        if overwrite_query_fields {
+            let had_query_locks = locked.remove("title") | locked.remove("authors");
+            if had_query_locks {
+                let mut next_locked: Vec<String> = locked.iter().cloned().collect();
+                next_locked.sort();
+                let locked_json = serde_json::to_string(&next_locked)?;
+                conn.execute(
+                    "UPDATE documents SET manual_locked_fields = ?2 WHERE id = ?1",
+                    params![document_id, locked_json],
+                )?;
+            }
+        }
+        let lock_abbrev = locked.contains("journal_abbrev");
         normalize_record_journals_locally(&mut rec, lock_abbrev);
         apply_record_respecting_locks(&conn, document_id, &rec, false)?;
         conn.execute(
@@ -3297,6 +3541,29 @@ pub fn search_documents_metadata(
     let mut out = Vec::new();
     let mut fallback_norm_summaries: Vec<String> = Vec::new();
 
+    let title_q_tokens: Vec<&str> = title_q
+        .as_deref()
+        .map(|q| {
+            let v: Vec<&str> = q
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if v.len() >= 2 { v } else { Vec::new() }
+        })
+        .unwrap_or_default();
+    let text_q_tokens: Vec<(&str, Option<i64>)> = text_q
+        .as_deref()
+        .map(|q| {
+            let v: Vec<(&str, Option<i64>)> = q
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| (t, t.parse::<i64>().ok()))
+                .collect();
+            if v.len() >= 2 { v } else { Vec::new() }
+        })
+        .unwrap_or_default();
+    let text_q_only_tokens: Vec<&str> = text_q_tokens.iter().map(|(t, _)| *t).collect();
+
     while let Some(r) = rows.next()? {
         if has_text_filter {
             let raw_title = r.get_ref(5)?.as_str().unwrap_or("");
@@ -3312,7 +3579,7 @@ pub fn search_documents_metadata(
                 }
             }
             if let Some(ref q) = title_q {
-                if !normalized_title_contains(db_title_norm, raw_title, q) {
+                if !normalized_title_contains(db_title_norm, raw_title, q, &title_q_tokens) {
                     continue;
                 }
             }
@@ -3328,13 +3595,21 @@ pub fn search_documents_metadata(
             }
             if let Some(ref q) = text_q {
                 let matched = author_matches_query(raw_authors_norm, q)
-                    || normalized_title_contains(db_title_norm, raw_title, q)
+                    || normalized_title_contains(db_title_norm, raw_title, q, &text_q_only_tokens)
                     || (!msc_raw.is_empty() && msc_raw.to_ascii_lowercase().contains(q.as_str()))
                     || (text_has_digit && yr_opt.is_some_and(|y| y.to_string().contains(q.as_str())))
                     || (!journal_raw.trim().is_empty()
                         && cached_j_norm
                             .get_or_insert_with(|| normalize_math_text(journal_raw))
-                            .contains(q.as_str()));
+                            .contains(q.as_str()))
+                    || (!text_q_tokens.is_empty()
+                        && combined_metadata_tokens_match(
+                            raw_authors_norm,
+                            db_title_norm,
+                            raw_title,
+                            yr_opt,
+                            &text_q_tokens,
+                        ));
                 if !matched {
                     continue;
                 }
@@ -3440,12 +3715,54 @@ fn author_matches_query(raw_authors_norm: &str, needle: &str) -> bool {
     false
 }
 
-fn normalized_title_contains(db_title_norm: &str, raw_title: &str, needle: &str) -> bool {
-    if !db_title_norm.is_empty() || raw_title.trim().is_empty() {
-        db_title_norm.contains(needle)
+fn normalized_title_contains(
+    db_title_norm: &str,
+    raw_title: &str,
+    needle: &str,
+    multi_tokens: &[&str],
+) -> bool {
+    let owned_norm;
+    let haystack = if !db_title_norm.is_empty() || raw_title.trim().is_empty() {
+        db_title_norm
     } else {
-        normalize_math_text(raw_title).contains(needle)
+        owned_norm = normalize_math_text(raw_title);
+        owned_norm.as_str()
+    };
+    if haystack.contains(needle) {
+        return true;
     }
+    if multi_tokens.is_empty() {
+        return false;
+    }
+    multi_tokens.iter().all(|tok| haystack.contains(tok))
+}
+
+fn combined_metadata_tokens_match(
+    raw_authors_norm: &str,
+    db_title_norm: &str,
+    raw_title: &str,
+    yr_opt: Option<i64>,
+    multi_tokens: &[(&str, Option<i64>)],
+) -> bool {
+    if multi_tokens.len() < 2 {
+        return false;
+    }
+    let owned_norm;
+    let title_haystack = if !db_title_norm.is_empty() || raw_title.trim().is_empty() {
+        db_title_norm
+    } else {
+        owned_norm = normalize_math_text(raw_title);
+        owned_norm.as_str()
+    };
+    for &(tok, parsed_yr) in multi_tokens {
+        let in_title = title_haystack.contains(tok);
+        let in_author = !raw_authors_norm.is_empty() && raw_authors_norm.contains(tok);
+        let in_year = parsed_yr.is_some() && parsed_yr == yr_opt;
+        if !in_title && !in_author && !in_year {
+            return false;
+        }
+    }
+    true
 }
 
 fn norm_opt(opt: &Option<String>) -> Option<String> {
@@ -5024,6 +5341,7 @@ mod tests {
             is_guided: false,
             locked_title: false,
             locked_authors: false,
+            strict_author_filter: false,
             locked_year: false,
         };
 
@@ -5873,6 +6191,7 @@ mod tests {
             is_guided: false,
             locked_title: false,
             locked_authors: false,
+            strict_author_filter: false,
             locked_year: false,
         };
         let mut hits = Vec::new();
@@ -6008,5 +6327,327 @@ mod tests {
         assert_eq!(meta.title, "Measure Theory");
         assert_eq!(meta.authors[0].family_name, "Halmos");
         assert_eq!(meta.doi.as_deref(), Some("10.1007/978-1-4684-9440-2"));
+    }
+
+    #[tokio::test]
+    async fn guided_partial_title_and_subtitle_variants_overwrite_official_title_authors_and_bibtex()
+    {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("guided_partial.db"), 2).unwrap();
+        let root_path = dir.path().join("lib");
+        std::fs::create_dir_all(&root_path).unwrap();
+        let (doc_brezzi, doc_book, doc_author_only) = {
+            let w = db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "r_guided_partial".into(),
+                    label: "Library".into(),
+                    root_path: root_path.to_string_lossy().into_owned(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+            let d1 = create_heuristic_document(&w, "scan_brezzi_74").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d1,
+                    root_id: "r_guided_partial",
+                    rel_path: "scan_brezzi_74.pdf",
+                    format: "pdf",
+                    size_bytes: 5_000,
+                    mtime_ns: 1,
+                    blake3_hash: "h_partial_1",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            w.execute(
+                "UPDATE documents SET doi = '10.1000/stale_wrong_doi' WHERE id = ?1",
+                params![d1],
+            )
+            .unwrap();
+
+            let d2 = create_heuristic_document(&w, "Collana Mondo Matematico").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d2,
+                    root_id: "r_guided_partial",
+                    rel_path: "numeri_primi.pdf",
+                    format: "pdf",
+                    size_bytes: 12_000,
+                    mtime_ns: 2,
+                    blake3_hash: "h_partial_2",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+
+            let d3 = create_heuristic_document(&w, "Titolo parziale bloccato").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d3,
+                    root_id: "r_guided_partial",
+                    rel_path: "brezzi_other.pdf",
+                    format: "pdf",
+                    size_bytes: 8_000,
+                    mtime_ns: 3,
+                    blake3_hash: "h_partial_3",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            (d1, d2, d3)
+        };
+
+        let cfg = AppConfig {
+            mrlookup_enabled_single: true,
+            zbmath_enabled: false,
+            crossref_enabled: false,
+            dblp_enabled: false,
+            openalex_enabled: false,
+            inspirehep_enabled: false,
+            arxiv_enabled: false,
+            datacite_enabled: false,
+            semanticscholar_enabled: false,
+            europepmc_enabled: false,
+            harvard_enabled: false,
+            loc_enabled: false,
+            googlebooks_enabled: false,
+            openlibrary_enabled: false,
+            ..AppConfig::default()
+        };
+        let clients = WaterfallClients::from_config(&cfg).unwrap();
+
+        // 1. Non-adjacent partial title words + surname -> resolves full official title, full given name, and verbatim BibTeX
+        let mrlookup_brezzi_html = r#"<html><body><pre>
+@article {MR0365287,
+    AUTHOR = {Brezzi, Franco},
+     TITLE = {On the existence, uniqueness and approximation of saddle-point problems arising from {L}agrangian multipliers},
+   JOURNAL = {Rev. Fran\c{c}aise Automat. Informat. Recherche Op\'erationnelle S\'er. Rouge},
+      YEAR = {1974},
+    VOLUME = {8},
+    NUMBER = {R-2},
+     PAGES = {129--151},
+   MRCLASS = {65N30},
+  MRNUMBER = {0365287},
+}
+</pre></body></html>"#;
+        crate::metadata::limiter::store_http_cache(
+            &db,
+            "mrlookup",
+            "q:ti=existence saddle lagrangian:au=brezzi:yr=0",
+            200,
+            mrlookup_brezzi_html,
+        )
+        .unwrap();
+
+        let mut edit1 = ManualMetadataEdit {
+            document_id: doc_brezzi,
+            work_type: "article".to_string(),
+            title: "existence saddle lagrangian".to_string(),
+            authors: vec![BibliographicAuthor {
+                family_name: "Brezzi".to_string(),
+                given_name: String::new(),
+                role: "author".to_string(),
+            }],
+            doi: Some("10.1000/stale_wrong_doi".to_string()),
+            edited_fields: vec!["title".to_string(), "authors".to_string()],
+            ..Default::default()
+        };
+        let hints1 = prepare_guided_search_edit(&db, &edit1, &[]).unwrap();
+        assert!(hints1.doi.is_none(), "stale unedited DOI must not pollute guided query");
+        let out1 = resolve_document_metadata_with_hints(
+            &db,
+            &clients,
+            &cfg,
+            doc_brezzi,
+            MetadataLookupScope::SingleRecordUserAction,
+            Some(hints1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out1.status, "updated");
+        let meta1 = get_document_metadata(&db, doc_brezzi).unwrap();
+        assert_eq!(
+            meta1.title,
+            "On the existence, uniqueness and approximation of saddle-point problems arising from Lagrangian multipliers"
+        );
+        assert_eq!(meta1.authors.len(), 1);
+        assert_eq!(meta1.authors[0].family_name, "Brezzi");
+        assert_eq!(meta1.authors[0].given_name, "Franco");
+        assert_eq!(meta1.mr_number.as_deref(), Some("0365287"));
+        assert!(meta1.doi.is_none());
+        assert!(
+            meta1
+                .raw_mrlookup_bibtex
+                .as_deref()
+                .is_some_and(|b| b.contains("@article {MR0365287")),
+            "unlocked overwriteable guided search must preserve verbatim MRLookup BibTeX"
+        );
+
+        // 2. Subtitle separator mismatch ('-' vs ':') + omitted subtitle tail -> overwrites with full official title
+        let mrlookup_book_html = r#"<html><body><pre>
+@book {MR2000001,
+    AUTHOR = {du Sautoy, Marcus},
+     TITLE = {I numeri primi: Un lungo cammino verso l'infinito},
+ PUBLISHER = {BUR Rizzoli},
+      YEAR = {2005},
+      ISBN = {9788817004626},
+  MRNUMBER = {2000001},
+}
+</pre></body></html>"#;
+        crate::metadata::limiter::store_http_cache(
+            &db,
+            "mrlookup",
+            "q:ti=i numeri primi - un lungo cammino:au=du sautoy:yr=0",
+            200,
+            mrlookup_book_html,
+        )
+        .unwrap();
+
+        edit1.document_id = doc_book;
+        edit1.work_type = "book".to_string();
+        edit1.title = "I numeri primi - Un lungo cammino".to_string();
+        edit1.authors = vec![BibliographicAuthor {
+            family_name: "du Sautoy".to_string(),
+            given_name: String::new(),
+            role: "author".to_string(),
+        }];
+        edit1.doi = None;
+        let hints2 = prepare_guided_search_edit(&db, &edit1, &[]).unwrap();
+        let out2 = resolve_document_metadata_with_hints(
+            &db,
+            &clients,
+            &cfg,
+            doc_book,
+            MetadataLookupScope::SingleRecordUserAction,
+            Some(hints2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out2.status, "updated");
+        let meta2 = get_document_metadata(&db, doc_book).unwrap();
+        assert_eq!(
+            meta2.title,
+            "I numeri primi: Un lungo cammino verso l'infinito"
+        );
+        assert_eq!(meta2.authors[0].given_name, "Marcus");
+
+        // 3. Author-only guided search surfaces candidates >= 0.45, and confirming with overwrite_query_fields=true
+        //    overwrites even a previously locked title/author!
+        let mrlookup_au_only_html = r#"<html><body><pre>
+@article {MR0365287,
+    AUTHOR = {Brezzi, Franco},
+     TITLE = {On the existence, uniqueness and approximation of saddle-point problems arising from {L}agrangian multipliers},
+   JOURNAL = {RAIRO},
+      YEAR = {1974},
+  MRNUMBER = {0365287},
+}
+</pre><pre>
+@book {MR1116295,
+    AUTHOR = {Brezzi, Franco and Fortin, Michel},
+     TITLE = {Mixed and hybrid finite element methods},
+ PUBLISHER = {Springer-Verlag, New York},
+      YEAR = {1991},
+  MRNUMBER = {1116295},
+}
+</pre></body></html>"#;
+        crate::metadata::limiter::store_http_cache(
+            &db,
+            "mrlookup",
+            "q:ti=:au=brezzi:yr=0",
+            200,
+            mrlookup_au_only_html,
+        )
+        .unwrap();
+
+        let edit3 = ManualMetadataEdit {
+            document_id: doc_author_only,
+            work_type: "book".to_string(),
+            title: String::new(),
+            authors: vec![BibliographicAuthor {
+                family_name: "Brezzi".to_string(),
+                given_name: String::new(),
+                role: "author".to_string(),
+            }],
+            edited_fields: vec!["authors".to_string()],
+            ..Default::default()
+        };
+        let hints3 = prepare_guided_search_edit(&db, &edit3, &[]).unwrap();
+        let out3 = resolve_document_metadata_with_hints(
+            &db,
+            &clients,
+            &cfg,
+            doc_author_only,
+            MetadataLookupScope::SingleRecordUserAction,
+            Some(hints3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out3.status, "candidates_found");
+        assert_eq!(out3.candidates_count, 2);
+
+        // Simulate a stale lock on "title" and verify confirm_metadata_candidate_with_options(..., true) overwrites it
+        {
+            let w = db.writer();
+            w.execute(
+                "UPDATE documents SET title = 'Titolo vecchio errato', manual_locked_fields = '[\"title\"]' WHERE id = ?1",
+                params![doc_author_only],
+            )
+            .unwrap();
+        }
+        let pre_confirm = get_document_metadata(&db, doc_author_only).unwrap();
+        let mixed_cand = pre_confirm
+            .pending_candidates
+            .iter()
+            .find(|c| c.record.mr_number.as_deref() == Some("1116295"))
+            .expect("Mixed finite element book candidate present");
+        let confirmed =
+            confirm_metadata_candidate_with_options(&db, doc_author_only, mixed_cand.id, true)
+                .unwrap();
+        assert_eq!(confirmed.title, "Mixed and hybrid finite element methods");
+        assert_eq!(confirmed.authors.len(), 2);
+        assert_eq!(confirmed.authors[1].family_name, "Fortin");
+        assert!(!confirmed.manual_locked_fields.contains(&"title".to_string()));
+        assert!(confirmed.raw_mrlookup_bibtex.is_some());
+
+        // 4. Local catalog search matches non-adjacent partial title words, ':' vs '-' subtitles, and combined author+title
+        let r_conn = db.reader();
+        let hits_non_adj = search_documents_metadata(
+            &r_conn,
+            &MetadataSearchFilter {
+                title: Some("existence saddle lagrangian".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits_non_adj.len(), 1);
+        assert_eq!(hits_non_adj[0].document_id, doc_brezzi);
+
+        let hits_sub = search_documents_metadata(
+            &r_conn,
+            &MetadataSearchFilter {
+                title: Some("numeri primi - lungo cammino".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits_sub.len(), 1);
+        assert_eq!(hits_sub[0].document_id, doc_book);
+
+        let hits_combined = search_documents_metadata(
+            &r_conn,
+            &MetadataSearchFilter {
+                text: Some("fortin mixed finite".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(hits_combined.len(), 1);
+        assert_eq!(hits_combined[0].document_id, doc_author_only);
     }
 }

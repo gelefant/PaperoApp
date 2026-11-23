@@ -493,7 +493,7 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true" aria-label={tr(lang, 'settingsTitle')}>
     <div class="settings-modal">
       <header class="modal-head">
-        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.3.2</span></h2>
+        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.3.3</span></h2>
         <button type="button" onclick={onClose}>{tr(lang, 'close')}</button>
       </header>
 

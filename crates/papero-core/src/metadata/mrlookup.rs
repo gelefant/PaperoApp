@@ -64,6 +64,7 @@ impl MrLookupClient {
         let kw_fallback = ids.filename_keywords.join(" ");
         let mut can_retry_title_only: Option<(String, String)> = None;
         let mut prose_core_retry: Option<(String, String)> = None;
+        let mut sig_words_retry: Option<(String, String)> = None;
 
         if let Some(mr) = ids.mr_number.as_deref() {
             if let Some(ti) = ids.heuristic_title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -122,6 +123,15 @@ impl MrLookupClient {
                     prose_core_retry = Some((clean_prose, p_ck));
                 }
             }
+            let sig_q = extract_significant_mrlookup_query(ti);
+            if !sig_q.is_empty() && sig_q != cleaned_ti_q {
+                let s_ck = format!(
+                    "qsig:ti={}:au={}",
+                    normalize_math_text(&sig_q),
+                    normalize_math_text(&clean_au)
+                );
+                sig_words_retry = Some((sig_q, s_ck));
+            }
         }
 
         if form.is_empty() {
@@ -153,11 +163,26 @@ impl MrLookupClient {
         // If PDF math symbols/formulas in `ti` blocked MRLookup's strict word AND filter, retry with clean prose core
         if top_score < 0.55 {
             if let Some((prose_q, p_ck)) = prose_core_retry {
-                let mut p_form = vec![("au", clean_au), ("ti", prose_q)];
+                let mut p_form = vec![("au", clean_au.clone()), ("ti", prose_q)];
                 if let Ok(p_body) = self.fetch_mrlookup_body(db, &mut p_form, &p_ck).await {
                     let p_hits = parse_mrlookup_html_to_candidates(&p_body, ids);
                     if p_hits.first().map(|c| c.score).unwrap_or(0.0) > top_score {
                         hits = p_hits;
+                        top_score = hits.first().map(|c| c.score).unwrap_or(0.0);
+                    }
+                }
+            }
+        }
+
+        // Retry with significant content words only (dropping articles/prepositions like "and"/"an"/"the")
+        // so approximate or subtitle-rephrased user queries still match MRLookup's strict word-AND search.
+        if top_score < 0.55 {
+            if let Some((sig_q, s_ck)) = sig_words_retry {
+                let mut s_form = vec![("au", clean_au), ("ti", sig_q)];
+                if let Ok(s_body) = self.fetch_mrlookup_body(db, &mut s_form, &s_ck).await {
+                    let s_hits = parse_mrlookup_html_to_candidates(&s_body, ids);
+                    if s_hits.first().map(|c| c.score).unwrap_or(0.0) > top_score {
+                        hits = s_hits;
                     }
                 }
             }
@@ -208,6 +233,56 @@ impl MrLookupClient {
     }
 }
 
+fn extract_significant_mrlookup_query(raw: &str) -> String {
+    let norm = normalize_title_words(&clean_metadata_text(raw));
+    let mut kept = Vec::new();
+    for w in norm.split_whitespace() {
+        if w.len() >= 3
+            && !matches!(
+                w,
+                "the"
+                    | "and"
+                    | "for"
+                    | "with"
+                    | "from"
+                    | "into"
+                    | "over"
+                    | "under"
+                    | "via"
+                    | "sur"
+                    | "les"
+                    | "des"
+                    | "une"
+                    | "dans"
+                    | "und"
+                    | "der"
+                    | "die"
+                    | "das"
+                    | "uber"
+                    | "del"
+                    | "dei"
+                    | "degli"
+                    | "della"
+                    | "delle"
+                    | "con"
+                    | "una"
+                    | "uno"
+                    | "gli"
+                    | "sul"
+                    | "sulla"
+            )
+            && !kept.contains(&w)
+        {
+            kept.push(w);
+        }
+    }
+    if kept.len() >= 2 {
+        kept.join(" ")
+    } else {
+        String::new()
+    }
+}
+
 fn clean_mrlookup_title_query(raw: &str) -> String {
     let cleaned = clean_metadata_text(raw);
     let mut out = String::with_capacity(cleaned.len());
@@ -243,12 +318,14 @@ pub fn parse_mrlookup_html_to_candidates(
     html_body: &str,
     ids: &ExtractedIdentifiers,
 ) -> Vec<CandidateMatch> {
-    let pre_re = Regex::new(r"(?is)<pre[^>]*>(.*?)</pre>").unwrap();
-    let tag_re = Regex::new(r"<[^>]+>").unwrap();
+    static PRE_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?is)<pre[^>]*>(.*?)</pre>").unwrap());
+    static TAG_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
     let mut matches = Vec::new();
 
-    for cap in pre_re.captures_iter(html_body) {
-        let inner = tag_re.replace_all(&cap[1], "");
+    for cap in PRE_RE.captures_iter(html_body) {
+        let inner = TAG_RE.replace_all(&cap[1], "");
         let unescaped = decode_basic_html_entities(&inner);
         for parsed in parse_bibtex_entries(&unescaped) {
             let mut rec = parsed.record;
@@ -373,6 +450,50 @@ pub fn score_candidate(rec: &BibliographicRecord, ids: &ExtractedIdentifiers) ->
             score = score.max(0.87 + year_bonus.min(0.06));
         }
 
+        // User-guided word-containment & subtitle-tolerant scoring (MRLookup-style partial title search):
+        // when the user explicitly typed partial keywords contained in the title (even omitting subtitles
+        // or mixing ':' vs '-'), boost matching works cleanly while keeping ambiguous multi-hit queries reviewable.
+        if ids.is_user_query {
+            let (q_tok_cnt, r_tok_cnt, contained_cnt) =
+                compute_word_containment_counts(q_title, &rec.title);
+            if q_tok_cnt >= 1 && r_tok_cnt >= 1 {
+                let rec_ratio = (contained_cnt as f32) / (q_tok_cnt as f32);
+                let prec_ratio = ((contained_cnt as f32) / (r_tok_cnt as f32)).clamp(0.0, 1.0);
+                if contained_cnt == q_tok_cnt {
+                    if has_query_author && author_sim >= 0.88 {
+                        let floor = if q_tok_cnt >= 3 {
+                            0.93 + 0.03 * prec_ratio + year_bonus.min(0.02)
+                        } else if q_tok_cnt == 2 {
+                            0.90 + 0.05 * prec_ratio + year_bonus.min(0.03)
+                        } else if r_tok_cnt == 1 {
+                            0.92 + year_bonus.min(0.04)
+                        } else {
+                            0.78 + 0.08 * prec_ratio + year_bonus.min(0.04)
+                        };
+                        score = score.max(floor);
+                    } else if !has_query_author {
+                        let floor = if q_tok_cnt >= 4 {
+                            0.90 + 0.06 * prec_ratio + year_bonus.min(0.02)
+                        } else if q_tok_cnt == 3 {
+                            0.85 + 0.09 * prec_ratio + year_bonus.min(0.03)
+                        } else {
+                            0.72 + 0.14 * prec_ratio + year_bonus.min(0.03)
+                        };
+                        score = score.max(floor);
+                    }
+                } else if q_tok_cnt >= 4 && rec_ratio >= 0.75 {
+                    let floor = if has_query_author && author_sim >= 0.88 {
+                        0.82 + 0.08 * rec_ratio + year_bonus.min(0.04)
+                    } else if !has_query_author {
+                        0.68 + 0.12 * rec_ratio
+                    } else {
+                        0.0
+                    };
+                    score = score.max(floor);
+                }
+            }
+        }
+
         if is_erratum_or_review_mismatch(q_title, &rec.title)
             || has_series_part_mismatch(q_title, &rec.title)
         {
@@ -383,12 +504,24 @@ pub fn score_candidate(rec: &BibliographicRecord, ids: &ExtractedIdentifiers) ->
     }
 
     // 3. Fallback scoring for author (+ optional year / filename keywords) when title is absent
-    if has_query_author && author_sim >= 0.88 {
-        let mut score = match year_diff {
-            Some(0) => 0.62 * author_sim,
-            Some(1) => 0.54 * author_sim,
-            None => 0.48 * author_sim,
-            _ => 0.20 * author_sim,
+    if has_query_author && author_sim >= 0.86 {
+        let mut score = if ids.is_user_query {
+            match year_diff {
+                Some(0) => 0.78 * author_sim,
+                Some(1) => 0.72 * author_sim,
+                None => 0.68 * author_sim,
+                _ => 0.50 * author_sim,
+            }
+        } else {
+            if author_sim < 0.88 {
+                return 0.0;
+            }
+            match year_diff {
+                Some(0) => 0.62 * author_sim,
+                Some(1) => 0.54 * author_sim,
+                None => 0.48 * author_sim,
+                _ => 0.20 * author_sim,
+            }
         };
         if !ids.filename_keywords.is_empty() {
             let r_norm = normalize_math_text(&clean_metadata_text(&rec.title));
@@ -592,6 +725,55 @@ pub(crate) fn normalize_title_words(s: &str) -> String {
     out.trim().to_string()
 }
 
+fn compute_word_containment_counts(q_raw: &str, r_raw: &str) -> (usize, usize, usize) {
+    let q_norm = normalize_title_words(&clean_metadata_text(q_raw));
+    let r_norm = normalize_title_words(&clean_metadata_text(r_raw));
+    let q_toks = significant_title_tokens(&q_norm);
+    let r_toks = significant_title_tokens(&r_norm);
+    if q_toks.is_empty() || r_toks.is_empty() {
+        return (q_toks.len(), r_toks.len(), 0);
+    }
+    let mut r_compact: Option<String> = None;
+    let contained = q_toks
+        .iter()
+        .filter(|&&qt| {
+            if r_toks.contains(qt) {
+                return true;
+            }
+            // Singular/plural or 1-char inflection stem tolerance on >= 5-char words
+            if qt.len() >= 5 {
+                let stem_len = qt.char_indices().next_back().map_or(qt.len(), |(i, _)| i);
+                let stem = &qt[..stem_len];
+                if stem.len() >= 4
+                    && r_toks.iter().any(|&rt| {
+                        rt.starts_with(stem) && rt.len().abs_diff(qt.len()) <= 2
+                    })
+                {
+                    return true;
+                }
+            }
+            // Compound/hyphen join tolerance ("saddlepoint" <-> "saddle point"), allocated lazily
+            qt.len() >= 6
+                && r_compact
+                    .get_or_insert_with(|| r_norm.chars().filter(|c| !c.is_whitespace()).collect())
+                    .contains(qt)
+        })
+        .count();
+    (q_toks.len(), r_toks.len(), contained)
+}
+
+fn split_main_title_short(raw: &str) -> Option<&str> {
+    for sep in [":", " — ", " – ", " - "] {
+        if let Some((head, _)) = raw.split_once(sep) {
+            let trimmed = head.trim();
+            if trimmed.split_whitespace().count() >= 2 && trimmed.len() >= 10 {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn compute_title_similarity(q_raw: &str, r_raw: &str) -> (f32, usize, usize) {
     let q_clean = clean_metadata_text(q_raw);
     let r_clean = clean_metadata_text(r_raw);
@@ -600,18 +782,22 @@ pub(crate) fn compute_title_similarity(q_raw: &str, r_raw: &str) -> (f32, usize,
     let sig_count = significant_title_tokens(&q_norm).len();
     let mut best = pair_title_sim(&q_norm, &r_norm);
 
-    // Subtitle-tolerant comparison when one side omits ": Subtitle"
-    let q_main = split_main_title(&q_clean).map(normalize_title_words);
-    let r_main = split_main_title(&r_clean).map(normalize_title_words);
+    // Subtitle-tolerant comparison when one side omits ": Subtitle" or "- Subtitle"
+    let q_main = split_main_title(&q_clean)
+        .or_else(|| split_main_title_short(&q_clean))
+        .map(normalize_title_words);
+    let r_main = split_main_title(&r_clean)
+        .or_else(|| split_main_title_short(&r_clean))
+        .map(normalize_title_words);
     if q_main.is_some() || r_main.is_some() {
         let qm = q_main.as_deref().unwrap_or(&q_norm);
         let rm = r_main.as_deref().unwrap_or(&r_norm);
-        if qm.split_whitespace().count() >= 4
-            && rm.split_whitespace().count() >= 4
-            && qm.len() >= 20
-            && rm.len() >= 20
-        {
+        let qm_words = qm.split_whitespace().count();
+        let rm_words = rm.split_whitespace().count();
+        if qm_words >= 4 && rm_words >= 4 && qm.len() >= 20 && rm.len() >= 20 {
             best = best.max(pair_title_sim(qm, rm) * 0.97);
+        } else if qm_words >= 2 && rm_words >= 2 && qm.len() >= 10 && rm.len() >= 10 {
+            best = best.max(pair_title_sim(qm, rm) * 0.94);
         }
     }
 

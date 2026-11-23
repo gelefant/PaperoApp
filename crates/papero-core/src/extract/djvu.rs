@@ -116,8 +116,8 @@ pub fn extract_djvu_front_matter(path: &Path, djvused_bin: Option<&str>) -> Resu
         });
     }
 
-    let mut target_ords: Vec<u32> = (1..=page_count.min(4)).collect();
-    if page_count > 4 {
+    let mut target_ords: Vec<u32> = (1..=page_count.min(6)).collect();
+    if page_count > 6 {
         target_ords.push(page_count);
     }
 

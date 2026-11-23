@@ -57,15 +57,15 @@ impl HarvardClient {
             }
         }
 
-        let Some(ti) = ids
+        let ti = ids
             .heuristic_title
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(Vec::new());
-        };
+            .unwrap_or("");
         let au = ids.heuristic_first_author.as_deref().unwrap_or("").trim();
+        if ti.is_empty() && (!ids.is_user_query || au.is_empty()) {
+            return Ok(Vec::new());
+        }
         let cache_key = format!(
             "book:ti={}:au={}",
             normalize_math_text(ti),
@@ -78,10 +78,20 @@ impl HarvardClient {
             }
             cached.body
         } else {
-            let mut url = format!(
-                "{HARVARD_ITEMS_URL}?title={}&resourceType=text&limit=5",
-                url::form_urlencoded::byte_serialize(ti.as_bytes()).collect::<String>()
-            );
+            let clean_ti: String = ti
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut url = format!("{HARVARD_ITEMS_URL}?resourceType=text&limit=6");
+            if !clean_ti.is_empty() {
+                url.push_str("&title=");
+                url.push_str(
+                    &url::form_urlencoded::byte_serialize(clean_ti.as_bytes()).collect::<String>(),
+                );
+            }
             if !au.is_empty() {
                 url.push_str("&name=");
                 url.push_str(

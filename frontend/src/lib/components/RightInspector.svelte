@@ -15,11 +15,19 @@
     fetchingOnline: boolean;
     lastFetchMessage: string;
     onSave: (edit: ManualMetadataEdit, lockedFields?: string[]) => Promise<void>;
-    onSaveAndFetch?: (edit: ManualMetadataEdit, lockedFields: string[]) => Promise<ResolveOutcome | void>;
+    onSaveAndFetch?: (
+      edit: ManualMetadataEdit,
+      lockedFields: string[],
+      overwriteQueryFields?: boolean
+    ) => Promise<ResolveOutcome | void>;
     onFetchMetadata: (documentId: number) => Promise<ResolveOutcome | void>;
     onToggleVerified?: (documentId: number, verified: boolean, advanceNext?: boolean) => Promise<void>;
     hasNextUnverified?: boolean;
-    onConfirmCandidate: (documentId: number, candidateId: number) => Promise<void>;
+    onConfirmCandidate: (
+      documentId: number,
+      candidateId: number,
+      overwriteQueryFields?: boolean
+    ) => Promise<void>;
     onDismissCandidate: (candidateId: number) => Promise<void>;
     onCopyBibtex: (documentId: number) => Promise<string>;
     onImportAltFormula?: (fileId: number, markdownText: string) => Promise<void>;
@@ -93,6 +101,8 @@
   let lockedFields = $state<string[]>([]);
   let locksModified = $state(false);
   let touched = $state<string[]>([]);
+  let overwriteQueryFields = $state(true);
+  let lastDocId = $state<number | null>(null);
   let bibPreview = $state('');
   let copyFeedback = $state('');
   let altFormulaFeedback = $state('');
@@ -201,6 +211,10 @@
     lockedFields = meta.manual_locked_fields.filter(
       (f) => f !== 'tags' && f !== 'exclude_from_cloud_llm'
     );
+    if (meta.document_id !== lastDocId) {
+      lastDocId = meta.document_id;
+      overwriteQueryFields = true;
+    }
     locksModified = false;
     touched = [];
     bibPreview = meta.raw_mrlookup_bibtex ?? '';
@@ -212,6 +226,9 @@
       touched = [...touched, field];
     }
     if (field === 'tags' || field === 'exclude_from_cloud_llm') return;
+    if ((field === 'title' || field === 'authors') && overwriteQueryFields) {
+      return;
+    }
     if (currentValue !== undefined) {
       if (currentValue.trim()) {
         if (!lockedFields.includes(field)) {
@@ -236,8 +253,21 @@
       lockedFields = lockedFields.filter((f) => f !== field);
     } else {
       lockedFields = [...lockedFields, field];
+      if (field === 'title' || field === 'authors') {
+        overwriteQueryFields = false;
+      }
     }
     locksModified = true;
+  }
+
+  function handleOverwriteToggle() {
+    if (overwriteQueryFields) {
+      const next = lockedFields.filter((f) => f !== 'title' && f !== 'authors');
+      if (next.length !== lockedFields.length) {
+        lockedFields = next;
+        locksModified = true;
+      }
+    }
   }
 
   function unlockAllFields() {
@@ -296,9 +326,17 @@
     e.preventDefault();
     const payload = buildEditPayload(false);
     if (!payload) return;
+    const saveLocks = [...lockedFields];
+    if (touched.includes('title') && title.trim() && !saveLocks.includes('title')) {
+      saveLocks.push('title');
+    }
+    if (touched.includes('authors') && authorsText.trim() && !saveLocks.includes('authors')) {
+      saveLocks.push('authors');
+    }
     saving = true;
     try {
-      await onSave(payload, lockedFields);
+      await onSave(payload, saveLocks);
+      lockedFields = saveLocks;
       touched = [];
       locksModified = false;
     } finally {
@@ -309,11 +347,18 @@
   async function handleGuidedFetchClick() {
     if (!meta) return;
     let nextLocks = [...lockedFields];
-    const hasPrimaryAnchor = nextLocks.some((f) => PRIMARY_ANCHOR_KEYS.includes(f));
-    if (!hasPrimaryAnchor) {
-      if (title.trim()) nextLocks.push('title');
-      if (authorsText.trim()) nextLocks.push('authors');
-      if (yearStr.trim() && touched.includes('year')) nextLocks.push('year');
+    if (overwriteQueryFields) {
+      nextLocks = nextLocks.filter((f) => f !== 'title' && f !== 'authors');
+      if (yearStr.trim() && touched.includes('year') && !nextLocks.includes('year')) {
+        nextLocks.push('year');
+      }
+    } else {
+      const hasPrimaryAnchor = nextLocks.some((f) => PRIMARY_ANCHOR_KEYS.includes(f));
+      if (!hasPrimaryAnchor) {
+        if (title.trim()) nextLocks.push('title');
+        if (authorsText.trim()) nextLocks.push('authors');
+        if (yearStr.trim() && touched.includes('year')) nextLocks.push('year');
+      }
     }
     lockedFields = nextLocks;
     const payload = buildEditPayload(true);
@@ -321,7 +366,7 @@
     saving = true;
     try {
       if (onSaveAndFetch) {
-        await onSaveAndFetch(payload, nextLocks);
+        await onSaveAndFetch(payload, nextLocks, overwriteQueryFields);
       } else {
         await onSave(payload, nextLocks);
         await onFetchMetadata(meta.document_id);
@@ -640,7 +685,8 @@
               <button
                 type="button"
                 class="primary"
-                onclick={() => onConfirmCandidate(meta.document_id, cand.id)}
+                onclick={() =>
+                  onConfirmCandidate(meta.document_id, cand.id, overwriteQueryFields)}
               >
                 Conferma
               </button>
@@ -704,25 +750,41 @@
 
       <div class="guided-box">
         <div class="guided-info">
-          {#if activeLockedAnchors.length > 0}
+          {#if overwriteQueryFields}
             <span>
-              Guida attiva:
+              Scrivi parole del <strong>Titolo</strong> (anche parziali o senza sottotitolo) e/o <strong>Autori</strong>: Papero cercherà il record completo online.
+            </span>
+          {:else if activeLockedAnchors.length > 0}
+            <span>
+              Guida bloccata:
               <strong>{activeLockedAnchors.map((k) => ANCHOR_LABELS[k]).join(', ')}</strong>
             </span>
           {:else}
             <span>
-              Metadati errati? Scrivi <strong>Titolo</strong> e/o <strong>Autori</strong> qui sopra: verranno bloccati 🔒 e il resto sarà cercato online.
+              Scrivi <strong>Titolo</strong> e/o <strong>Autori</strong> qui sopra: verranno bloccati 🔒 e il resto sarà cercato online.
             </span>
           {/if}
         </div>
+        <label class="guided-overwrite-row">
+          <input
+            type="checkbox"
+            bind:checked={overwriteQueryFields}
+            onchange={handleOverwriteToggle}
+          />
+          <span>Sovrascrivi anche Titolo e Autori con i dati ufficiali trovati</span>
+        </label>
         <button
           type="button"
           class="guided-btn"
-          disabled={saving || fetchingOnline || (!title.trim() && !authorsText.trim() && activeLockedAnchors.length === 0)}
+          disabled={saving || fetchingOnline || meta.metadata_verified || (!title.trim() && !authorsText.trim() && activeLockedAnchors.length === 0)}
           onclick={handleGuidedFetchClick}
-          title="Salva e blocca i campi guida (es. Titolo e/o Autori), azzera i restanti metadati non bloccati e cerca rivista, anno, DOI, MR, Zbl…"
+          title="Cerca per parole contenute nel titolo (anche senza sottotitolo o con ':' / '-') e/o per autore; se la spunta sopra è attiva aggiorna anche titolo, autori e BibTeX ufficiale"
         >
-          {fetchingOnline ? 'Ricerca in corso…' : '🔍 Blocca e cerca il resto'}
+          {fetchingOnline
+            ? 'Ricerca in corso…'
+            : overwriteQueryFields
+              ? '🔍 Cerca per titolo/autore'
+              : '🔍 Blocca e cerca il resto'}
         </button>
       </div>
 
@@ -859,9 +921,11 @@
           onclick={handleGuidedFetchClick}
           title={meta.metadata_verified
             ? 'Metadati confermati: rimuovi la spunta ✓ prima di cercare online'
-            : 'Salva i campi bloccati, azzera i restanti e cerca online'}
+            : overwriteQueryFields
+              ? 'Cerca per parole del titolo e/o autore e sovrascrivi anche titolo e autori con i dati ufficiali'
+              : 'Salva i campi bloccati, azzera i restanti e cerca online'}
         >
-          🔍 Blocca e cerca il resto
+          {overwriteQueryFields ? '🔍 Cerca per titolo/autore' : '🔍 Blocca e cerca il resto'}
         </button>
       </div>
     </form>
@@ -1188,6 +1252,22 @@
   .guided-info {
     font-size: 11px;
     line-height: 1.35;
+  }
+  .guided-overwrite-row {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: flex-start;
+    gap: 6px !important;
+    cursor: pointer;
+    user-select: none;
+  }
+  .guided-overwrite-row input {
+    margin-top: 2px;
+  }
+  .guided-overwrite-row span {
+    color: var(--text-main, inherit) !important;
+    font-size: 11px;
+    line-height: 1.3;
   }
   .guided-btn {
     align-self: flex-start;

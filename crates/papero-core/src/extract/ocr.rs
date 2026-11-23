@@ -4,7 +4,7 @@ use crate::db::repos::docs::{
     replace_file_ocr_pages_and_passages, set_file_ocr_status, FilePageInsert, PassageInsert,
 };
 use crate::db::Database;
-use crate::dedup::{compute_minhash, pack_minhash};
+use crate::dedup::{compute_document_minhash_from_pages, pack_minhash};
 use crate::error::{CoreError, Result};
 use crate::extract::chunker::chunk_document;
 use crate::extract::pdf::lock_cached_pdfium;
@@ -472,7 +472,7 @@ where
         let first_pages: Vec<&str> = doc
             .pages
             .iter()
-            .take(4)
+            .take(6)
             .map(|p| p.raw_text.as_str())
             .collect();
         let last_page = doc.pages.last().map(|p| p.raw_text.as_str());
@@ -492,20 +492,15 @@ where
         );
         let _ = apply_extracted_identifiers_to_doc(&w, loc.document_id, &ids, None);
 
-        let full_text_for_minhash = doc
-            .pages
-            .iter()
-            .take(15)
-            .map(|p| p.raw_text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Some(sig) = compute_minhash(&full_text_for_minhash) {
-            let blob = pack_minhash(&sig);
-            let _ = w.execute(
-                "UPDATE documents SET minhash_sig = ?1 WHERE id = ?2",
-                params![blob, loc.document_id],
-            );
-        }
+        let minhash_blob = compute_document_minhash_from_pages(
+            doc.pages.iter().map(|p| (p.page_ord, p.raw_text.as_str())),
+            page_count,
+        )
+        .map(|sig| pack_minhash(&sig));
+        let _ = w.execute(
+            "UPDATE documents SET minhash_sig = ?1 WHERE id = ?2",
+            params![minhash_blob, loc.document_id],
+        );
 
         let embed_stage = match ModelProfile::from_str_lossy(&config.ml_profile) {
             ModelProfile::Light => "embed_light",

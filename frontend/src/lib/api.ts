@@ -133,12 +133,14 @@ export const api = {
   saveAndFetchDocumentMetadata: (
     edit: ManualMetadataEdit,
     lockedFields?: string[],
-    resetUnlocked = true
+    resetUnlocked = true,
+    overwriteQueryFields = false
   ) =>
     invoke<SaveAndFetchResult>('save_and_fetch_document_metadata', {
       edit,
       lockedFields: lockedFields ?? null,
       resetUnlocked,
+      overwriteQueryFields,
     }),
   fetchDocumentMetadata: (documentId: number) =>
     invoke<ResolveOutcome>('fetch_document_metadata', { documentId }),
@@ -154,8 +156,12 @@ export const api = {
     });
   },
   cancelMetadataBatch: () => invoke<void>('cancel_metadata_batch_cmd'),
-  confirmCandidate: (documentId: number, candidateId: number) =>
-    invoke<DocumentMetadataView>('confirm_candidate', { documentId, candidateId }),
+  confirmCandidate: (documentId: number, candidateId: number, overwriteQueryFields = false) =>
+    invoke<DocumentMetadataView>('confirm_candidate', {
+      documentId,
+      candidateId,
+      overwriteQueryFields,
+    }),
   dismissCandidate: (candidateId: number) =>
     invoke<void>('dismiss_candidate', { candidateId }),
 

@@ -52,12 +52,14 @@ use papero_core::metadata::io::{
 };
 use papero_core::metadata::models::DocumentMetadataView;
 use papero_core::metadata::resolver::{
-    apply_manual_metadata_edit_with_locks, clear_metadata_jobs_for_doc, confirm_metadata_candidate,
-    dismiss_metadata_candidate, get_document_metadata as core_get_document_metadata,
-    get_documents_metadata_for_export, import_metadata_records_into_library,
-    is_document_metadata_verified, list_all_document_ids, list_documents_for_bulk_metadata,
-    resolve_document_metadata, run_pending_metadata_jobs_cancellable, search_documents_metadata,
-    set_document_metadata_verified, ManualMetadataEdit, MetadataLookupScope, MetadataSearchFilter,
+    apply_manual_metadata_edit_with_locks, clear_metadata_jobs_for_doc,
+    confirm_metadata_candidate_with_options, dismiss_metadata_candidate,
+    get_document_metadata as core_get_document_metadata, get_documents_metadata_for_export,
+    import_metadata_records_into_library, is_document_metadata_verified, list_all_document_ids,
+    list_documents_for_bulk_metadata, prepare_guided_search_edit, resolve_document_metadata,
+    resolve_document_metadata_with_hints, run_pending_metadata_jobs_cancellable,
+    search_documents_metadata, set_document_metadata_verified, GuidedSearchHints,
+    ManualMetadataEdit, MetadataLookupScope, MetadataSearchFilter,
     ResolveOutcome, SaveAndFetchResult, WaterfallClients,
 };
 use papero_core::ml::{
@@ -947,27 +949,48 @@ pub async fn save_and_fetch_document_metadata(
     edit: ManualMetadataEdit,
     locked_fields: Option<Vec<String>>,
     reset_unlocked: Option<bool>,
+    overwrite_query_fields: Option<bool>,
 ) -> Result<SaveAndFetchResult, String> {
     let db_save = Arc::clone(&state.db);
     let edit_doc_id = edit.document_id;
     let reset = reset_unlocked.unwrap_or(true);
-    let blocked_by_verified = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        let verified = {
-            let r = db_save.reader();
-            is_document_metadata_verified(&r, edit_doc_id).map_err(|e| e.to_string())?
-        };
-        if verified && reset {
-            // Protect confirmed metadata: persist explicit edits & locks without resetting verification or overwriting unlocked fields
-            apply_manual_metadata_edit_with_locks(&db_save, &edit, locked_fields.as_deref(), false)
+    let overwrite = overwrite_query_fields.unwrap_or(false);
+    let (blocked_by_verified, guided_hints) =
+        tokio::task::spawn_blocking(move || -> Result<(bool, Option<GuidedSearchHints>), String> {
+            let verified = {
+                let r = db_save.reader();
+                is_document_metadata_verified(&r, edit_doc_id).map_err(|e| e.to_string())?
+            };
+            if verified && reset {
+                // Protect confirmed metadata: persist explicit edits & locks without resetting verification or overwriting unlocked fields
+                apply_manual_metadata_edit_with_locks(
+                    &db_save,
+                    &edit,
+                    locked_fields.as_deref(),
+                    false,
+                )
                 .map_err(|e| e.to_string())?;
-            return Ok(true);
-        }
-        apply_manual_metadata_edit_with_locks(&db_save, &edit, locked_fields.as_deref(), reset)
-            .map_err(|e| e.to_string())?;
-        Ok(false)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+                return Ok((true, None));
+            }
+            if overwrite && reset {
+                let effective_locks: Vec<String> = locked_fields
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|f| {
+                        let t = f.trim();
+                        t != "title" && t != "authors"
+                    })
+                    .collect();
+                let hints = prepare_guided_search_edit(&db_save, &edit, &effective_locks)
+                    .map_err(|e| e.to_string())?;
+                return Ok((false, Some(hints)));
+            }
+            apply_manual_metadata_edit_with_locks(&db_save, &edit, locked_fields.as_deref(), reset)
+                .map_err(|e| e.to_string())?;
+            Ok((false, None))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
 
     if blocked_by_verified {
         let db_after = Arc::clone(&state.db);
@@ -990,12 +1013,13 @@ pub async fn save_and_fetch_document_metadata(
 
     let cfg = state.config.read().expect("config poisoned").clone();
     let clients = Arc::clone(&state.clients.read().expect("clients poisoned"));
-    let outcome = resolve_document_metadata(
+    let outcome = resolve_document_metadata_with_hints(
         &state.db,
         &clients,
         &cfg,
         edit_doc_id,
         MetadataLookupScope::SingleRecordUserAction,
+        guided_hints,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1188,11 +1212,13 @@ pub async fn confirm_candidate(
     state: State<'_, Arc<AppState>>,
     document_id: i64,
     candidate_id: i64,
+    overwrite_query_fields: Option<bool>,
 ) -> Result<DocumentMetadataView, String> {
     let db = Arc::clone(&state.db);
+    let overwrite = overwrite_query_fields.unwrap_or(false);
     let view = tokio::task::spawn_blocking(move || {
-        let view =
-            confirm_metadata_candidate(&db, document_id, candidate_id).map_err(|e| e.to_string())?;
+        let view = confirm_metadata_candidate_with_options(&db, document_id, candidate_id, overwrite)
+            .map_err(|e| e.to_string())?;
         let _ = run_duplicate_detection(&db);
         Ok::<_, String>(view)
     })

@@ -136,5 +136,134 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current_version < 6 {
+        rebuild_minhashes_and_recompute_duplicates_v6(conn)?;
+    }
+
+    Ok(())
+}
+
+fn rebuild_minhashes_and_recompute_duplicates_v6(conn: &Connection) -> Result<()> {
+    use crate::dedup::detector::{refresh_user_decided_pair_hashes, run_duplicate_detection_conn};
+    use crate::dedup::{compute_document_minhash_from_pages, pack_minhash};
+
+    let mut updates: Vec<(i64, Option<Vec<u8>>)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "WITH primary_files AS (
+                 SELECT document_id, MIN(id) AS file_id
+                 FROM files
+                 GROUP BY document_id
+             )
+             SELECT pf.document_id, COALESCE(f.page_count, 0), p.page_ord, p.text_content
+             FROM primary_files pf
+             JOIN files f ON f.id = pf.file_id
+             LEFT JOIN passages p
+               ON p.file_id = pf.file_id
+              AND p.is_alt_formula = 0
+              AND (
+                    COALESCE(f.page_count, 0) < 45
+                    OR (
+                        p.page_ord >= MIN(35, MAX(14, (f.page_count * 18) / 100))
+                        AND p.page_ord <= MIN((f.page_count * 90) / 100, MIN(35, MAX(14, (f.page_count * 18) / 100)) + 90)
+                    )
+                  )
+             ORDER BY pf.document_id ASC, p.page_ord ASC, p.chunk_index ASC",
+        )?;
+
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?.max(0) as u32,
+                r.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u32),
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+
+        let mut cur_doc: Option<(i64, u32)> = None;
+        let mut cur_pages: Vec<(u32, String)> = Vec::new();
+
+        let flush_doc = |doc_id: i64,
+                         page_count: u32,
+                         pages: &[(u32, String)],
+                         out: &mut Vec<(i64, Option<Vec<u8>>)>| {
+            let blob = compute_document_minhash_from_pages(
+                pages.iter().map(|(ord, txt)| (*ord, txt.as_str())),
+                page_count,
+            )
+            .map(|sig| pack_minhash(&sig));
+            out.push((doc_id, blob));
+        };
+
+        for row in rows {
+            let (doc_id, page_count, ord_opt, txt_opt) = row?;
+            if let Some((prev_id, prev_pc)) = cur_doc {
+                if prev_id != doc_id {
+                    flush_doc(prev_id, prev_pc, &cur_pages, &mut updates);
+                    cur_pages.clear();
+                    cur_doc = Some((doc_id, page_count));
+                }
+            } else {
+                cur_doc = Some((doc_id, page_count));
+            }
+
+            if let (Some(ord), Some(txt)) = (ord_opt, txt_opt) {
+                if page_count >= 45 {
+                    let start = ((page_count * 18) / 100).clamp(14, 35);
+                    let end = ((page_count * 90) / 100).min(start + 90).max(start + 1);
+                    if ord < start || ord > end {
+                        continue;
+                    }
+                } else if page_count >= 18 {
+                    let start = (page_count / 5).max(4);
+                    let end = page_count.saturating_sub(2).max(start);
+                    if ord < start || ord > end {
+                        continue;
+                    }
+                }
+                if let Some((last_ord, last_txt)) = cur_pages.last_mut() {
+                    if *last_ord == ord {
+                        last_txt.push('\n');
+                        last_txt.push_str(&txt);
+                        continue;
+                    }
+                }
+                cur_pages.push((ord, txt));
+            }
+        }
+
+        if let Some((last_id, last_pc)) = cur_doc {
+            flush_doc(last_id, last_pc, &cur_pages, &mut updates);
+        }
+    }
+
+    {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut upd_stmt =
+                tx.prepare("UPDATE documents SET minhash_sig = ?1 WHERE id = ?2")?;
+            for (doc_id, blob) in &updates {
+                upd_stmt.execute(rusqlite::params![blob, doc_id])?;
+            }
+        }
+        // Purge unresolved false-positive pending groups & stale cached pair results while preserving
+        // all explicit user resolutions ('distinct', 'merged', 'versions', 'editions', 'info_merged').
+        tx.execute_batch(
+            "DELETE FROM duplicate_groups WHERE status = 'pending' AND group_level >= 2;
+             DELETE FROM duplicate_evaluated_pairs WHERE decision IN ('pending', 'clean');",
+        )?;
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![6i64, now],
+        )?;
+        tx.commit()?;
+    }
+
+    refresh_user_decided_pair_hashes(conn)?;
+    if updates.len() >= 2 {
+        let _ = run_duplicate_detection_conn(conn)?;
+    }
+
     Ok(())
 }

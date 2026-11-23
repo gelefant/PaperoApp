@@ -1223,21 +1223,32 @@
     return `${labels.slice(0, 5).join(' → ')} → …`;
   }
 
-  async function handleSaveAndFetchDocMetadata(edit: ManualMetadataEdit, lockedFields: string[]) {
+  async function handleSaveAndFetchDocMetadata(
+    edit: ManualMetadataEdit,
+    lockedFields: string[],
+    overwriteQueryFields = false
+  ) {
     fetchingMeta = true;
     fetchStatusMsg = `Ricerca guidata secondo priorità (${formatActivePriorityChain(settings)})…`;
     try {
-      const res = await api.saveAndFetchDocumentMetadata(edit, lockedFields, true);
+      const res = await api.saveAndFetchDocumentMetadata(
+        edit,
+        lockedFields,
+        true,
+        overwriteQueryFields
+      );
       selectedMeta = res.metadata;
       const outcome = res.outcome;
       if (outcome.status === 'updated') {
-        fetchStatusMsg = `Metadati completati da ${outcome.source ?? 'fonte esterna'} (campi bloccati preservati).`;
+        fetchStatusMsg = overwriteQueryFields
+          ? `Metadati (inclusi titolo e autori ufficiali) aggiornati da ${outcome.source ?? 'fonte esterna'}.`
+          : `Metadati completati da ${outcome.source ?? 'fonte esterna'} (campi bloccati preservati).`;
       } else if (outcome.status === 'verified_locked') {
         fetchStatusMsg = 'Metadati confermati e protetti: rimuovi la spunta ✓ prima di avviare una ricerca online.';
       } else if (outcome.status === 'candidates_found') {
         fetchStatusMsg = `Trovati ${outcome.candidates_count} candidati da confermare qui sotto.`;
       } else if (outcome.status === 'offline_only') {
-        fetchStatusMsg = 'Modalità offline attiva: campi bloccati salvati, nessuna richiesta di rete inviata.';
+        fetchStatusMsg = 'Modalità offline attiva: modifiche salvate localmente, nessuna richiesta di rete inviata.';
       } else {
         fetchStatusMsg = 'Nessuna corrispondenza trovata con i campi inseriti. Prova ad aggiungere o precisare Titolo/Autore.';
       }
@@ -1338,8 +1349,12 @@
     await api.cancelMetadataBatch();
   }
 
-  async function handleConfirmCandidate(documentId: number, candidateId: number) {
-    selectedMeta = await api.confirmCandidate(documentId, candidateId);
+  async function handleConfirmCandidate(
+    documentId: number,
+    candidateId: number,
+    overwriteQueryFields = true
+  ) {
+    selectedMeta = await api.confirmCandidate(documentId, candidateId, overwriteQueryFields);
     fetchStatusMsg = 'Candidato confermato e applicato.';
     await Promise.all([refreshDocuments(true), refreshDuplicates(), refreshTaxonomy()]);
   }

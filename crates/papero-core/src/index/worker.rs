@@ -4,7 +4,7 @@ use crate::db::repos::docs::{
     PassageInsert,
 };
 use crate::db::Database;
-use crate::dedup::{compute_minhash, pack_minhash, run_duplicate_detection};
+use crate::dedup::{compute_document_minhash_from_pages, pack_minhash, run_duplicate_detection};
 use crate::error::{CoreError, Result};
 use crate::extract::chunker::chunk_document;
 use crate::extract::djvu::extract_djvu;
@@ -108,7 +108,7 @@ pub fn run_extract_bm25_queue(
                     let first_pages: Vec<&str> = extracted
                         .pages
                         .iter()
-                        .take(4)
+                        .take(6)
                         .map(|p| p.raw_text.as_str())
                         .collect();
                     let last_page = extracted.pages.last().map(|p| p.raw_text.as_str());
@@ -127,14 +127,14 @@ pub fn run_extract_bm25_queue(
                         extracted.pages.get(1),
                     );
 
-                    let full_text_for_minhash = extracted
-                        .pages
-                        .iter()
-                        .take(15)
-                        .map(|p| p.raw_text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let minhash_blob = compute_minhash(&full_text_for_minhash).map(|s| pack_minhash(&s));
+                    let minhash_blob = compute_document_minhash_from_pages(
+                        extracted
+                            .pages
+                            .iter()
+                            .map(|p| (p.page_ord, p.raw_text.as_str())),
+                        extracted.page_count,
+                    )
+                    .map(|s| pack_minhash(&s));
 
                     let page_inserts: Vec<FilePageInsert> = extracted
                         .pages
@@ -224,12 +224,10 @@ pub fn run_extract_bm25_queue(
 
                         let _ = apply_extracted_identifiers_to_doc(&w, job.document_id, &prep.ids, None);
 
-                        if let Some(blob) = prep.minhash_blob {
-                            let _ = w.execute(
-                                "UPDATE documents SET minhash_sig = ?1 WHERE id = ?2",
-                                params![blob, job.document_id],
-                            );
-                        }
+                        let _ = w.execute(
+                            "UPDATE documents SET minhash_sig = ?1 WHERE id = ?2",
+                            params![prep.minhash_blob, job.document_id],
+                        );
                         let _ = enqueue_index_job(&w, job.file_id, "metadata", 20);
                         let embed_stage = match ModelProfile::from_str_lossy(&config.ml_profile) {
                             ModelProfile::Light => "embed_light",

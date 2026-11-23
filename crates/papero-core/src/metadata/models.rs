@@ -125,6 +125,8 @@ pub struct ExtractedIdentifiers {
     #[serde(default)]
     pub filename_keywords: Vec<String>,
     pub looks_like_book: bool,
+    #[serde(default)]
+    pub is_user_query: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

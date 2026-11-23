@@ -59,15 +59,15 @@ impl LocClient {
             }
         }
 
-        let Some(ti) = ids
+        let ti = ids
             .heuristic_title
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(Vec::new());
-        };
+            .unwrap_or("");
         let au = ids.heuristic_first_author.as_deref().unwrap_or("").trim();
+        if ti.is_empty() && (!ids.is_user_query || au.is_empty()) {
+            return Ok(Vec::new());
+        }
         let cache_key = format!(
             "book:ti={}:au={}",
             normalize_math_text(ti),
@@ -81,18 +81,12 @@ impl LocClient {
             cached.body
         } else {
             let safe_ti = sanitize_cql_term(ti);
-            if safe_ti.is_empty() {
-                return Ok(Vec::new());
-            }
-            let cql = if !au.is_empty() {
-                let safe_au = sanitize_cql_term(au);
-                if safe_au.is_empty() {
-                    format!("dc.title=\"{safe_ti}\"")
-                } else {
-                    format!("dc.title=\"{safe_ti}\" and dc.creator=\"{safe_au}\"")
-                }
-            } else {
-                format!("dc.title=\"{safe_ti}\"")
+            let safe_au = sanitize_cql_term(au);
+            let cql = match (!safe_ti.is_empty(), !safe_au.is_empty()) {
+                (true, true) => format!("dc.title all \"{safe_ti}\" and dc.creator all \"{safe_au}\""),
+                (true, false) => format!("dc.title all \"{safe_ti}\""),
+                (false, true) => format!("dc.creator all \"{safe_au}\""),
+                (false, false) => return Ok(Vec::new()),
             };
             let url = format!(
                 "{LOC_SRU_BASE}?version=1.1&operation=searchRetrieve&recordSchema=mods&maximumRecords=5&query={}",
