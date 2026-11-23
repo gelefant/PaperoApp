@@ -123,14 +123,16 @@ impl MrLookupClient {
                     prose_core_retry = Some((clean_prose, p_ck));
                 }
             }
-            let sig_q = extract_significant_mrlookup_query(ti);
-            if !sig_q.is_empty() && sig_q != cleaned_ti_q {
-                let s_ck = format!(
-                    "qsig:ti={}:au={}",
-                    normalize_math_text(&sig_q),
-                    normalize_math_text(&clean_au)
-                );
-                sig_words_retry = Some((sig_q, s_ck));
+            if ids.is_user_query {
+                let sig_q = extract_significant_mrlookup_query(ti);
+                if !sig_q.is_empty() && sig_q != cleaned_ti_q {
+                    let s_ck = format!(
+                        "qsig:ti={}:au={}",
+                        normalize_math_text(&sig_q),
+                        normalize_math_text(&clean_au)
+                    );
+                    sig_words_retry = Some((sig_q, s_ck));
+                }
             }
         }
 
@@ -464,7 +466,12 @@ pub fn score_candidate(rec: &BibliographicRecord, ids: &ExtractedIdentifiers) ->
                         let floor = if q_tok_cnt >= 3 {
                             0.93 + 0.03 * prec_ratio + year_bonus.min(0.02)
                         } else if q_tok_cnt == 2 {
-                            0.90 + 0.05 * prec_ratio + year_bonus.min(0.03)
+                            if prec_ratio >= 0.40 {
+                                0.90 + 0.05 * prec_ratio + year_bonus.min(0.03)
+                            } else {
+                                // Surface 2-word fragment inside a much longer title as confirmable candidate
+                                0.82 + 0.06 * prec_ratio
+                            }
                         } else if r_tok_cnt == 1 {
                             0.92 + year_bonus.min(0.04)
                         } else {
@@ -472,20 +479,22 @@ pub fn score_candidate(rec: &BibliographicRecord, ids: &ExtractedIdentifiers) ->
                         };
                         score = score.max(floor);
                     } else if !has_query_author {
-                        let floor = if q_tok_cnt >= 4 {
+                        let floor = if q_tok_cnt >= 4 && prec_ratio >= 0.45 {
                             0.90 + 0.06 * prec_ratio + year_bonus.min(0.02)
-                        } else if q_tok_cnt == 3 {
-                            0.85 + 0.09 * prec_ratio + year_bonus.min(0.03)
+                        } else if q_tok_cnt >= 3 {
+                            0.82 + 0.07 * prec_ratio
                         } else {
-                            0.72 + 0.14 * prec_ratio + year_bonus.min(0.03)
+                            0.72 + 0.12 * prec_ratio
                         };
                         score = score.max(floor);
                     }
                 } else if q_tok_cnt >= 4 && rec_ratio >= 0.75 {
+                    // At least one user-supplied word is missing from the candidate title:
+                    // surface as a reviewable candidate (< 0.85), never auto-overwrite!
                     let floor = if has_query_author && author_sim >= 0.88 {
-                        0.82 + 0.08 * rec_ratio + year_bonus.min(0.04)
+                        0.76 + 0.06 * rec_ratio
                     } else if !has_query_author {
-                        0.68 + 0.12 * rec_ratio
+                        0.66 + 0.10 * rec_ratio
                     } else {
                         0.0
                     };

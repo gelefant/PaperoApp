@@ -99,6 +99,9 @@
   let activeTabId = $state<string | null>(null);
   let contextTarget = $state<ContextTarget | null>(null);
   let topBarRef = $state<{ focusSearch?: () => void } | null>(null);
+  let inspectorRef = $state<{ savePendingIfForDoc: (docId: number) => Promise<void> } | null>(
+    null
+  );
   let settingsOpen = $state(false);
   let settingsInitialTab = $state<SettingsTabId | null>(null);
   let wizardOpen = $state(false);
@@ -754,6 +757,10 @@
   ) {
     const prevList = documents;
     const prevIdx = prevList.findIndex((d) => d.document_id === documentId);
+
+    if (verified && inspectorOpen && selectedDocId === documentId) {
+      await inspectorRef?.savePendingIfForDoc(documentId);
+    }
 
     const updated = await api.setDocumentMetadataVerified(documentId, verified);
     if (selectedDocId === documentId) {
@@ -1697,6 +1704,7 @@
       {#if inspectorOpen}
         <section class="inspector-pane">
           <RightInspector
+            bind:this={inspectorRef}
             meta={selectedMeta}
             {selectedFileId}
             {clusters}

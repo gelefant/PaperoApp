@@ -976,10 +976,8 @@ pub async fn save_and_fetch_document_metadata(
                 let effective_locks: Vec<String> = locked_fields
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|f| {
-                        let t = f.trim();
-                        t != "title" && t != "authors"
-                    })
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty())
                     .collect();
                 let hints = prepare_guided_search_edit(&db_save, &edit, &effective_locks)
                     .map_err(|e| e.to_string())?;

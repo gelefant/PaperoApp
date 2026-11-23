@@ -208,12 +208,15 @@
     abstractText = meta.abstract_text ?? '';
     tagsText = meta.tags.join(', ');
     excludeFromCloud = meta.exclude_from_cloud_llm;
-    lockedFields = meta.manual_locked_fields.filter(
+    const nextLocked = meta.manual_locked_fields.filter(
       (f) => f !== 'tags' && f !== 'exclude_from_cloud_llm'
     );
+    lockedFields = nextLocked;
     if (meta.document_id !== lastDocId) {
       lastDocId = meta.document_id;
-      overwriteQueryFields = true;
+      overwriteQueryFields = !nextLocked.includes('title') && !nextLocked.includes('authors');
+    } else if (nextLocked.includes('title') || nextLocked.includes('authors')) {
+      overwriteQueryFields = false;
     }
     locksModified = false;
     touched = [];
@@ -264,6 +267,21 @@
     if (overwriteQueryFields) {
       const next = lockedFields.filter((f) => f !== 'title' && f !== 'authors');
       if (next.length !== lockedFields.length) {
+        lockedFields = next;
+        locksModified = true;
+      }
+    } else {
+      const next = [...lockedFields];
+      let changed = false;
+      if (title.trim() && !next.includes('title')) {
+        next.push('title');
+        changed = true;
+      }
+      if (authorsText.trim() && !next.includes('authors')) {
+        next.push('authors');
+        changed = true;
+      }
+      if (changed) {
         lockedFields = next;
         locksModified = true;
       }
@@ -322,21 +340,57 @@
     };
   }
 
+  function hasUnsavedFormDiff(): boolean {
+    if (!meta) return false;
+    if (touched.length > 0 || locksModified) return true;
+    if (title.trim() !== (meta.title ?? '').trim()) return true;
+    if (authorsText.trim() !== formatAuthorsForInput(meta.authors).trim()) return true;
+    return false;
+  }
+
+  function computeEffectiveSaveLocks(): string[] {
+    const saveLocks = [...lockedFields];
+    const titleChanged =
+      touched.includes('title') || (meta !== null && title.trim() !== (meta.title ?? '').trim());
+    const authorsChanged =
+      touched.includes('authors') ||
+      (meta !== null && authorsText.trim() !== formatAuthorsForInput(meta.authors).trim());
+    if (titleChanged && title.trim() && !saveLocks.includes('title')) {
+      saveLocks.push('title');
+    }
+    if (authorsChanged && authorsText.trim() && !saveLocks.includes('authors')) {
+      saveLocks.push('authors');
+    }
+    return saveLocks;
+  }
+
+  export async function savePendingIfForDoc(docId: number): Promise<void> {
+    if (!meta || meta.document_id !== docId) return;
+    if (!hasUnsavedFormDiff()) return;
+    const payload = buildEditPayload(false);
+    if (!payload) return;
+    const saveLocks = computeEffectiveSaveLocks();
+    await onSave(payload, saveLocks);
+    lockedFields = saveLocks;
+    if (saveLocks.includes('title') || saveLocks.includes('authors')) {
+      overwriteQueryFields = false;
+    }
+    touched = [];
+    locksModified = false;
+  }
+
   async function handleSave(e: Event) {
     e.preventDefault();
     const payload = buildEditPayload(false);
     if (!payload) return;
-    const saveLocks = [...lockedFields];
-    if (touched.includes('title') && title.trim() && !saveLocks.includes('title')) {
-      saveLocks.push('title');
-    }
-    if (touched.includes('authors') && authorsText.trim() && !saveLocks.includes('authors')) {
-      saveLocks.push('authors');
-    }
+    const saveLocks = computeEffectiveSaveLocks();
     saving = true;
     try {
       await onSave(payload, saveLocks);
       lockedFields = saveLocks;
+      if (saveLocks.includes('title') || saveLocks.includes('authors')) {
+        overwriteQueryFields = false;
+      }
       touched = [];
       locksModified = false;
     } finally {
@@ -380,31 +434,43 @@
 
   async function handleTopFetchClick() {
     if (!meta) return;
-    if (touched.length > 0 || locksModified) {
+    const docId = meta.document_id;
+    if (hasUnsavedFormDiff()) {
       const payload = buildEditPayload(false);
       if (payload) {
-        await onSave(payload, lockedFields);
+        const saveLocks = computeEffectiveSaveLocks();
+        await onSave(payload, saveLocks);
+        lockedFields = saveLocks;
+        if (saveLocks.includes('title') || saveLocks.includes('authors')) {
+          overwriteQueryFields = false;
+        }
         touched = [];
         locksModified = false;
       }
     }
-    await onFetchMetadata(meta.document_id);
+    await onFetchMetadata(docId);
   }
 
   async function handleToggleVerifiedClick(advanceNext = false) {
     if (!meta || !onToggleVerified) return;
+    const docId = meta.document_id;
     const nextState = advanceNext ? true : !meta.metadata_verified;
     saving = true;
     try {
-      if (nextState && (touched.length > 0 || locksModified)) {
+      if (nextState && hasUnsavedFormDiff()) {
         const payload = buildEditPayload(false);
         if (payload) {
-          await onSave(payload, lockedFields);
+          const saveLocks = computeEffectiveSaveLocks();
+          await onSave(payload, saveLocks);
+          lockedFields = saveLocks;
+          if (saveLocks.includes('title') || saveLocks.includes('authors')) {
+            overwriteQueryFields = false;
+          }
           touched = [];
           locksModified = false;
         }
       }
-      await onToggleVerified(meta.document_id, nextState, advanceNext);
+      await onToggleVerified(docId, nextState, advanceNext);
     } finally {
       saving = false;
     }
@@ -651,7 +717,18 @@
 
     {#if meta.pending_candidates.length > 0}
       <section class="candidates-box">
-        <strong>Candidati ambigui ({meta.pending_candidates.length})</strong>
+        <div class="cand-box-header">
+          <strong>Candidati ambigui ({meta.pending_candidates.length})</strong>
+          <button
+            type="button"
+            class="mini-no"
+            disabled={saving || fetchingOnline}
+            onclick={() => handleToggleVerifiedClick(false)}
+            title="Ignora questi candidati errati, mantieni il tuo Titolo/Autore e segna i metadati come controllati"
+          >
+            ✓ Tieni i miei dati
+          </button>
+        </div>
         {#each meta.pending_candidates as cand (cand.id)}
           {@const venue =
             cand.record.booktitle || cand.record.journal_abbrev || cand.record.journal_full}
@@ -1171,6 +1248,12 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--bg-muted);
+  }
+  .cand-box-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
   }
   .cand-card {
     padding: 6px;

@@ -1640,7 +1640,7 @@ fn build_guided_context_from_hints(
             heuristic_year: hints.year,
             filename_keywords: Vec::new(),
             looks_like_book,
-            is_user_query: true,
+            is_user_query: !locked_title_flag,
         },
         db_title: clean_title,
         verify_text: None,
@@ -1951,7 +1951,7 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
                 heuristic_year: if locked_year_flag { year } else { None },
                 filename_keywords: Vec::new(),
                 looks_like_book,
-                is_user_query: true,
+                is_user_query: !locked_title_flag,
             },
             db_title,
             verify_text: None,
@@ -3005,6 +3005,10 @@ pub fn set_document_metadata_verified(
         }
         if verified {
             clear_metadata_jobs_for_doc(&tx, document_id)?;
+            tx.execute(
+                "DELETE FROM metadata_candidates WHERE document_id = ?1",
+                params![document_id],
+            )?;
         }
 
         let hashes: Vec<String> = {
@@ -4405,6 +4409,7 @@ mod tests {
         let db = Database::open(&dir.path().join("prio.db"), 2).unwrap();
         let mut cfg = AppConfig {
             crossref_enabled: false,
+            dblp_enabled: false,
             openalex_enabled: false,
             datacite_enabled: false,
             inspirehep_enabled: false,
@@ -4417,7 +4422,10 @@ mod tests {
             openlibrary_enabled: false,
             ..Default::default()
         };
-        let clients = WaterfallClients::from_config(&cfg).unwrap();
+        let mut clients = WaterfallClients::from_config(&cfg).unwrap();
+        clients.mrlookup = clients
+            .mrlookup
+            .with_endpoint("http://127.0.0.1:9/offline", std::time::Duration::from_millis(1));
 
         let title = "On the existence uniqueness and approximation of saddle point problems";
         let mrlookup_cache_key = format!("q:ti={}:au=brezzi:yr=0", normalize_math_text(title));
@@ -6420,9 +6428,10 @@ mod tests {
             openlibrary_enabled: false,
             ..AppConfig::default()
         };
-        let clients = WaterfallClients::from_config(&cfg).unwrap();
-
-        // 1. Non-adjacent partial title words + surname -> resolves full official title, full given name, and verbatim BibTeX
+        let mut clients = WaterfallClients::from_config(&cfg).unwrap();
+        clients.mrlookup = clients
+            .mrlookup
+            .with_endpoint("http://127.0.0.1:9/offline", std::time::Duration::from_millis(1));
         let mrlookup_brezzi_html = r#"<html><body><pre>
 @article {MR0365287,
     AUTHOR = {Brezzi, Franco},
@@ -6616,38 +6625,116 @@ mod tests {
         assert!(confirmed.raw_mrlookup_bibtex.is_some());
 
         // 4. Local catalog search matches non-adjacent partial title words, ':' vs '-' subtitles, and combined author+title
-        let r_conn = db.reader();
-        let hits_non_adj = search_documents_metadata(
-            &r_conn,
-            &MetadataSearchFilter {
-                title: Some("existence saddle lagrangian".to_string()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(hits_non_adj.len(), 1);
-        assert_eq!(hits_non_adj[0].document_id, doc_brezzi);
+        {
+            let r_conn = db.reader();
+            let hits_non_adj = search_documents_metadata(
+                &r_conn,
+                &MetadataSearchFilter {
+                    title: Some("existence saddle lagrangian".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(hits_non_adj.len(), 1);
+            assert_eq!(hits_non_adj[0].document_id, doc_brezzi);
 
-        let hits_sub = search_documents_metadata(
-            &r_conn,
-            &MetadataSearchFilter {
-                title: Some("numeri primi - lungo cammino".to_string()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(hits_sub.len(), 1);
-        assert_eq!(hits_sub[0].document_id, doc_book);
+            let hits_sub = search_documents_metadata(
+                &r_conn,
+                &MetadataSearchFilter {
+                    title: Some("numeri primi - lungo cammino".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(hits_sub.len(), 1);
+            assert_eq!(hits_sub[0].document_id, doc_book);
 
-        let hits_combined = search_documents_metadata(
-            &r_conn,
-            &MetadataSearchFilter {
-                text: Some("fortin mixed finite".to_string()),
-                ..Default::default()
-            },
+            let hits_combined = search_documents_metadata(
+                &r_conn,
+                &MetadataSearchFilter {
+                    text: Some("fortin mixed finite".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(hits_combined.len(), 1);
+            assert_eq!(hits_combined[0].document_id, doc_author_only);
+        }
+
+        // 5. Locked title + author when work is NOT in database (only a wrong work by same author shares words):
+        //    must NOT auto-accept wrong metadata, must preserve imposed title/author, and marking verified clears candidates!
+        let doc_locked_missing = {
+            let w = db.writer();
+            let d = create_heuristic_document(&w, "Titolo errato trovato prima").unwrap();
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d,
+                    root_id: "r_guided_partial",
+                    rel_path: "dispense_brezzi.pdf",
+                    format: "pdf",
+                    size_bytes: 9_000,
+                    mtime_ns: 4,
+                    blake3_hash: "h_partial_4",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            w.execute(
+                "UPDATE documents SET journal_abbrev = 'Wrong J.', doi = '10.9999/wrong', metadata_source = 'mrlookup' WHERE id = ?1",
+                params![d],
+            )
+            .unwrap();
+            d
+        };
+
+        let locked_missing_title = "Appunti su saddle point problems";
+        crate::metadata::limiter::store_http_cache(
+            &db,
+            "mrlookup",
+            &format!("q:ti={}:au=brezzi:yr=0", normalize_math_text(locked_missing_title)),
+            200,
+            mrlookup_brezzi_html,
         )
         .unwrap();
-        assert_eq!(hits_combined.len(), 1);
-        assert_eq!(hits_combined[0].document_id, doc_author_only);
+
+        apply_manual_metadata_edit_with_locks(
+            &db,
+            &ManualMetadataEdit {
+                document_id: doc_locked_missing,
+                work_type: "book".to_string(),
+                title: locked_missing_title.to_string(),
+                authors: vec![BibliographicAuthor {
+                    family_name: "Brezzi".to_string(),
+                    given_name: "Franco".to_string(),
+                    role: "author".to_string(),
+                }],
+                edited_fields: vec!["title".to_string(), "authors".to_string()],
+                ..Default::default()
+            },
+            Some(&["title".to_string(), "authors".to_string()]),
+            true,
+        )
+        .unwrap();
+
+        let out_locked = resolve_document_metadata(
+            &db,
+            &clients,
+            &cfg,
+            doc_locked_missing,
+            MetadataLookupScope::SingleRecordUserAction,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            out_locked.status, "updated",
+            "must never auto-apply wrong paper when locked title is absent from DB"
+        );
+        let verified_meta = set_document_metadata_verified(&db, doc_locked_missing, true).unwrap();
+        assert!(verified_meta.metadata_verified);
+        assert_eq!(verified_meta.title, locked_missing_title);
+        assert_eq!(verified_meta.authors[0].family_name, "Brezzi");
+        assert!(verified_meta.doi.is_none());
+        assert!(verified_meta.pending_candidates.is_empty());
     }
 }
