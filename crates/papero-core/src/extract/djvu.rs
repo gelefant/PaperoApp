@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+const MAX_SEXPR_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, PartialEq)]
 enum SExpr {
     Atom(String),
@@ -186,7 +188,7 @@ pub fn extract_djvu_single_page_spans(
                 }
             }
         }
-        collect_granular_text_spans(&expr, page_w, page_h, &mut spans);
+        collect_granular_text_spans(&expr, page_w, page_h, &mut spans, 0);
     }
     Ok(spans)
 }
@@ -196,7 +198,11 @@ fn collect_granular_text_spans(
     page_w: f32,
     page_h: f32,
     spans: &mut Vec<ExtractedSpan>,
+    depth: usize,
 ) {
+    if depth >= MAX_SEXPR_DEPTH {
+        return;
+    }
     let SExpr::List(items) = expr else {
         return;
     };
@@ -211,7 +217,7 @@ fn collect_granular_text_spans(
             as_f32(&items[4]),
         ) {
             let mut txt = String::new();
-            collect_strings_in_children(&items[5..], &mut txt);
+            collect_strings_in_children(&items[5..], &mut txt, depth + 1);
             let trimmed = txt.trim();
             if !trimmed.is_empty() {
                 if let Some(bbox) =
@@ -232,7 +238,7 @@ fn collect_granular_text_spans(
         });
         if has_nested_words {
             for child in &items[5..] {
-                collect_granular_text_spans(child, page_w, page_h, spans);
+                collect_granular_text_spans(child, page_w, page_h, spans, depth + 1);
             }
         } else if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) = (
             as_f32(&items[1]),
@@ -241,7 +247,7 @@ fn collect_granular_text_spans(
             as_f32(&items[4]),
         ) {
             let mut line_text = String::new();
-            collect_strings_in_children(&items[5..], &mut line_text);
+            collect_strings_in_children(&items[5..], &mut line_text, depth + 1);
             let trimmed = line_text.trim();
             if !trimmed.is_empty() {
                 if let Some(bbox) =
@@ -257,7 +263,7 @@ fn collect_granular_text_spans(
         return;
     }
     for child in items.iter().skip(1) {
-        collect_granular_text_spans(child, page_w, page_h, spans);
+        collect_granular_text_spans(child, page_w, page_h, spans, depth + 1);
     }
 }
 
@@ -282,11 +288,24 @@ fn run_djvused(bin: &str, file: &Path, script: &str) -> Result<String> {
             }
         })?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes())?;
-    }
+    // Feed `stdin` concurrently while draining `stdout`/`stderr`: on Windows, anonymous pipe
+    // buffers default to 4 KB, so writing a >150-page `select N; size; print-txt` script before
+    // reading `stdout` can otherwise deadlock both processes.
+    let stdin_opt = child.stdin.take();
+    let (write_res, output) = std::thread::scope(|s| {
+        let writer = s.spawn(move || -> std::io::Result<()> {
+            if let Some(mut stdin) = stdin_opt {
+                stdin.write_all(script.as_bytes())?;
+            }
+            Ok(())
+        });
+        let out = child.wait_with_output();
+        let w_res = writer
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("djvused stdin writer panicked")));
+        out.map(|o| (w_res, o))
+    })?;
 
-    let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(CoreError::CorruptFile(format!(
@@ -294,6 +313,7 @@ fn run_djvused(bin: &str, file: &Path, script: &str) -> Result<String> {
             output.status, stderr
         )));
     }
+    write_res?;
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -413,12 +433,12 @@ fn extract_page_sexpr(
                 }
             }
             for child in &items[5..] {
-                collect_djvu_text_nodes(child, *page_w, *page_h, spans, raw_text);
+                collect_djvu_text_nodes(child, *page_w, *page_h, spans, raw_text, 0);
             }
             return;
         }
     }
-    collect_djvu_text_nodes(expr, *page_w, *page_h, spans, raw_text);
+    collect_djvu_text_nodes(expr, *page_w, *page_h, spans, raw_text, 0);
 }
 
 fn collect_djvu_text_nodes(
@@ -427,7 +447,11 @@ fn collect_djvu_text_nodes(
     page_h: f32,
     spans: &mut Vec<ExtractedSpan>,
     raw_text: &mut String,
+    depth: usize,
 ) {
+    if depth >= MAX_SEXPR_DEPTH {
+        return;
+    }
     let SExpr::List(items) = expr else {
         return;
     };
@@ -443,7 +467,7 @@ fn collect_djvu_text_nodes(
             as_f32(&items[4]),
         ) {
             let mut line_text = String::new();
-            collect_strings_in_children(&items[5..], &mut line_text);
+            collect_strings_in_children(&items[5..], &mut line_text, depth + 1);
             let trimmed = line_text.trim();
             if !trimmed.is_empty() {
                 if !raw_text.is_empty() {
@@ -471,7 +495,7 @@ fn collect_djvu_text_nodes(
             as_f32(&items[4]),
         ) {
             let mut txt = String::new();
-            collect_strings_in_children(&items[5..], &mut txt);
+            collect_strings_in_children(&items[5..], &mut txt, depth + 1);
             let trimmed = txt.trim();
             if !trimmed.is_empty() {
                 if !raw_text.is_empty() {
@@ -493,11 +517,14 @@ fn collect_djvu_text_nodes(
 
     // Container nodes: column, region, para, etc.
     for child in items.iter().skip(1) {
-        collect_djvu_text_nodes(child, page_w, page_h, spans, raw_text);
+        collect_djvu_text_nodes(child, page_w, page_h, spans, raw_text, depth + 1);
     }
 }
 
-fn collect_strings_in_children(nodes: &[SExpr], out: &mut String) {
+fn collect_strings_in_children(nodes: &[SExpr], out: &mut String, depth: usize) {
+    if depth >= MAX_SEXPR_DEPTH {
+        return;
+    }
     for node in nodes {
         match node {
             SExpr::Str(s) => {
@@ -517,7 +544,7 @@ fn collect_strings_in_children(nodes: &[SExpr], out: &mut String) {
                 } else {
                     0
                 };
-                collect_strings_in_children(&children[start_idx..], out);
+                collect_strings_in_children(&children[start_idx..], out, depth + 1);
             }
             SExpr::Atom(_) => {}
         }
@@ -549,11 +576,14 @@ pub fn parse_djvu_outline(input: &str) -> Vec<OutlineItem> {
     };
     items[start..]
         .iter()
-        .filter_map(parse_bookmark_node)
+        .filter_map(|e| parse_bookmark_node(e, 0))
         .collect()
 }
 
-fn parse_bookmark_node(expr: &SExpr) -> Option<OutlineItem> {
+fn parse_bookmark_node(expr: &SExpr, depth: usize) -> Option<OutlineItem> {
+    if depth >= MAX_SEXPR_DEPTH {
+        return None;
+    }
     let SExpr::List(items) = expr else {
         return None;
     };
@@ -571,7 +601,7 @@ fn parse_bookmark_node(expr: &SExpr) -> Option<OutlineItem> {
     }
     let children = items[child_start..]
         .iter()
-        .filter_map(parse_bookmark_node)
+        .filter_map(|e| parse_bookmark_node(e, depth + 1))
         .collect();
     Some(OutlineItem {
         title,
@@ -580,7 +610,45 @@ fn parse_bookmark_node(expr: &SExpr) -> Option<OutlineItem> {
     })
 }
 
+fn skip_balanced_parens(bytes: &[u8], open_paren_pos: usize) -> usize {
+    let mut pos = open_paren_pos + 1;
+    let mut nesting = 1usize;
+    while pos < bytes.len() && nesting > 0 {
+        match bytes[pos] {
+            b'"' => {
+                pos += 1;
+                while pos < bytes.len() {
+                    if bytes[pos] == b'\\' {
+                        pos = (pos + 2).min(bytes.len());
+                    } else if bytes[pos] == b'"' {
+                        pos += 1;
+                        break;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+            b'(' => {
+                nesting += 1;
+                pos += 1;
+            }
+            b')' => {
+                nesting -= 1;
+                pos += 1;
+            }
+            _ => {
+                pos += 1;
+            }
+        }
+    }
+    pos
+}
+
 fn parse_one_sexpr(input: &str, start: usize) -> Option<(SExpr, usize)> {
+    parse_one_sexpr_depth(input, start, 0)
+}
+
+fn parse_one_sexpr_depth(input: &str, start: usize, depth: usize) -> Option<(SExpr, usize)> {
     let bytes = input.as_bytes();
     let mut pos = start;
     while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
@@ -591,6 +659,10 @@ fn parse_one_sexpr(input: &str, start: usize) -> Option<(SExpr, usize)> {
     }
     match bytes[pos] {
         b'(' => {
+            if depth >= MAX_SEXPR_DEPTH {
+                let end = skip_balanced_parens(bytes, pos);
+                return Some((SExpr::List(Vec::new()), end));
+            }
             pos += 1;
             let mut items = Vec::new();
             loop {
@@ -604,7 +676,7 @@ fn parse_one_sexpr(input: &str, start: usize) -> Option<(SExpr, usize)> {
                     pos += 1;
                     break;
                 }
-                let (child, next) = parse_one_sexpr(input, pos)?;
+                let (child, next) = parse_one_sexpr_depth(input, pos, depth + 1)?;
                 items.push(child);
                 pos = next;
             }
@@ -729,5 +801,25 @@ mod tests {
         assert_eq!(items[0].children.len(), 1);
         assert_eq!(items[0].children[0].page_ord, Some(3));
         assert_eq!(items[1].page_ord, Some(42));
+    }
+
+    #[test]
+    fn deeply_nested_djvu_sexpr_respects_depth_cap_without_stack_overflow() {
+        let depth = 2500usize;
+        let mut raw = String::from("width=1000 height=1400\n(page 0 0 1000 1400 ");
+        raw.push_str(&"(".repeat(depth));
+        raw.push_str("\"deep \\\"leaf\\\"\"");
+        raw.push_str(&")".repeat(depth));
+        raw.push_str(" (line 10 1200 500 1300 \"Visible Header\"))\n");
+
+        // Run on a tiny 512 KB stack (smaller than Windows's 1 MB default) to prove stack safety.
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || parse_djvused_pages_output(&raw, 1, Vec::new()).unwrap())
+            .unwrap();
+        let doc = handle.join().unwrap();
+        assert_eq!(doc.pages.len(), 1);
+        assert_eq!(doc.pages[0].spans.len(), 1);
+        assert_eq!(doc.pages[0].spans[0].text, "Visible Header");
     }
 }

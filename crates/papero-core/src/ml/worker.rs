@@ -75,8 +75,12 @@ impl MlWorkerClient {
         let mut cmd = Command::new(&exe);
         cmd.arg("--ml-worker")
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stdout(Stdio::piped());
+
+        #[cfg(all(target_os = "windows", not(debug_assertions)))]
+        cmd.stderr(Stdio::null());
+        #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+        cmd.stderr(Stdio::inherit());
 
         #[cfg(target_os = "windows")]
         {

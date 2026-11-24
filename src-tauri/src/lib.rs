@@ -60,10 +60,112 @@ fn report_fatal_startup_error(context: &str, detail: &str) -> ! {
     std::process::exit(1);
 }
 
+#[cfg(target_os = "windows")]
+mod win_seh_logger {
+    use std::ffi::c_void;
+    use std::io::Write as _;
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        exception_code: u32,
+        exception_flags: u32,
+        exception_record: *mut ExceptionRecord,
+        exception_address: *mut c_void,
+        number_parameters: u32,
+        exception_information: [usize; 15],
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        exception_record: *mut ExceptionRecord,
+        context_record: *mut c_void,
+    }
+
+    type TopLevelExceptionFilter =
+        Option<unsafe extern "system" fn(*const ExceptionPointers) -> i32>;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetUnhandledExceptionFilter(
+            lp_top_level_exception_filter: TopLevelExceptionFilter,
+        ) -> TopLevelExceptionFilter;
+        fn GetModuleHandleExW(
+            dw_flags: u32,
+            lp_module_name: *const u16,
+            ph_module: *mut *mut c_void,
+        ) -> i32;
+        fn GetModuleFileNameW(
+            h_module: *mut c_void,
+            lp_filename: *mut u16,
+            n_size: u32,
+        ) -> u32;
+    }
+
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    unsafe extern "system" fn unhandled_seh_handler(info: *const ExceptionPointers) -> i32 {
+        if !info.is_null() {
+            let rec = (*info).exception_record;
+            if !rec.is_null() {
+                let code = (*rec).exception_code;
+                let addr = (*rec).exception_address;
+                if code != STATUS_STACK_OVERFLOW {
+                    let mut hmod: *mut c_void = std::ptr::null_mut();
+                    let mut mod_name = String::from("<unknown>");
+                    if GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                            | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        addr as *const u16,
+                        &mut hmod,
+                    ) != 0
+                        && !hmod.is_null()
+                    {
+                        let mut buf = [0u16; 512];
+                        let len =
+                            GetModuleFileNameW(hmod, buf.as_mut_ptr(), buf.len() as u32) as usize;
+                        if len > 0 && len <= buf.len() {
+                            mod_name = String::from_utf16_lossy(&buf[..len]);
+                        }
+                    }
+                    let crash_path = super::startup_crash_log_path();
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&crash_path)
+                    {
+                        let _ = writeln!(
+                            file,
+                            "win32_seh_crash: code=0x{code:08X} addr={addr:p} module={mod_name}"
+                        );
+                    }
+                }
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    pub fn install() {
+        // SAFETY: `unhandled_seh_handler` is a valid `"system"` callback with static lifetime.
+        unsafe {
+            let _ = SetUnhandledExceptionFilter(Some(unhandled_seh_handler));
+        }
+    }
+}
+
 fn install_panic_logger() {
+    #[cfg(target_os = "windows")]
+    win_seh_logger::install();
+
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let msg = format!("panic: {info}");
+        let thread_name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
+        let msg = format!("panic [thread={thread_name}]: {info}");
         tracing::error!("{msg}");
         let crash_path = startup_crash_log_path();
         if let Ok(mut file) = std::fs::OpenOptions::new()

@@ -1,9 +1,14 @@
 #Requires -Version 5.1
 param(
     [string]$OnnxRuntimeVersion = $(if ($env:ONNXRUNTIME_VERSION) { $env:ONNXRUNTIME_VERSION } else { "1.23.2" }),
-    [string]$PdfiumBaseUrl = $(if ($env:PDFIUM_BASE_URL) { $env:PDFIUM_BASE_URL } else { "https://github.com/bblanchon/pdfium-binaries/releases/latest/download" }),
+    [string]$PdfiumVersion = $(if ($env:PDFIUM_VERSION) { $env:PDFIUM_VERSION } else { "7543" }),
+    [string]$PdfiumBaseUrl = $(if ($env:PDFIUM_BASE_URL) { $env:PDFIUM_BASE_URL } else { "" }),
     [string]$DjvuBinDir = $env:DJVULIBRE_BIN_DIR
 )
+
+if (-not $PdfiumBaseUrl) {
+    $PdfiumBaseUrl = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F$PdfiumVersion"
+}
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -42,8 +47,8 @@ function Download-Cached {
     Move-Item -Force $Tmp $Dest
 }
 
-# 1. PDFium (strictly non-V8 Windows x64)
-$PdfiumArchive = Join-Path $CacheDir "pdfium-win-x64.tgz"
+# 1. PDFium (strictly non-V8 Windows x64, pinned to match pdfium-render's bindgen ABI)
+$PdfiumArchive = Join-Path $CacheDir "pdfium-win-x64-$PdfiumVersion.tgz"
 Download-Cached "$PdfiumBaseUrl/pdfium-win-x64.tgz" $PdfiumArchive
 $PdfiumExtract = Join-Path $CacheDir "pdfium_win"
 if (Test-Path $PdfiumExtract) { Remove-Item -Recurse -Force $PdfiumExtract }

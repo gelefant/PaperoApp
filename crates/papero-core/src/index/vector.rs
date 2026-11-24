@@ -341,7 +341,25 @@ impl VectorIndex {
             .index
             .save(tmp_str)
             .map_err(|e| CoreError::Config(format!("failed saving usearch temp file: {e}")))?;
-        fs::rename(&tmp_path, &self.path)?;
+
+        let mut rename_err = None;
+        for attempt in 0..4 {
+            match fs::rename(&tmp_path, &self.path) {
+                Ok(()) => {
+                    rename_err = None;
+                    break;
+                }
+                Err(e) => {
+                    rename_err = Some(e);
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+            }
+        }
+        if let Some(e) = rename_err {
+            return Err(CoreError::Io(e));
+        }
 
         let mapped = Index::new(&index_options(self.dimensions))
             .map_err(|e| CoreError::Config(format!("failed opening usearch mmap view: {e}")))?;

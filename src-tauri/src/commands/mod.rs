@@ -330,31 +330,50 @@ pub async fn trigger_rescan(
 
     let _ = on_event.send(ScanProgressEvent::Started);
 
-    let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let summary = match rescan_sources(&db, Some(&bm25), only_root_id.as_deref(), Some(&ctrl)) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = e.to_string();
-                let _ = on_event.send(ScanProgressEvent::Error { message: msg.clone() });
-                return Err(msg);
-            }
-        };
-        let _ = on_event.send(ScanProgressEvent::ScanDone { summary });
+    let on_event_err = on_event.clone();
+    let res = match tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+            let summary = match rescan_sources(&db, Some(&bm25), only_root_id.as_deref(), Some(&ctrl)) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let _ = on_event.send(ScanProgressEvent::Error { message: msg.clone() });
+                    return Err(msg);
+                }
+            };
+            let _ = on_event.send(ScanProgressEvent::ScanDone { summary });
 
-        let report = match run_extract_bm25_queue(&db, &bm25, &cfg, Some(&ctrl)) {
+            let report = match run_extract_bm25_queue(&db, &bm25, &cfg, Some(&ctrl)) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let _ = on_event.send(ScanProgressEvent::Error { message: msg.clone() });
+                    return Err(msg);
+                }
+            };
+            let _ = on_event.send(ScanProgressEvent::IndexingDone { report });
+            let _ = on_event.send(ScanProgressEvent::Finished);
+            Ok(())
+        }));
+        match inner {
             Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                let _ = on_event.send(ScanProgressEvent::Error { message: msg.clone() });
-                return Err(msg);
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown rescan panic");
+                let msg = format!("Errore interno durante la scansione: {detail}");
+                let _ = on_event_err.send(ScanProgressEvent::Error { message: msg.clone() });
+                Err(msg)
             }
-        };
-        let _ = on_event.send(ScanProgressEvent::IndexingDone { report });
-        let _ = on_event.send(ScanProgressEvent::Finished);
-        Ok(())
+        }
     })
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(r) => r,
+        Err(join_err) => Err(join_err.to_string()),
+    };
 
     {
         let mut slot = state.scan_control.lock().expect("scan_control poisoned");
@@ -1448,15 +1467,18 @@ fn spawn_background_embedder(state: Arc<AppState>) {
             }
             let ctrl = state.reset_embed_control();
             let vindex = state.vector_index_for(profile);
-            if let Ok(rep) = run_embed_queue(
-                &state.db,
-                &vindex,
-                &state.embedder_slot,
-                &state.paths.models_dir,
-                profile,
-                &cfg,
-                Some(&ctrl),
-            ) {
+            let embed_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_embed_queue(
+                    &state.db,
+                    &vindex,
+                    &state.embedder_slot,
+                    &state.paths.models_dir,
+                    profile,
+                    &cfg,
+                    Some(&ctrl),
+                )
+            }));
+            if let Ok(Ok(rep)) = embed_outcome {
                 if rep.succeeded > 0 {
                     state.schedule_auto_backup();
                 }

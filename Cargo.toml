@@ -7,12 +7,12 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-blake3 = { version = "1", features = ["mmap", "rayon"] }
+blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"
@@ -21,7 +21,7 @@ ndarray = "0.17"
 notify = "7"
 notify-debouncer-full = "0.4"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-22"] }
-pdfium-render = { version = "0.8", features = ["thread_safe"] }
+pdfium-render = { version = "=0.8.37", default-features = false, features = ["pdfium_7543", "thread_safe", "image"] }
 percent-encoding = "2"
 png = "0.18"
 quick-xml = "0.42"

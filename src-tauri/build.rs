@@ -37,6 +37,10 @@ fn main() {
 
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest_path.display());
+        // Reserve 8 MB virtual stack per thread on Windows (matching macOS/Linux defaults; physical
+        // pages still commit lazily in 4 KB increments) so PDF/XML parsing and Win32 crypto/TLS calls
+        // never hit Windows's 1 MB default `STATUS_STACK_OVERFLOW` (`0xC00000FD`).
+        println!("cargo:rustc-link-arg=/STACK:8388608");
     } else {
         tauri_build::build();
     }

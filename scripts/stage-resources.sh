@@ -7,7 +7,8 @@ RESOURCES_DIR="${REPO_ROOT}/src-tauri/resources"
 CACHE_DIR="${REPO_ROOT}/.tmp_stage_cache"
 
 ONNXRUNTIME_VERSION="${ONNXRUNTIME_VERSION:-1.23.2}"
-PDFIUM_BASE_URL="${PDFIUM_BASE_URL:-https://github.com/bblanchon/pdfium-binaries/releases/latest/download}"
+PDFIUM_VERSION="${PDFIUM_VERSION:-7543}"
+PDFIUM_BASE_URL="${PDFIUM_BASE_URL:-https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F${PDFIUM_VERSION}}"
 
 TARGET=""
 while [[ $# -gt 0 ]]; do
@@ -232,11 +233,34 @@ print(f"    Relocated {len(copied)} transitive dylib(s) cleanly for {expected_ar
 PY
 }
 
+download_pdfium() {
+  local filename="$1"
+  local versioned_dest="${CACHE_DIR}/${filename%.tgz}-${PDFIUM_VERSION}.tgz"
+  local legacy_dest="${CACHE_DIR}/${filename}"
+  if [[ -s "${versioned_dest}" ]]; then
+    echo "    [cache hit] $(basename "${versioned_dest}")" >&2
+    printf '%s\n' "${versioned_dest}"
+    return 0
+  fi
+  echo "    [download]  ${PDFIUM_BASE_URL}/${filename}" >&2
+  if curl -fL --retry 3 --retry-delay 2 -o "${versioned_dest}.part" "${PDFIUM_BASE_URL}/${filename}"; then
+    mv "${versioned_dest}.part" "${versioned_dest}"
+    printf '%s\n' "${versioned_dest}"
+    return 0
+  fi
+  rm -f "${versioned_dest}.part"
+  if [[ -s "${legacy_dest}" ]]; then
+    echo "    [offline fallback] using cached $(basename "${legacy_dest}")" >&2
+    printf '%s\n' "${legacy_dest}"
+    return 0
+  fi
+  echo "ERROR: failed to download ${PDFIUM_BASE_URL}/${filename}" >&2
+  exit 1
+}
+
 case "${TARGET}" in
   aarch64-apple-darwin)
-    PDFIUM_ARCHIVE="${CACHE_DIR}/pdfium-mac-arm64.tgz"
-
-    download_file "${PDFIUM_BASE_URL}/pdfium-mac-arm64.tgz" "${PDFIUM_ARCHIVE}"
+    PDFIUM_ARCHIVE="$(download_pdfium "pdfium-mac-arm64.tgz")"
     tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" ./lib/libpdfium.dylib ./LICENSE 2>/dev/null || \
       tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" lib/libpdfium.dylib LICENSE
     cp "${CACHE_DIR}/lib/libpdfium.dylib" "${RESOURCES_DIR}/libpdfium.dylib"
@@ -259,9 +283,7 @@ case "${TARGET}" in
     ;;
 
   x86_64-apple-darwin)
-    PDFIUM_ARCHIVE="${CACHE_DIR}/pdfium-mac-x64.tgz"
-
-    download_file "${PDFIUM_BASE_URL}/pdfium-mac-x64.tgz" "${PDFIUM_ARCHIVE}"
+    PDFIUM_ARCHIVE="$(download_pdfium "pdfium-mac-x64.tgz")"
     tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" ./lib/libpdfium.dylib ./LICENSE 2>/dev/null || \
       tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" lib/libpdfium.dylib LICENSE
     cp "${CACHE_DIR}/lib/libpdfium.dylib" "${RESOURCES_DIR}/libpdfium.dylib"
@@ -311,9 +333,7 @@ case "${TARGET}" in
     ;;
 
   x86_64-unknown-linux-gnu)
-    PDFIUM_ARCHIVE="${CACHE_DIR}/pdfium-linux-x64.tgz"
-
-    download_file "${PDFIUM_BASE_URL}/pdfium-linux-x64.tgz" "${PDFIUM_ARCHIVE}"
+    PDFIUM_ARCHIVE="$(download_pdfium "pdfium-linux-x64.tgz")"
     tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" ./lib/libpdfium.so ./LICENSE 2>/dev/null || \
       tar -xzf "${PDFIUM_ARCHIVE}" -C "${CACHE_DIR}" lib/libpdfium.so LICENSE
     cp "${CACHE_DIR}/lib/libpdfium.so" "${RESOURCES_DIR}/libpdfium.so"

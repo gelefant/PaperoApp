@@ -7,7 +7,7 @@ use crate::db::Database;
 use crate::dedup::{compute_document_minhash_from_pages, pack_minhash};
 use crate::error::{CoreError, Result};
 use crate::extract::chunker::chunk_document;
-use crate::extract::pdf::lock_cached_pdfium;
+use crate::extract::pdf::{open_pdf_document, with_pdfium};
 use crate::extract::types::{
     ExtractedDocument, ExtractedPage, ExtractedSpan, NormalizedRect,
 };
@@ -649,13 +649,11 @@ fn run_ocr_pdf<F>(
 where
     F: FnMut(OcrProgressEvent),
 {
-    let total_pages = {
-        let pdfium = lock_cached_pdfium(pdfium_lib_path)?;
-        let doc = pdfium
-            .load_pdf_from_file(pdf_path, None)
-            .map_err(|e| CoreError::CorruptFile(format!("{}: {e:?}", pdf_path.display())))?;
-        doc.pages().len() as u32
-    };
+    let pdf_path_owned = pdf_path.to_path_buf();
+    let total_pages = with_pdfium(pdfium_lib_path, move |pdfium| {
+        let doc = open_pdf_document(pdfium, &pdf_path_owned)?;
+        Ok(doc.pages().len() as u32)
+    })?;
     let mut pages = Vec::with_capacity(total_pages as usize);
 
     for batch_start in (0..total_pages).step_by(4) {
@@ -663,12 +661,11 @@ where
             ctrl.wait_if_paused()?;
         }
         let batch_end = (batch_start + 4).min(total_pages);
-        let mut rendered_batch = Vec::with_capacity((batch_end - batch_start) as usize);
-        {
-            let pdfium = lock_cached_pdfium(pdfium_lib_path)?;
-            let doc = pdfium
-                .load_pdf_from_file(pdf_path, None)
-                .map_err(|e| CoreError::CorruptFile(format!("{}: {e:?}", pdf_path.display())))?;
+        let pdf_batch_path = pdf_path.to_path_buf();
+        let ocr_batch_dir = ocr_tmp_dir.to_path_buf();
+        let rendered_batch = with_pdfium(pdfium_lib_path, move |pdfium| {
+            let mut batch = Vec::with_capacity((batch_end - batch_start) as usize);
+            let doc = open_pdf_document(pdfium, &pdf_batch_path)?;
             for idx in batch_start..batch_end {
                 let page_ord = idx + 1;
                 let page = doc.pages().get(idx as u16).map_err(|e| {
@@ -691,12 +688,13 @@ where
                 let bw = bitmap.width() as u32;
                 let bh = bitmap.height() as u32;
                 let rgba = bitmap.as_rgba_bytes();
-                let tmp_png_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.png"));
+                let tmp_png_path = ocr_batch_dir.join(format!("ocr_{file_id}_p{page_ord}.png"));
                 let guard = TempOcrFile::new(tmp_png_path.clone());
                 write_rgba_png(&tmp_png_path, bw, bh, &rgba)?;
-                rendered_batch.push((page_ord, width_pts, height_pts, printed_label, tmp_png_path, guard));
+                batch.push((page_ord, width_pts, height_pts, printed_label, tmp_png_path, guard));
             }
-        }
+            Ok(batch)
+        })?;
 
         for (page_ord, width_pts, height_pts, printed_label, tmp_png_path, _guard) in rendered_batch {
             if let Some(ctrl) = control {

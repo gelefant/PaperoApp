@@ -276,6 +276,7 @@ pub fn rescan_sources(
             .unwrap_or(2);
         let hash_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(io_threads)
+            .stack_size(8 * 1024 * 1024)
             .start_handler(|_| {
                 let _ = thread_priority::set_current_thread_priority(
                     thread_priority::ThreadPriority::Min,
@@ -562,22 +563,30 @@ pub fn rescan_sources(
 }
 
 pub fn compute_blake3_hex(path: &Path) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    // Use OS-mmapped BLAKE3 SIMD path for files >= 128 KB, falling back to 256 KB buffered reads.
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() >= 128 * 1024 && hasher.update_mmap(path).is_ok() {
-            return Ok(hasher.finalize().to_hex().to_string());
-        }
+    std::thread_local! {
+        static HASH_BUF: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; 256 * 1024]);
     }
+    // Always use buffered `ReadFile` / `read` streaming rather than `mmap`: on Windows cloud-synced
+    // folders (OneDrive Files On-Demand, Google Drive, Dropbox, SMB) and macOS iCloud Drive, reading
+    // a memory-mapped file raises a fatal hardware `EXCEPTION_IN_PAGE_ERROR` (`0xC0000006`) or `SIGBUS`
+    // that terminates the process instead of returning `io::Error`.
     let mut file = File::open(path)?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let mut hasher = blake3::Hasher::new();
+    HASH_BUF.with(|cell| -> Result<()> {
+        let mut buf = cell.borrow_mut();
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(CoreError::Io(e)),
+            }
         }
-        hasher.update(&buf[..n]);
-    }
+        Ok(())
+    })?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -596,7 +605,11 @@ pub fn spawn_rescan_thread(
     only_root_id: Option<String>,
     control: Arc<ScanControl>,
 ) -> std::thread::JoinHandle<Result<ScanSummary>> {
-    std::thread::spawn(move || {
-        rescan_sources(&db, bm25.as_deref(), only_root_id.as_deref(), Some(&control))
-    })
+    std::thread::Builder::new()
+        .name("papero-rescan".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            rescan_sources(&db, bm25.as_deref(), only_root_id.as_deref(), Some(&control))
+        })
+        .expect("failed spawning papero-rescan thread")
 }

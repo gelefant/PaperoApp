@@ -209,8 +209,8 @@
       <polygon points="17,5 22,7 19,8.5" fill="#ea580c" />
       <polygon points="6,15 17,15 13,20 4,18" fill="#fcd34d" />
     </svg>
-    <strong class="brand-name" title="Papero v0.3.3">Papero</strong>
-    <span class="brand-version" title="Papero v0.3.3">0.3.3</span>
+    <strong class="brand-name" title="Papero v0.3.4">Papero</strong>
+    <span class="brand-version" title="Papero v0.3.4">0.3.4</span>
     <span
       class="roots-pill"
       title={roots.length > 0

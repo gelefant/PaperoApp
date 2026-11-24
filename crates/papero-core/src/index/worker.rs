@@ -60,6 +60,7 @@ pub fn run_extract_bm25_queue(
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.max_worker_threads.max(1))
+        .stack_size(8 * 1024 * 1024)
         .start_handler(|_| {
             let _ = set_current_thread_priority(ThreadPriority::Min);
         })
@@ -89,100 +90,119 @@ pub fn run_extract_bm25_queue(
                     if ctrl.is_cancelled() {
                         return Err(CoreError::Cancelled);
                     }
-                    let full_path = resolve_rel_path(Path::new(&job.root_path), &job.rel_path)?;
-                    let extracted = match job.format.as_str() {
-                        "pdf" => extract_pdf(&full_path, config.pdfium_lib_path.as_deref())?,
-                        "djvu" => extract_djvu(&full_path, config.djvused_bin.as_deref())?,
-                        other => {
-                            return Err(CoreError::CorruptFile(format!(
-                                "unsupported format: {other}"
-                            )));
+                    let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Result<PreparedExtractOutput> {
+                            let full_path =
+                                resolve_rel_path(Path::new(&job.root_path), &job.rel_path)?;
+                            let extracted = match job.format.as_str() {
+                                "pdf" => extract_pdf(&full_path, config.pdfium_lib_path.as_deref())?,
+                                "djvu" => extract_djvu(&full_path, config.djvused_bin.as_deref())?,
+                                other => {
+                                    return Err(CoreError::CorruptFile(format!(
+                                        "unsupported format: {other}"
+                                    )));
+                                }
+                            };
+                            let built_chunks = chunk_document(
+                                &extracted,
+                                config.chunk_target_tokens,
+                                config.chunk_overlap_tokens,
+                            );
+
+                            let first_pages: Vec<&str> = extracted
+                                .pages
+                                .iter()
+                                .take(6)
+                                .map(|p| p.raw_text.as_str())
+                                .collect();
+                            let last_page = extracted.pages.last().map(|p| p.raw_text.as_str());
+                            let stem = Path::new(&job.rel_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str());
+                            let ids = extract_identifiers_and_heuristics_with_front_pages(
+                                extracted.xmp_xml.as_deref(),
+                                extracted.doc_title.as_deref(),
+                                extracted.doc_author.as_deref(),
+                                &first_pages,
+                                last_page,
+                                extracted.page_count,
+                                stem,
+                                extracted.pages.first(),
+                                extracted.pages.get(1),
+                            );
+
+                            let minhash_blob = compute_document_minhash_from_pages(
+                                extracted
+                                    .pages
+                                    .iter()
+                                    .map(|p| (p.page_ord, p.raw_text.as_str())),
+                                extracted.page_count,
+                            )
+                            .map(|s| pack_minhash(&s));
+
+                            let page_inserts: Vec<FilePageInsert> = extracted
+                                .pages
+                                .iter()
+                                .map(|p| FilePageInsert {
+                                    file_id: job.file_id,
+                                    page_ord: p.page_ord,
+                                    printed_label: p.printed_label.clone(),
+                                    width_pts: p.width_pts,
+                                    height_pts: p.height_pts,
+                                    text_source: "native".to_string(),
+                                })
+                                .collect();
+
+                            let outline_json = if extracted.outline.is_empty() {
+                                None
+                            } else {
+                                serde_json::to_string(&extracted.outline).ok()
+                            };
+                            let page_count = extracted.page_count;
+                            let has_text_layer = extracted.has_text_layer;
+                            // Explicitly drop `extracted` (all raw_text + line spans) before building PassageInserts
+                            drop(extracted);
+
+                            let passage_inserts: Vec<PassageInsert> = built_chunks
+                                .into_iter()
+                                .map(|c| PassageInsert {
+                                    document_id: job.document_id,
+                                    file_id: job.file_id,
+                                    page_ord: c.page_ord,
+                                    printed_label: c.printed_label,
+                                    chunk_index: c.chunk_index,
+                                    is_alt_formula: false,
+                                    token_count: c.token_count,
+                                    text_content: c.text_content,
+                                    bboxes_blob: c.bboxes_blob,
+                                })
+                                .collect();
+
+                            Ok(PreparedExtractOutput {
+                                page_count,
+                                has_text_layer,
+                                outline_json,
+                                page_inserts,
+                                passage_inserts,
+                                ids,
+                                minhash_blob,
+                            })
+                        },
+                    ));
+                    match inner {
+                        Ok(res) => res,
+                        Err(payload) => {
+                            let detail = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                                .unwrap_or("unknown extraction panic");
+                            Err(CoreError::CorruptFile(format!(
+                                "panic while indexing {}: {detail}",
+                                job.rel_path
+                            )))
                         }
-                    };
-                    let built_chunks = chunk_document(
-                        &extracted,
-                        config.chunk_target_tokens,
-                        config.chunk_overlap_tokens,
-                    );
-
-                    let first_pages: Vec<&str> = extracted
-                        .pages
-                        .iter()
-                        .take(6)
-                        .map(|p| p.raw_text.as_str())
-                        .collect();
-                    let last_page = extracted.pages.last().map(|p| p.raw_text.as_str());
-                    let stem = Path::new(&job.rel_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str());
-                    let ids = extract_identifiers_and_heuristics_with_front_pages(
-                        extracted.xmp_xml.as_deref(),
-                        extracted.doc_title.as_deref(),
-                        extracted.doc_author.as_deref(),
-                        &first_pages,
-                        last_page,
-                        extracted.page_count,
-                        stem,
-                        extracted.pages.first(),
-                        extracted.pages.get(1),
-                    );
-
-                    let minhash_blob = compute_document_minhash_from_pages(
-                        extracted
-                            .pages
-                            .iter()
-                            .map(|p| (p.page_ord, p.raw_text.as_str())),
-                        extracted.page_count,
-                    )
-                    .map(|s| pack_minhash(&s));
-
-                    let page_inserts: Vec<FilePageInsert> = extracted
-                        .pages
-                        .iter()
-                        .map(|p| FilePageInsert {
-                            file_id: job.file_id,
-                            page_ord: p.page_ord,
-                            printed_label: p.printed_label.clone(),
-                            width_pts: p.width_pts,
-                            height_pts: p.height_pts,
-                            text_source: "native".to_string(),
-                        })
-                        .collect();
-
-                    let outline_json = if extracted.outline.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&extracted.outline).ok()
-                    };
-                    let page_count = extracted.page_count;
-                    let has_text_layer = extracted.has_text_layer;
-                    // Explicitly drop `extracted` (all raw_text + line spans) before building PassageInserts
-                    drop(extracted);
-
-                    let passage_inserts: Vec<PassageInsert> = built_chunks
-                        .into_iter()
-                        .map(|c| PassageInsert {
-                            document_id: job.document_id,
-                            file_id: job.file_id,
-                            page_ord: c.page_ord,
-                            printed_label: c.printed_label,
-                            chunk_index: c.chunk_index,
-                            is_alt_formula: false,
-                            token_count: c.token_count,
-                            text_content: c.text_content,
-                            bboxes_blob: c.bboxes_blob,
-                        })
-                        .collect();
-
-                    Ok(PreparedExtractOutput {
-                        page_count,
-                        has_text_layer,
-                        outline_json,
-                        page_inserts,
-                        passage_inserts,
-                        ids,
-                        minhash_blob,
-                    })
+                    }
                 })
                 .collect()
         });

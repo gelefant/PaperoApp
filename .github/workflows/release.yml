@@ -11,6 +11,7 @@ permissions:
 
 env:
   ONNXRUNTIME_VERSION: "1.23.2"
+  PDFIUM_VERSION: "7543"
   DJVULIBRE_TARBALL: "djvulibre-3.5.30.tar.gz"
   DJVULIBRE_URL: "https://downloads.sourceforge.net/project/djvu/DjVuLibre/3.5.30/djvulibre-3.5.30.tar.gz"
   DJVULIBRE_SHA256: "ee5e457d4cfebe566f94b99e5e3d3cc7f5c79ddb741c2ac2ba2e456f00329644"
