@@ -373,6 +373,8 @@ pub fn bundled_resource_dirs() -> Vec<PathBuf> {
                 // Standard `.deb` / AppImage resource layout (`/usr/lib/<pkg>/resources` etc.)
                 dirs.push(parent.join("../lib/Papero/resources"));
                 dirs.push(parent.join("../lib/papero/resources"));
+                dirs.push(parent.join("../lib/papero-app/resources"));
+                dirs.push(parent.join("../share/Papero/resources"));
                 dirs.push(parent.join("../share/papero/resources"));
             }
         }

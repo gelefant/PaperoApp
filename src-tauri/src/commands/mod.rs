@@ -926,12 +926,38 @@ pub async fn get_document_metadata(
     .map_err(|e| e.to_string())?
 }
 
+fn spawn_background_dedup(state: &Arc<AppState>) {
+    let st = Arc::clone(state);
+    tauri::async_runtime::spawn(async move {
+        let db = Arc::clone(&st.db);
+        let rep = tokio::task::spawn_blocking(move || run_duplicate_detection(&db)).await;
+        if let Ok(Ok(r)) = rep {
+            if r.new_groups_created > 0 {
+                if let Ok(guard) = st.app_handle.lock() {
+                    if let Some(app) = guard.as_ref() {
+                        let _ = app.emit("papero://duplicates-updated", ());
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub fn cancel_single_metadata_cmd(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.single_metadata_cancel_notify.notify_waiters();
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_document_metadata_verified_cmd(
     state: State<'_, Arc<AppState>>,
     document_id: i64,
     verified: bool,
 ) -> Result<DocumentMetadataView, String> {
+    if verified {
+        state.single_metadata_cancel_notify.notify_waiters();
+    }
     let db = Arc::clone(&state.db);
     let res = tokio::task::spawn_blocking(move || {
         set_document_metadata_verified(&db, document_id, verified).map_err(|e| e.to_string())
@@ -948,16 +974,15 @@ pub async fn save_document_metadata(
     edit: ManualMetadataEdit,
     locked_fields: Option<Vec<String>>,
 ) -> Result<DocumentMetadataView, String> {
+    state.single_metadata_cancel_notify.notify_waiters();
     let db = Arc::clone(&state.db);
     let view = tokio::task::spawn_blocking(move || {
-        let view =
-            apply_manual_metadata_edit_with_locks(&db, &edit, locked_fields.as_deref(), false)
-                .map_err(|e| e.to_string())?;
-        let _ = run_duplicate_detection(&db);
-        Ok::<_, String>(view)
+        apply_manual_metadata_edit_with_locks(&db, &edit, locked_fields.as_deref(), false)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
+    spawn_background_dedup(&state);
     state.schedule_auto_backup();
     Ok(view)
 }
@@ -970,6 +995,9 @@ pub async fn save_and_fetch_document_metadata(
     reset_unlocked: Option<bool>,
     overwrite_query_fields: Option<bool>,
 ) -> Result<SaveAndFetchResult, String> {
+    let cancel_wait = state.single_metadata_cancel_notify.notified();
+    tokio::pin!(cancel_wait);
+    cancel_wait.as_mut().enable();
     let db_save = Arc::clone(&state.db);
     let edit_doc_id = edit.document_id;
     let reset = reset_unlocked.unwrap_or(true);
@@ -1030,25 +1058,37 @@ pub async fn save_and_fetch_document_metadata(
 
     let cfg = state.config.read().expect("config poisoned").clone();
     let clients = Arc::clone(&state.clients.read().expect("clients poisoned"));
-    let outcome = resolve_document_metadata_with_hints(
-        &state.db,
-        &clients,
-        &cfg,
-        edit_doc_id,
-        MetadataLookupScope::SingleRecordUserAction,
-        guided_hints,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let resolve_res = tokio::select! {
+        biased;
+        _ = &mut cancel_wait => {
+            Ok(ResolveOutcome {
+                document_id: edit_doc_id,
+                status: "cancelled".to_string(),
+                source: None,
+                candidates_count: 0,
+            })
+        }
+        r = resolve_document_metadata_with_hints(
+            &state.db,
+            &clients,
+            &cfg,
+            edit_doc_id,
+            MetadataLookupScope::SingleRecordUserAction,
+            guided_hints,
+        ) => r,
+    };
+    let outcome = resolve_res.map_err(|e| e.to_string())?;
 
     let db_after = Arc::clone(&state.db);
     let metadata = tokio::task::spawn_blocking(move || {
-        let _ = run_duplicate_detection(&db_after);
         core_get_document_metadata(&db_after, edit_doc_id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
 
+    if outcome.status != "cancelled" {
+        spawn_background_dedup(&state);
+    }
     state.schedule_auto_backup();
     Ok(SaveAndFetchResult { outcome, metadata })
 }
@@ -1058,20 +1098,32 @@ pub async fn fetch_document_metadata(
     state: State<'_, Arc<AppState>>,
     document_id: i64,
 ) -> Result<ResolveOutcome, String> {
+    let cancel_wait = state.single_metadata_cancel_notify.notified();
+    tokio::pin!(cancel_wait);
+    cancel_wait.as_mut().enable();
     let cfg = state.config.read().expect("config poisoned").clone();
     let clients = Arc::clone(&state.clients.read().expect("clients poisoned"));
-    let outcome = resolve_document_metadata(
-        &state.db,
-        &clients,
-        &cfg,
-        document_id,
-        MetadataLookupScope::SingleRecordUserAction,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let resolve_res = tokio::select! {
+        biased;
+        _ = &mut cancel_wait => {
+            Ok(ResolveOutcome {
+                document_id,
+                status: "cancelled".to_string(),
+                source: None,
+                candidates_count: 0,
+            })
+        }
+        r = resolve_document_metadata(
+            &state.db,
+            &clients,
+            &cfg,
+            document_id,
+            MetadataLookupScope::SingleRecordUserAction,
+        ) => r,
+    };
+    let outcome = resolve_res.map_err(|e| e.to_string())?;
     if outcome.status == "updated" || outcome.status == "candidates_found" {
-        let db_dedup = Arc::clone(&state.db);
-        let _ = tokio::task::spawn_blocking(move || run_duplicate_detection(&db_dedup)).await;
+        spawn_background_dedup(&state);
         state.schedule_auto_backup();
     }
     Ok(outcome)
@@ -1234,13 +1286,12 @@ pub async fn confirm_candidate(
     let db = Arc::clone(&state.db);
     let overwrite = overwrite_query_fields.unwrap_or(false);
     let view = tokio::task::spawn_blocking(move || {
-        let view = confirm_metadata_candidate_with_options(&db, document_id, candidate_id, overwrite)
-            .map_err(|e| e.to_string())?;
-        let _ = run_duplicate_detection(&db);
-        Ok::<_, String>(view)
+        confirm_metadata_candidate_with_options(&db, document_id, candidate_id, overwrite)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
+    spawn_background_dedup(&state);
     state.schedule_auto_backup();
     Ok(view)
 }

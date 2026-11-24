@@ -1,11 +1,16 @@
 <script lang="ts">
   import type {
-    BibliographicAuthor,
     DocumentMetadataView,
     ManualMetadataEdit,
     ResolveOutcome,
     TopicClusterView,
   } from '../types';
+  import {
+    buildManualMetadataEditPayload,
+    computeNextLocksOnTouch,
+    formatAuthorsForInput,
+    normalizeInputText,
+  } from '../inspectorUtils';
 
   interface Props {
     meta: DocumentMetadataView | null;
@@ -15,12 +20,14 @@
     fetchingOnline: boolean;
     lastFetchMessage: string;
     onSave: (edit: ManualMetadataEdit, lockedFields?: string[]) => Promise<void>;
+    onFlushSave?: (edit: ManualMetadataEdit, lockedFields?: string[]) => Promise<void>;
     onSaveAndFetch?: (
       edit: ManualMetadataEdit,
       lockedFields: string[],
       overwriteQueryFields?: boolean
     ) => Promise<ResolveOutcome | void>;
     onFetchMetadata: (documentId: number) => Promise<ResolveOutcome | void>;
+    onCancelFetch?: () => void;
     onToggleVerified?: (documentId: number, verified: boolean, advanceNext?: boolean) => Promise<void>;
     hasNextUnverified?: boolean;
     onConfirmCandidate: (
@@ -50,8 +57,10 @@
     fetchingOnline,
     lastFetchMessage,
     onSave,
+    onFlushSave,
     onSaveAndFetch,
     onFetchMetadata,
+    onCancelFetch,
     onToggleVerified,
     hasNextUnverified = false,
     onConfirmCandidate,
@@ -102,10 +111,12 @@
   let locksModified = $state(false);
   let touched = $state<string[]>([]);
   let overwriteQueryFields = $state(true);
-  let lastDocId = $state<number | null>(null);
+  let lastDocId: number | null = null;
   let bibPreview = $state('');
   let copyFeedback = $state('');
   let altFormulaFeedback = $state('');
+  let saveFeedback = $state('');
+  let saveError = $state('');
   let altFileInput: HTMLInputElement | undefined = $state();
   let saving = $state(false);
   const currentCluster = $derived(
@@ -147,38 +158,6 @@
     altFormulaFeedback = `Importato testo formule (${file.name}) per ricerca ibrida.`;
   }
 
-  function formatAuthorsForInput(authors: BibliographicAuthor[]): string {
-    return authors
-      .map((a) => (a.given_name.trim() ? `${a.family_name}, ${a.given_name}` : a.family_name))
-      .join('; ');
-  }
-
-  function parseAuthorsInput(raw: string): BibliographicAuthor[] {
-    return raw
-      .split(';')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const idx = part.indexOf(',');
-        if (idx >= 0) {
-          return {
-            family_name: part.slice(0, idx).trim(),
-            given_name: part.slice(idx + 1).trim(),
-            role: 'author',
-          };
-        }
-        const tokens = part.split(/\s+/);
-        if (tokens.length >= 2) {
-          return {
-            family_name: tokens[tokens.length - 1],
-            given_name: tokens.slice(0, -1).join(' '),
-            role: 'author',
-          };
-        }
-        return { family_name: part, given_name: '', role: 'author' };
-      });
-  }
-
   $effect(() => {
     if (!meta) return;
     workType = meta.work_type || 'article';
@@ -215,6 +194,8 @@
     if (meta.document_id !== lastDocId) {
       lastDocId = meta.document_id;
       overwriteQueryFields = !nextLocked.includes('title') && !nextLocked.includes('authors');
+      saveFeedback = '';
+      saveError = '';
     } else if (nextLocked.includes('title') || nextLocked.includes('authors')) {
       overwriteQueryFields = false;
     }
@@ -224,25 +205,20 @@
     copyFeedback = '';
   });
 
-  function touch(field: string, currentValue?: string) {
+  function touch(field: string, currentValue?: string | number | null) {
+    saveFeedback = '';
+    saveError = '';
     if (!touched.includes(field)) {
       touched = [...touched, field];
     }
-    if (field === 'tags' || field === 'exclude_from_cloud_llm') return;
-    if ((field === 'title' || field === 'authors') && overwriteQueryFields) {
-      return;
-    }
-    if (currentValue !== undefined) {
-      if (currentValue.trim()) {
-        if (!lockedFields.includes(field)) {
-          lockedFields = [...lockedFields, field];
-        }
-      } else {
-        lockedFields = lockedFields.filter((f) => f !== field);
-      }
-      locksModified = true;
-    } else if (!lockedFields.includes(field)) {
-      lockedFields = [...lockedFields, field];
+    const next = computeNextLocksOnTouch(
+      lockedFields,
+      field,
+      overwriteQueryFields,
+      currentValue
+    );
+    lockedFields = next.lockedFields;
+    if (next.modified) {
       locksModified = true;
     }
   }
@@ -252,6 +228,8 @@
   }
 
   function toggleLock(field: string) {
+    saveFeedback = '';
+    saveError = '';
     if (lockedFields.includes(field)) {
       lockedFields = lockedFields.filter((f) => f !== field);
     } else {
@@ -289,55 +267,53 @@
   }
 
   function unlockAllFields() {
+    saveFeedback = '';
+    saveError = '';
     lockedFields = [];
     locksModified = true;
   }
 
-  function optStr(val: string): string | null {
-    const t = val.trim();
-    return t ? t : null;
-  }
-
   function buildEditPayload(allowEmptyTitle = false): ManualMetadataEdit | null {
     if (!meta) return null;
-    const parsedYear = yearStr.trim() ? Number(yearStr.trim()) : null;
-    return {
-      document_id: meta.document_id,
-      work_type: workType,
-      title: allowEmptyTitle ? title.trim() : title.trim() || meta.title,
-      authors: parseAuthorsInput(authorsText),
-      journal_abbrev: optStr(journalAbbrev),
-      journal_full: optStr(journalFull),
-      booktitle: optStr(booktitle),
-      series: optStr(series),
-      volume: optStr(volume),
-      issue_number: optStr(issueNumber),
-      year: parsedYear && Number.isFinite(parsedYear) ? parsedYear : null,
-      pages: optStr(pages),
-      edition: optStr(edition),
-      publisher: optStr(publisher),
-      address: optStr(address),
-      isbn: optStr(isbn),
-      issn: optStr(issn),
-      doi: optStr(doi),
-      arxiv_id: optStr(arxivId),
-      mr_number: optStr(mrNumber),
-      mr_reviewer: optStr(mrReviewer),
-      zbl_number: optStr(zblNumber),
-      url: optStr(url),
-      msc_primary: optStr(mscPrimary),
-      msc_secondary: mscSecondaryText
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-      abstract_text: optStr(abstractText),
-      exclude_from_cloud_llm: excludeFromCloud,
-      tags: tagsText
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-      edited_fields: touched,
-    };
+    const res = buildManualMetadataEditPayload(
+      meta,
+      {
+        workType,
+        title,
+        authorsText,
+        yearStr,
+        journalAbbrev,
+        journalFull,
+        booktitle,
+        series,
+        volume,
+        issueNumber,
+        pages,
+        edition,
+        publisher,
+        address,
+        doi,
+        arxivId,
+        mrNumber,
+        mrReviewer,
+        zblNumber,
+        isbn,
+        issn,
+        url,
+        mscPrimary,
+        mscSecondaryText,
+        abstractText,
+        tagsText,
+        excludeFromCloud,
+        touched,
+      },
+      allowEmptyTitle
+    );
+    if (!res.ok) {
+      saveError = res.error;
+      return null;
+    }
+    return res.payload;
   }
 
   function hasUnsavedFormDiff(): boolean {
@@ -345,6 +321,8 @@
     if (touched.length > 0 || locksModified) return true;
     if (title.trim() !== (meta.title ?? '').trim()) return true;
     if (authorsText.trim() !== formatAuthorsForInput(meta.authors).trim()) return true;
+    const metaYearStr = meta.year !== null && meta.year !== undefined ? String(meta.year) : '';
+    if (normalizeInputText(yearStr) !== metaYearStr) return true;
     return false;
   }
 
@@ -364,25 +342,32 @@
     return saveLocks;
   }
 
-  export async function savePendingIfForDoc(docId: number): Promise<void> {
-    if (!meta || meta.document_id !== docId) return;
-    if (!hasUnsavedFormDiff()) return;
+  export async function savePendingIfForDoc(docId: number): Promise<boolean> {
+    if (!meta || meta.document_id !== docId) return true;
+    if (!hasUnsavedFormDiff()) return true;
+    saveError = '';
     const payload = buildEditPayload(false);
-    if (!payload) return;
+    if (!payload) return false;
     const saveLocks = computeEffectiveSaveLocks();
-    await onSave(payload, saveLocks);
+    await (onFlushSave ?? onSave)(payload, saveLocks);
     lockedFields = saveLocks;
     if (saveLocks.includes('title') || saveLocks.includes('authors')) {
       overwriteQueryFields = false;
     }
     touched = [];
     locksModified = false;
+    return true;
   }
 
   async function handleSave(e: Event) {
     e.preventDefault();
+    saveError = '';
+    saveFeedback = '';
     const payload = buildEditPayload(false);
     if (!payload) return;
+    if (fetchingOnline && onCancelFetch) {
+      onCancelFetch();
+    }
     const saveLocks = computeEffectiveSaveLocks();
     saving = true;
     try {
@@ -393,6 +378,9 @@
       }
       touched = [];
       locksModified = false;
+      saveFeedback = 'Metadati salvati.';
+    } catch (err) {
+      saveError = `Errore salvataggio metadati: ${String(err)}`;
     } finally {
       saving = false;
     }
@@ -400,10 +388,13 @@
 
   async function handleGuidedFetchClick() {
     if (!meta) return;
+    saveError = '';
+    saveFeedback = '';
+    const cleanedYear = normalizeInputText(yearStr);
     let nextLocks = [...lockedFields];
     if (overwriteQueryFields) {
       nextLocks = nextLocks.filter((f) => f !== 'title' && f !== 'authors');
-      if (yearStr.trim() && touched.includes('year') && !nextLocks.includes('year')) {
+      if (cleanedYear && touched.includes('year') && !nextLocks.includes('year')) {
         nextLocks.push('year');
       }
     } else {
@@ -411,12 +402,12 @@
       if (!hasPrimaryAnchor) {
         if (title.trim()) nextLocks.push('title');
         if (authorsText.trim()) nextLocks.push('authors');
-        if (yearStr.trim() && touched.includes('year')) nextLocks.push('year');
+        if (cleanedYear && touched.includes('year')) nextLocks.push('year');
       }
     }
-    lockedFields = nextLocks;
     const payload = buildEditPayload(true);
     if (!payload) return;
+    lockedFields = nextLocks;
     saving = true;
     try {
       if (onSaveAndFetch) {
@@ -427,6 +418,8 @@
       }
       touched = [];
       locksModified = false;
+    } catch (err) {
+      saveError = `Errore salvataggio/ricerca metadati: ${String(err)}`;
     } finally {
       saving = false;
     }
@@ -434,43 +427,40 @@
 
   async function handleTopFetchClick() {
     if (!meta) return;
+    saveError = '';
+    saveFeedback = '';
     const docId = meta.document_id;
     if (hasUnsavedFormDiff()) {
       const payload = buildEditPayload(false);
-      if (payload) {
-        const saveLocks = computeEffectiveSaveLocks();
+      if (!payload) return;
+      const saveLocks = computeEffectiveSaveLocks();
+      try {
         await onSave(payload, saveLocks);
-        lockedFields = saveLocks;
-        if (saveLocks.includes('title') || saveLocks.includes('authors')) {
-          overwriteQueryFields = false;
-        }
-        touched = [];
-        locksModified = false;
+      } catch (err) {
+        saveError = `Errore salvataggio metadati: ${String(err)}`;
+        return;
       }
+      lockedFields = saveLocks;
+      if (saveLocks.includes('title') || saveLocks.includes('authors')) {
+        overwriteQueryFields = false;
+      }
+      touched = [];
+      locksModified = false;
     }
     await onFetchMetadata(docId);
   }
 
   async function handleToggleVerifiedClick(advanceNext = false) {
     if (!meta || !onToggleVerified) return;
+    saveError = '';
+    saveFeedback = '';
     const docId = meta.document_id;
     const nextState = advanceNext ? true : !meta.metadata_verified;
     saving = true;
     try {
-      if (nextState && hasUnsavedFormDiff()) {
-        const payload = buildEditPayload(false);
-        if (payload) {
-          const saveLocks = computeEffectiveSaveLocks();
-          await onSave(payload, saveLocks);
-          lockedFields = saveLocks;
-          if (saveLocks.includes('title') || saveLocks.includes('authors')) {
-            overwriteQueryFields = false;
-          }
-          touched = [];
-          locksModified = false;
-        }
-      }
       await onToggleVerified(docId, nextState, advanceNext);
+    } catch (err) {
+      saveError = `Errore conferma metadati: ${String(err)}`;
     } finally {
       saving = false;
     }
@@ -517,6 +507,16 @@
       >
         {fetchingOnline ? 'Ricerca…' : 'Aggiorna metadati'}
       </button>
+      {#if fetchingOnline && onCancelFetch}
+        <button
+          type="button"
+          class="mini-no"
+          onclick={onCancelFetch}
+          title="Interrompi subito la ricerca online in corso"
+        >
+          ✕ Interrompi
+        </button>
+      {/if}
       <button type="button" onclick={handleCopyBibtexClick}>
         Copia BibTeX (MRLookup)
       </button>
@@ -547,6 +547,12 @@
       {/if}
     </div>
 
+    {#if saveError}
+      <div class="error-notice" role="alert">{saveError}</div>
+    {/if}
+    {#if saveFeedback}
+      <div class="notice">{saveFeedback}</div>
+    {/if}
     {#if lastFetchMessage}
       <div class="notice">{lastFetchMessage}</div>
     {/if}
@@ -658,11 +664,11 @@
           type="button"
           class="verify-main-btn"
           class:verified={meta.metadata_verified}
-          disabled={saving || fetchingOnline}
+          disabled={saving}
           onclick={() => handleToggleVerifiedClick(false)}
           title={meta.metadata_verified
             ? 'Clicca per rimuovere il check di controllo metadati'
-            : 'Salva eventuali modifiche e segna i metadati come controllati e corretti'}
+            : 'Salva eventuali modifiche e segna subito i metadati come controllati e corretti'}
         >
           <span class="verify-box">{meta.metadata_verified ? '✓' : ''}</span>
           <span>
@@ -675,7 +681,7 @@
           <button
             type="button"
             class="verify-next-btn"
-            disabled={saving || fetchingOnline}
+            disabled={saving}
             onclick={() => handleToggleVerifiedClick(true)}
             title="Segna questo documento come controllato e passa subito al prossimo non checkato"
           >
@@ -722,7 +728,7 @@
           <button
             type="button"
             class="mini-no"
-            disabled={saving || fetchingOnline}
+            disabled={saving}
             onclick={() => handleToggleVerifiedClick(false)}
             title="Ignora questi candidati errati, mantieni il tuo Titolo/Autore e segna i metadati come controllati"
           >
@@ -817,7 +823,13 @@
       <div class="two-col">
         <div class="field-group">
           {@render fieldHead('Anno', 'year')}
-          <input type="number" bind:value={yearStr} oninput={() => touch('year', yearStr)} />
+          <input
+            type="text"
+            inputmode="numeric"
+            placeholder="es. 2002"
+            bind:value={yearStr}
+            oninput={() => touch('year', yearStr)}
+          />
         </div>
         <div class="field-group">
           {@render fieldHead('Pagine', 'pages')}
@@ -982,8 +994,15 @@
         <span>Escludi documento da servizi LLM cloud</span>
       </label>
 
+      {#if saveError}
+        <div class="error-notice" role="alert">{saveError}</div>
+      {/if}
+      {#if saveFeedback}
+        <div class="notice">{saveFeedback}</div>
+      {/if}
+
       <div class="bottom-actions">
-        <button type="submit" class="primary save-btn" disabled={saving || fetchingOnline}>
+        <button type="submit" class="primary save-btn" disabled={saving}>
           {saving ? 'Salvataggio…' : touched.length > 0 || locksModified ? 'Salva modifiche e blocchi' : 'Salva metadati'}
         </button>
         <button
@@ -1152,6 +1171,14 @@
     padding: 5px 8px;
     border-radius: 4px;
     background: var(--accent-soft);
+    font-size: 11px;
+  }
+  .error-notice {
+    padding: 5px 8px;
+    border-radius: 4px;
+    border: 1px solid rgba(220, 38, 38, 0.45);
+    background: rgba(220, 38, 38, 0.12);
+    color: #b91c1c;
     font-size: 11px;
   }
   .proposal-banner {

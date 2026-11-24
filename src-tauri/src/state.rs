@@ -107,6 +107,7 @@ pub struct AppState {
     pub metadata_batch_cancel: Arc<AtomicBool>,
     pub bg_metadata_cancel: Arc<AtomicBool>,
     pub metadata_cancel_notify: Arc<Notify>,
+    pub single_metadata_cancel_notify: Arc<Notify>,
     pub metadata_batch_active: Arc<AtomicBool>,
     pub embed_control: Mutex<Arc<ScanControl>>,
     pub embed_pause_depth: AtomicUsize,
@@ -178,6 +179,7 @@ impl AppState {
             metadata_batch_cancel: Arc::new(AtomicBool::new(false)),
             bg_metadata_cancel: Arc::new(AtomicBool::new(false)),
             metadata_cancel_notify: Arc::new(Notify::new()),
+            single_metadata_cancel_notify: Arc::new(Notify::new()),
             metadata_batch_active: Arc::new(AtomicBool::new(false)),
             embed_control: Mutex::new(Arc::new(ScanControl::new())),
             embed_pause_depth: AtomicUsize::new(0),
@@ -247,6 +249,7 @@ impl AppState {
         self.metadata_batch_cancel.store(true, Ordering::SeqCst);
         self.bg_metadata_cancel.store(true, Ordering::SeqCst);
         self.metadata_cancel_notify.notify_waiters();
+        self.single_metadata_cancel_notify.notify_waiters();
         self.cancel_embed_worker();
         if let Ok(g) = self.scan_control.lock() {
             if let Some(ctrl) = g.as_ref() {
@@ -477,14 +480,15 @@ impl AppState {
                 if !state.auto_backup_dirty.load(Ordering::SeqCst) {
                     state.auto_backup_notify.notified().await;
                 }
-                // Debounce rapid mutations (scans, bulk metadata edits) up to 45s max wait
+                // Debounce interactive edits (90s quiet window, up to 300s max wait) so manual
+                // metadata curation never triggers heavyweight multi-hundred-MB archive compression mid-edit.
                 let start = tokio::time::Instant::now();
                 loop {
                     let elapsed = start.elapsed();
-                    if elapsed >= Duration::from_secs(45) {
+                    if elapsed >= Duration::from_secs(300) {
                         break;
                     }
-                    let wait = Duration::from_secs(12).min(Duration::from_secs(45) - elapsed);
+                    let wait = Duration::from_secs(90).min(Duration::from_secs(300) - elapsed);
                     tokio::select! {
                         _ = state.auto_backup_notify.notified() => {},
                         _ = tokio::time::sleep(wait) => break,
@@ -594,6 +598,7 @@ impl AppState {
             metadata_batch_cancel: Arc::new(AtomicBool::new(false)),
             bg_metadata_cancel: Arc::new(AtomicBool::new(false)),
             metadata_cancel_notify: Arc::new(Notify::new()),
+            single_metadata_cancel_notify: Arc::new(Notify::new()),
             metadata_batch_active: Arc::new(AtomicBool::new(false)),
             embed_control: Mutex::new(Arc::new(ScanControl::new())),
             embed_pause_depth: AtomicUsize::new(0),

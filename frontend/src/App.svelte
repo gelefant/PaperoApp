@@ -99,7 +99,7 @@
   let activeTabId = $state<string | null>(null);
   let contextTarget = $state<ContextTarget | null>(null);
   let topBarRef = $state<{ focusSearch?: () => void } | null>(null);
-  let inspectorRef = $state<{ savePendingIfForDoc: (docId: number) => Promise<void> } | null>(
+  let inspectorRef = $state<{ savePendingIfForDoc: (docId: number) => Promise<boolean> } | null>(
     null
   );
   let settingsOpen = $state(false);
@@ -120,11 +120,13 @@
   let lang = $derived(normalizeLang(settings?.ui_language));
   let unlistenFs: UnlistenFn | null = null;
   let unlistenBackup: UnlistenFn | null = null;
+  let unlistenDuplicates: UnlistenFn | null = null;
   let appDestroyed = false;
   let fsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let docsReqSeq = 0;
   let searchReqSeq = 0;
   let inspectorReqSeq = 0;
+  let singleFetchSeq = 0;
 
   $effect(() => {
     document.documentElement.dataset.theme = settings?.ui_theme ?? 'system';
@@ -561,6 +563,17 @@
       return;
     }
     unlistenBackup = unBk;
+
+    const unDup = await listen('papero://duplicates-updated', () => {
+      if (!appDestroyed) {
+        void refreshDuplicates();
+      }
+    });
+    if (appDestroyed) {
+      unDup();
+      return;
+    }
+    unlistenDuplicates = unDup;
   });
 
   onDestroy(() => {
@@ -571,6 +584,7 @@
     }
     unlistenFs?.();
     unlistenBackup?.();
+    unlistenDuplicates?.();
   });
 
   async function handleAddFolder() {
@@ -758,23 +772,41 @@
     const prevList = documents;
     const prevIdx = prevList.findIndex((d) => d.document_id === documentId);
 
+    if (verified && fetchingMeta && selectedDocId === documentId) {
+      singleFetchSeq++;
+      fetchingMeta = false;
+      fetchStatusMsg = '';
+      void api.cancelSingleMetadata();
+    }
+
     if (verified && inspectorOpen && selectedDocId === documentId) {
-      await inspectorRef?.savePendingIfForDoc(documentId);
+      const saved = await inspectorRef?.savePendingIfForDoc(documentId);
+      if (saved === false) return;
     }
 
     const updated = await api.setDocumentMetadataVerified(documentId, verified);
     if (selectedDocId === documentId) {
       selectedMeta = updated;
     }
-    allDocuments = allDocuments.map((d) =>
-      d.document_id === documentId ? { ...d, metadata_verified: verified } : d
-    );
-    await refreshDocuments(false);
+    const patchDoc = (d: DocumentListItem): DocumentListItem =>
+      d.document_id === documentId
+        ? {
+            ...d,
+            title: updated.title,
+            year: updated.year,
+            work_type: updated.work_type,
+            metadata_source: updated.metadata_source,
+            metadata_verified: verified,
+          }
+        : d;
+    allDocuments = allDocuments.map(patchDoc);
+    documents = documents.map(patchDoc);
 
     const shouldAdvance =
       verified &&
       (advanceNext || (activeVerifiedFilter === 'unverified' && selectedDocId === documentId));
     if (shouldAdvance) {
+      await refreshDocuments(false);
       let nextDoc: DocumentListItem | undefined;
       if (activeVerifiedFilter === 'unverified') {
         if (documents.length > 0) {
@@ -794,6 +826,8 @@
         selectedMeta = null;
         fetchStatusMsg = '';
       }
+    } else {
+      void refreshDocuments(false);
     }
   }
 
@@ -1160,14 +1194,39 @@
     }
   }
 
+  function handleCancelSingleMetadata() {
+    singleFetchSeq++;
+    fetchingMeta = false;
+    fetchStatusMsg = 'Ricerca online interrotta.';
+    void api.cancelSingleMetadata();
+  }
+
+  async function handleFlushDocMetadata(edit: ManualMetadataEdit, lockedFields?: string[]) {
+    await api.saveDocumentMetadata(edit, lockedFields);
+  }
+
   async function handleSaveDocMetadata(edit: ManualMetadataEdit, lockedFields?: string[]) {
-    selectedMeta = await api.saveDocumentMetadata(edit, lockedFields);
-    await Promise.all([
-      refreshDocuments(true),
-      refreshDuplicates(),
-      refreshTaxonomy(),
-      refreshLlmPreview(),
-    ]);
+    if (fetchingMeta) {
+      singleFetchSeq++;
+      fetchingMeta = false;
+      void api.cancelSingleMetadata();
+    }
+    const updated = await api.saveDocumentMetadata(edit, lockedFields);
+    selectedMeta = updated;
+    const patchDoc = (d: DocumentListItem): DocumentListItem =>
+      d.document_id === updated.document_id
+        ? {
+            ...d,
+            title: updated.title,
+            year: updated.year,
+            work_type: updated.work_type,
+            metadata_source: updated.metadata_source,
+            metadata_verified: updated.metadata_verified,
+          }
+        : d;
+    allDocuments = allDocuments.map(patchDoc);
+    documents = documents.map(patchDoc);
+    void Promise.all([refreshDocuments(true), refreshTaxonomy(), refreshLlmPreview()]);
   }
 
   const SOURCE_SHORT_NAMES: Record<string, string> = {
@@ -1235,6 +1294,7 @@
     lockedFields: string[],
     overwriteQueryFields = false
   ) {
+    const reqSeq = ++singleFetchSeq;
     fetchingMeta = true;
     fetchStatusMsg = `Ricerca guidata secondo priorità (${formatActivePriorityChain(settings)})…`;
     try {
@@ -1244,8 +1304,13 @@
         true,
         overwriteQueryFields
       );
+      if (reqSeq !== singleFetchSeq) return;
       selectedMeta = res.metadata;
       const outcome = res.outcome;
+      if (outcome.status === 'cancelled') {
+        fetchStatusMsg = 'Ricerca online interrotta.';
+        return outcome;
+      }
       if (outcome.status === 'updated') {
         fetchStatusMsg = overwriteQueryFields
           ? `Metadati (inclusi titolo e autori ufficiali) aggiornati da ${outcome.source ?? 'fonte esterna'}.`
@@ -1259,25 +1324,30 @@
       } else {
         fetchStatusMsg = 'Nessuna corrispondenza trovata con i campi inseriti. Prova ad aggiungere o precisare Titolo/Autore.';
       }
-      await Promise.all([
-        refreshDocuments(true),
-        refreshDuplicates(),
-        refreshTaxonomy(),
-        refreshLlmPreview(),
-      ]);
+      void Promise.all([refreshDocuments(true), refreshTaxonomy(), refreshLlmPreview()]);
       return outcome;
     } catch (e) {
-      fetchStatusMsg = `Errore ricerca guidata metadati: ${e}`;
+      if (reqSeq === singleFetchSeq) {
+        fetchStatusMsg = `Errore ricerca guidata metadati: ${e}`;
+      }
     } finally {
-      fetchingMeta = false;
+      if (reqSeq === singleFetchSeq) {
+        fetchingMeta = false;
+      }
     }
   }
 
   async function handleFetchDocMetadata(documentId: number) {
+    const reqSeq = ++singleFetchSeq;
     fetchingMeta = true;
     fetchStatusMsg = `Ricerca metadati secondo priorità (${formatActivePriorityChain(settings)})…`;
     try {
       const outcome = await api.fetchDocumentMetadata(documentId);
+      if (reqSeq !== singleFetchSeq) return;
+      if (outcome.status === 'cancelled') {
+        fetchStatusMsg = 'Ricerca online interrotta.';
+        return outcome;
+      }
       let msg = '';
       if (outcome.status === 'updated') {
         msg = `Metadati aggiornati da ${outcome.source ?? 'fonte esterna'}.`;
@@ -1290,14 +1360,20 @@
       } else {
         msg = 'Nessun risultato migliore trovato nelle fonti abilitate.';
       }
-      selectedMeta = await api.getDocumentMetadata(documentId);
+      const latestMeta = await api.getDocumentMetadata(documentId);
+      if (reqSeq !== singleFetchSeq) return;
+      selectedMeta = latestMeta;
       fetchStatusMsg = msg;
-      await Promise.all([refreshDocuments(true), refreshDuplicates(), refreshTaxonomy()]);
+      void Promise.all([refreshDocuments(true), refreshTaxonomy()]);
       return outcome;
     } catch (e) {
-      fetchStatusMsg = `Errore ricerca metadati: ${e}`;
+      if (reqSeq === singleFetchSeq) {
+        fetchStatusMsg = `Errore ricerca metadati: ${e}`;
+      }
     } finally {
-      fetchingMeta = false;
+      if (reqSeq === singleFetchSeq) {
+        fetchingMeta = false;
+      }
     }
   }
 
@@ -1712,8 +1788,10 @@
             fetchingOnline={fetchingMeta}
             lastFetchMessage={fetchStatusMsg}
             onSave={handleSaveDocMetadata}
+            onFlushSave={handleFlushDocMetadata}
             onSaveAndFetch={handleSaveAndFetchDocMetadata}
             onFetchMetadata={handleFetchDocMetadata}
+            onCancelFetch={handleCancelSingleMetadata}
             onToggleVerified={handleToggleDocVerified}
             {hasNextUnverified}
             onConfirmCandidate={handleConfirmCandidate}

@@ -716,6 +716,14 @@ async fn resolve_document_metadata_inner(
         };
         resolve_record_journal_fields(db, clients, config, &mut chosen.record, lock_abbrev).await;
         let w = db.writer();
+        if is_document_metadata_verified(&w, document_id)? {
+            return Ok(ResolveOutcome {
+                document_id,
+                status: "verified_locked".to_string(),
+                source: None,
+                candidates_count: 0,
+            });
+        }
         apply_record_respecting_locks(&w, document_id, &chosen.record, false)?;
         w.execute(
             "DELETE FROM metadata_candidates WHERE document_id = ?1",
@@ -768,6 +776,14 @@ async fn resolve_document_metadata_inner(
         }
         let now = chrono::Utc::now().timestamp();
         let w = db.writer();
+        if is_document_metadata_verified(&w, document_id)? {
+            return Ok(ResolveOutcome {
+                document_id,
+                status: "verified_locked".to_string(),
+                source: None,
+                candidates_count: 0,
+            });
+        }
         let tx = w.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM metadata_candidates WHERE document_id = ?1",
@@ -2681,7 +2697,25 @@ pub fn apply_manual_metadata_edit_with_locks(
         let url_val = if keep("url") { clean_opt(&edit.url) } else { None };
         let msc_primary_val = if keep("msc_primary") { clean_opt(&edit.msc_primary) } else { None };
         let abstract_val = if keep("abstract_text") { clean_opt(&edit.abstract_text) } else { None };
-        let clear_raw_bib = reset_unlocked || !edit.edited_fields.is_empty() || !locked_vec.is_empty();
+        let (prev_arxiv_id, prev_mr_number): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT arxiv_id, mr_number FROM documents WHERE id = ?1",
+                params![edit.document_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None));
+        let clear_arxiv_version = (reset_unlocked && !locked.contains("arxiv_id"))
+            || arxiv_val.is_none()
+            || arxiv_val != prev_arxiv_id;
+        let clear_mr_display = (reset_unlocked && !locked.contains("mr_number"))
+            || mr_norm.is_none()
+            || mr_norm != prev_mr_number;
+        let clear_raw_bib = reset_unlocked
+            || !edit.edited_fields.is_empty()
+            || !locked_vec.is_empty()
+            || clear_arxiv_version
+            || clear_mr_display;
         let next_source = if reset_unlocked && locked_vec.is_empty() {
             "heuristic"
         } else {
@@ -2755,8 +2789,8 @@ pub fn apply_manual_metadata_edit_with_locks(
                 locked_json,
                 edit.exclude_from_cloud_llm as i64,
                 now,
-                (reset_unlocked && !locked.contains("arxiv_id")) as i64,
-                (reset_unlocked && !locked.contains("mr_number")) as i64,
+                clear_arxiv_version as i64,
+                clear_mr_display as i64,
                 clear_raw_bib as i64,
                 reset_unlocked as i64,
                 next_source,
@@ -6736,5 +6770,123 @@ mod tests {
         assert_eq!(verified_meta.authors[0].family_name, "Brezzi");
         assert!(verified_meta.doi.is_none());
         assert!(verified_meta.pending_candidates.is_empty());
+    }
+
+    #[test]
+    fn manual_metadata_edit_clears_wrong_fetched_fields_including_year_and_mr_display() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("clear_wrong_fields.db"), 2).unwrap();
+
+        let doc_id = {
+            let w = db.writer();
+            let id = create_heuristic_document(&w, "Principal Component Analysis").unwrap();
+            let wrong_article = BibliographicRecord {
+                work_type: WorkType::Article,
+                title: "Principal Component Analysis".into(),
+                authors: vec![BibliographicAuthor {
+                    family_name: "Jolliffe".into(),
+                    given_name: "I. T.".into(),
+                    role: "author".into(),
+                }],
+                journal_abbrev: Some("Philos. Trans. Roy. Soc. A".into()),
+                journal_full: Some("Philosophical Transactions of the Royal Society A".into()),
+                volume: Some("374".into()),
+                issue_number: Some("2065".into()),
+                year: Some(2016),
+                pages: Some("20150202, 16".into()),
+                issn: Some("1364-503X,1471-2962".into()),
+                doi: Some("10.1098/rsta.2015.0202".into()),
+                arxiv_id: Some("1601.00001".into()),
+                arxiv_version: Some("v2".into()),
+                mr_number: Some("3479904".into()),
+                mr_number_display: Some("3479904 (2016m:62001)".into()),
+                url: Some("https://doi.org/10.1098/rsta.2015.0202".into()),
+                msc_primary: Some("62H25".into()),
+                msc_secondary: vec!["62-02".into()],
+                source: "mrlookup".into(),
+                ..Default::default()
+            };
+            apply_record_respecting_locks(&w, id, &wrong_article, false).unwrap();
+            id
+        };
+
+        // User clears all wrong fetched fields (leaving them empty) and keeps book + title + author
+        let cleared = apply_manual_metadata_edit_with_locks(
+            &db,
+            &ManualMetadataEdit {
+                document_id: doc_id,
+                work_type: "book".into(),
+                title: "Principal Component Analysis".into(),
+                authors: vec![BibliographicAuthor {
+                    family_name: "Jolliffe".into(),
+                    given_name: "I. T.".into(),
+                    role: "author".into(),
+                }],
+                year: None,
+                journal_abbrev: None,
+                journal_full: None,
+                volume: None,
+                issue_number: None,
+                pages: None,
+                issn: None,
+                doi: None,
+                arxiv_id: None,
+                mr_number: None,
+                url: None,
+                msc_primary: None,
+                msc_secondary: vec![],
+                edited_fields: vec![
+                    "year".into(),
+                    "journal_abbrev".into(),
+                    "journal_full".into(),
+                    "volume".into(),
+                    "issue_number".into(),
+                    "pages".into(),
+                    "issn".into(),
+                    "doi".into(),
+                    "arxiv_id".into(),
+                    "mr_number".into(),
+                    "url".into(),
+                    "msc_primary".into(),
+                    "msc_secondary".into(),
+                ],
+                ..Default::default()
+            },
+            Some(&[
+                "authors".to_string(),
+                "title".to_string(),
+                "work_type".to_string(),
+            ]),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(cleared.work_type, "book");
+        assert_eq!(cleared.title, "Principal Component Analysis");
+        assert_eq!(cleared.year, None);
+        assert_eq!(cleared.journal_abbrev, None);
+        assert_eq!(cleared.journal_full, None);
+        assert_eq!(cleared.volume, None);
+        assert_eq!(cleared.issue_number, None);
+        assert_eq!(cleared.pages, None);
+        assert_eq!(cleared.issn, None);
+        assert_eq!(cleared.doi, None);
+        assert_eq!(cleared.arxiv_id, None);
+        assert_eq!(cleared.arxiv_version, None);
+        assert_eq!(cleared.mr_number, None);
+        assert_eq!(cleared.mr_number_display, None);
+        assert_eq!(cleared.url, None);
+        assert_eq!(cleared.msc_primary, None);
+        assert_eq!(cleared.msc_primary_status, "none");
+        assert!(cleared.msc_secondary.is_empty());
+        assert_eq!(cleared.metadata_source.as_deref(), Some("manual"));
+
+        let bib = crate::metadata::io::export_documents_bibtex(
+            &[cleared],
+            &crate::bibtex::BibtexExportOptions::default(),
+        );
+        assert!(!bib.contains("3479904"), "stale MRNUMBER must be removed from BibTeX: {bib}");
+        assert!(!bib.contains("10.1098/rsta.2015.0202"), "cleared DOI must not remain in BibTeX: {bib}");
+        assert!(!bib.contains("2016"), "cleared YEAR must not remain in BibTeX: {bib}");
     }
 }

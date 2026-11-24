@@ -302,13 +302,13 @@ pub fn create_backup_bundle_with_bm25(
         let _ = src_conn.busy_timeout(Duration::from_secs(10));
         let mut dst_conn = Connection::open(&snap_db_path)?;
         let backup = Backup::new(&src_conn, &mut dst_conn)?;
-        backup.run_to_completion(1024, Duration::from_millis(2), None)?;
+        backup.run_to_completion(4096, Duration::ZERO, None)?;
     } else {
         let src_conn = db.reader();
         let _ = src_conn.busy_timeout(Duration::from_secs(10));
         let mut dst_conn = Connection::open(&snap_db_path)?;
         let backup = Backup::new(&src_conn, &mut dst_conn)?;
-        backup.run_to_completion(1024, Duration::from_millis(2), None)?;
+        backup.run_to_completion(4096, Duration::ZERO, None)?;
     }
 
     let mut cfg = AppConfig::load_or_default(&paths.config_path)?;

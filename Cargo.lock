@@ -3345,7 +3345,7 @@ dependencies = [
 
 [[package]]
 name = "papero-app"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "http",
  "papero-core",
@@ -3361,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "papero-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "blake3",
  "chrono",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "papero-eval"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "clap",
  "papero-core",

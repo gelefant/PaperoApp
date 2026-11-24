@@ -156,6 +156,7 @@ export const api = {
     });
   },
   cancelMetadataBatch: () => invoke<void>('cancel_metadata_batch_cmd'),
+  cancelSingleMetadata: () => invoke<void>('cancel_single_metadata_cmd'),
   confirmCandidate: (documentId: number, candidateId: number, overwriteQueryFields = false) =>
     invoke<DocumentMetadataView>('confirm_candidate', {
       documentId,
