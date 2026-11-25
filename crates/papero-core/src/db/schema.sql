@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS documents (
     is_starred              INTEGER NOT NULL DEFAULT 0,
     published_notice_json   TEXT,
                             -- Cached JSON notice when an arXiv preprint has a published journal version
+    citation_key_override   TEXT,
+                            -- Optional user-specified BibTeX citation key override
     minhash_sig             BLOB,             -- 128 x u64 (1024 bytes) MinHash signature of extracted text
     content_modified_notice INTEGER NOT NULL DEFAULT 0, -- Flag set if underlying file was replaced on disk
     created_at              INTEGER NOT NULL,
@@ -159,12 +161,15 @@ CREATE TABLE IF NOT EXISTS passages (
     is_alt_formula  INTEGER NOT NULL DEFAULT 0, -- 1 if from Nougat/Marker alternative text
     token_count     INTEGER NOT NULL,
     text_content    TEXT NOT NULL,
-    bboxes_blob     BLOB NOT NULL     -- Little-endian packed array of `[f32; 4]` = (x, y, w, h)
+    bboxes_blob     BLOB NOT NULL,    -- Little-endian packed array of `[f32; 4]` = (x, y, w, h)
                                       -- normalized in [0.0, 1.0], origin TOP-LEFT!
+    statement_kind  TEXT,             -- 'theorem'|'lemma'|'proposition'|'corollary'|'definition'|'conjecture'|'axiom'|'claim'|'remark'|'example'
+    statement_label TEXT              -- e.g. 'Theorem 3.2', 'Definition 1.4', 'Remark 2.1'
 );
 CREATE INDEX IF NOT EXISTS idx_passages_file_page ON passages(file_id, page_ord);
 CREATE INDEX IF NOT EXISTS idx_passages_doc ON passages(document_id);
 CREATE INDEX IF NOT EXISTS idx_passages_doc_page ON passages(document_id, page_ord, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_passages_stmt_kind ON passages(statement_kind) WHERE statement_kind IS NOT NULL;
 
 -- 9. User free tags & Unsupervised topic clusters
 CREATE TABLE IF NOT EXISTS tags (
@@ -290,11 +295,12 @@ CREATE TABLE IF NOT EXISTS file_annotations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     blake3_hash     TEXT NOT NULL,
     page_ord        INTEGER NOT NULL,
-    kind            TEXT NOT NULL DEFAULT 'highlight', -- 'highlight' | 'bookmark' | 'note'
+    kind            TEXT NOT NULL DEFAULT 'highlight', -- 'highlight' | 'bookmark' | 'note' | 'snip'
     color           TEXT NOT NULL DEFAULT 'yellow',    -- 'yellow' | 'green' | 'blue' | 'pink'
     rects_json      TEXT NOT NULL DEFAULT '[]',        -- JSON array of NormalizedRect
     quoted_text     TEXT NOT NULL DEFAULT '',
     note_markdown   TEXT NOT NULL DEFAULT '',
+    image_data_url  TEXT,                              -- Optional PNG data URL for rectangular Area Snip annotations
     search_norm     TEXT NOT NULL DEFAULT '',          -- Math-diacritic-folded text for fast search
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL

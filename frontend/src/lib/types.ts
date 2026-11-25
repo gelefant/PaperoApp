@@ -353,6 +353,7 @@ export interface DocumentMetadataView {
   msc_primary_status: string;
   msc_secondary: string[];
   abstract_text: string | null;
+  citation_key_override?: string | null;
   raw_mrlookup_bibtex: string | null;
   metadata_source: string | null;
   metadata_license_note: string | null;
@@ -393,6 +394,7 @@ export interface ManualMetadataEdit {
   msc_primary: string | null;
   msc_secondary: string[];
   abstract_text: string | null;
+  citation_key_override?: string | null;
   exclude_from_cloud_llm: boolean;
   tags: string[];
   edited_fields: string[];
@@ -450,9 +452,10 @@ export interface MetadataSearchFilter {
   sort_dir?: SortDirection | null;
 }
 
-/** Content search filter (intentionally excludes MSC2020 per Papero design). */
+/** Content search filter (propagates MSC2020, tags, clusters, collections, author/year, and statement subtypes). */
 export interface ContentSearchFilter {
   root_ids?: string[] | null;
+  msc_prefix?: string | null;
   tag?: string | null;
   cluster_id?: number | null;
   collection_id?: number | null;
@@ -463,6 +466,7 @@ export interface ContentSearchFilter {
   reading_status?: ReadingStatus | string | null;
   starred_only?: boolean | null;
   statements_only?: boolean;
+  statement_kinds?: string[] | null;
 }
 
 export interface ImportMetadataReport {
@@ -702,26 +706,35 @@ export type LlmStreamEvent =
   | { event: 'done'; result: LlmAnswerResult }
   | { event: 'error'; message: string };
 
+export interface SnipLatexResult {
+  provider: LlmProvider;
+  model: string;
+  latex: string;
+  usage: LlmUsage;
+}
+
 export interface FileAnnotation {
   id: number;
   blake3_hash: string;
   page_ord: number;
-  kind: 'highlight' | 'bookmark' | 'note' | string;
+  kind: 'highlight' | 'bookmark' | 'note' | 'snip' | string;
   color: 'yellow' | 'green' | 'blue' | 'pink' | string;
   rects: NormalizedRect[];
   quoted_text: string;
   note_markdown: string;
+  image_data_url?: string | null;
   created_at: number;
   updated_at: number;
 }
 
 export interface NewFileAnnotation {
   page_ord: number;
-  kind: 'highlight' | 'bookmark' | 'note';
+  kind: 'highlight' | 'bookmark' | 'note' | 'snip';
   color?: 'yellow' | 'green' | 'blue' | 'pink';
   rects?: NormalizedRect[];
   quoted_text?: string;
   note_markdown?: string;
+  image_data_url?: string | null;
 }
 
 export interface UpdateFileAnnotation {

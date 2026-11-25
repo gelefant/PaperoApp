@@ -2,12 +2,13 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// A detected mathematical statement header (Theorem, Lemma, Proposition, Corollary, Definition,
-/// Conjecture, Axiom, Claim) inside a passage chunk.
+/// Conjecture, Axiom, Claim, Remark, Example) inside a passage chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedStatement {
-    /// Canonical lowercase kind: `"theorem" | "lemma" | "proposition" | "corollary" | "definition" | "conjecture" | "axiom" | "claim"`.
+    /// Canonical lowercase kind:
+    /// `"theorem" | "lemma" | "proposition" | "corollary" | "definition" | "conjecture" | "axiom" | "claim" | "remark" | "example"`.
     pub kind: &'static str,
-    /// Human-readable short badge, e.g. `"Theorem 3.2"` or `"Lemma 1"`.
+    /// Human-readable short badge, e.g. `"Theorem 3.2"` or `"Remark 2.1"`.
     pub label: String,
 }
 
@@ -19,7 +20,7 @@ fn statement_header_re() -> &'static Regex {
         // Requires either a number, a parenthetical attribution `(Riesz)`, or explicit punctuation (`.` / `:` / `—`)
         // to eliminate casual prose occurrences ("a theorem about...").
         Regex::new(
-            r"(?im)(?:^|[.!?]\s+|\n\s*)(Theorem|Teorema|Th[eé]or[eè]me|Satz|Hauptsatz|Lemma|Lemme|Hilfssatz|Proposition|Proposizione|Corollary|Corollario|Corollaire|Korollar|Definition|Definizione|D[eé]finition|Conjecture|Congettura|Axiom|Assioma|Axiome|Claim)(?:\s+([A-Z]?\d+(?:[.\-]\d+)*[a-z]?|[IVXLCM]+|\*[A-Z0-9]*))?(?:\s*\([^)\n]{1,48}\))?\s*(?:[.:—–-]|\n|$)",
+            r"(?im)(?:^|[.!?]\s+|\n\s*)(Theorem|Teorema|Th[eé]or[eè]me|Satz|Hauptsatz|Lemma|Lemme|Hilfssatz|Proposition|Proposizione|Corollary|Corollario|Corollaire|Korollar|Definition|Definizione|D[eé]finition|Conjecture|Congettura|Axiom|Assioma|Axiome|Claim|Remark|Remarks|Osservazione|Osservazioni|Remarque|Remarques|Bemerkung|Anmerkung|Example|Examples|Esempio|Esempi|Exemple|Exemples|Beispiel|Counterexample|Controesempio|Contre-exemple|Gegenbeispiel)(?:\s+([A-Z]?\d+(?:[.\-]\d+)*[a-z]?|[IVXLCM]+|\*[A-Z0-9]*))?(?:\s*\([^)\n]{1,48}\))?\s*(?:[.:—–-]|\n|$)",
         )
         .unwrap()
     })
@@ -57,6 +58,21 @@ fn canonical_kind(keyword: &str) -> &'static str {
         "conjecture"
     } else if low.starts_with("ax") || low.starts_with("ass") {
         "axiom"
+    } else if low.starts_with("rem")
+        || low.starts_with("oss")
+        || low.starts_with("bem")
+        || low.starts_with("anm")
+    {
+        "remark"
+    } else if low.starts_with("ex")
+        || low.starts_with("esem")
+        || low.starts_with("beisp")
+        || low.starts_with("counter")
+        || low.starts_with("contro")
+        || low.starts_with("contre")
+        || low.starts_with("gegen")
+    {
+        "example"
     } else {
         "claim"
     }
@@ -161,6 +177,16 @@ mod tests {
         let satz = detect_math_statement("Satz 4. Ist G eine endliche Gruppe...").unwrap();
         assert_eq!(satz.kind, "theorem");
         assert_eq!(satz.label, "Satz 4");
+
+        let rem = detect_math_statement("Osservazione 3.1. Il funzionale non è coercivo su L^1.")
+            .unwrap();
+        assert_eq!(rem.kind, "remark");
+        assert_eq!(rem.label, "Osservazione 3.1");
+
+        let ex = detect_math_statement("Counterexample 2.4. Take f(x) = x sin(1/x) on [0, 1].")
+            .unwrap();
+        assert_eq!(ex.kind, "example");
+        assert_eq!(ex.label, "Counterexample 2.4");
     }
 
     #[test]

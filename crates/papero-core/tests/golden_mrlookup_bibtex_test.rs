@@ -145,6 +145,7 @@ fn manual_locked_fields_are_never_overwritten_by_autofetch() {
             msc_primary: Some("49F20".into()),
             msc_secondary: vec![],
             abstract_text: None,
+            citation_key_override: None,
             exclude_from_cloud_llm: false,
             tags: vec!["variational".into()],
             edited_fields: vec!["title".into(), "year".into(), "msc_primary".into()],

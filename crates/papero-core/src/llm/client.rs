@@ -9,7 +9,7 @@ use crate::llm::guard::{
     REFUSAL_IT,
 };
 use crate::llm::provider::{
-    LlmAnswerResult, LlmKeyVerifyResult, LlmModelInfo, LlmProvider, LlmUsage,
+    LlmAnswerResult, LlmKeyVerifyResult, LlmModelInfo, LlmProvider, LlmUsage, SnipLatexResult,
 };
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
@@ -1053,4 +1053,246 @@ fn parse_chat_response(provider: LlmProvider, v: &Value) -> Result<(String, LlmU
             ))
         }
     }
+}
+
+fn parse_snip_image_data_url(data_url: &str) -> Result<(&'static str, &str)> {
+    let trimmed = data_url.trim();
+    if trimmed.len() > 4_000_000 {
+        return Err(CoreError::Config(
+            "Area Snip image exceeds maximum size limit for Vision OCR.".into(),
+        ));
+    }
+    let (mime, b64) = if let Some(rest) = trimmed.strip_prefix("data:image/png;base64,") {
+        ("image/png", rest.trim())
+    } else if let Some(rest) = trimmed.strip_prefix("data:image/jpeg;base64,") {
+        ("image/jpeg", rest.trim())
+    } else if let Some(rest) = trimmed.strip_prefix("data:image/webp;base64,") {
+        ("image/webp", rest.trim())
+    } else {
+        return Err(CoreError::Config(
+            "Invalid image data URL (expected PNG/JPEG/WebP base64).".into(),
+        ));
+    };
+    if b64.is_empty() {
+        return Err(CoreError::Config("Empty image payload.".into()));
+    }
+    Ok((mime, b64))
+}
+
+fn strip_outer_markdown_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(after_open) = trimmed.strip_prefix("```") {
+        if let Some(nl) = after_open.find('\n') {
+            let inner = after_open[nl + 1..].trim();
+            if let Some(body) = inner.strip_suffix("```") {
+                return body.trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Converts a cropped rectangular page snip (`data:image/png;base64,...`) of a mathematical formula,
+/// statement, or commutative diagram into clean AMS-LaTeX / `tikz-cd` using the configured Vision LLM
+/// (local Ollama or consented cloud API), strictly enforcing per-document & per-folder cloud exclusions.
+pub async fn convert_snip_image_to_latex(
+    db: Option<&Database>,
+    config: &AppConfig,
+    api_key: Option<&SecretApiKey>,
+    document_id: i64,
+    image_data_url: &str,
+    hint: Option<&str>,
+    base_url_override: Option<&str>,
+) -> Result<SnipLatexResult> {
+    let provider = config.llm_provider;
+    if !provider.is_enabled() {
+        return Err(CoreError::Config(
+            "LLM provider is disabled in Settings.".into(),
+        ));
+    }
+    let model = config
+        .llm_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            CoreError::Config("No LLM model selected. Choose a vision-capable model in Settings.".into())
+        })?
+        .to_string();
+
+    if provider.is_cloud() {
+        if let Some(database) = db {
+            let conn = database.reader();
+            let excluded = crate::llm::guard::query_cloud_exclusion_map(&conn, &[document_id])?;
+            if excluded.contains_key(&document_id) {
+                return Err(CoreError::Config(
+                    "Document or source folder is excluded from cloud LLM transmission. Use local Ollama or update cloud exclusion in the Inspector.".into(),
+                ));
+            }
+        }
+        if !has_cloud_consent(config, provider) {
+            return Err(CoreError::Config("CLOUD_CONSENT_REQUIRED".into()));
+        }
+    }
+
+    let (mime_type, raw_base64) = parse_snip_image_data_url(image_data_url)?;
+    let full_data_url = format!("data:{mime_type};base64,{raw_base64}");
+
+    let system_prompt = "You are an expert mathematical LaTeX and commutative-diagram OCR transcriber.\n\
+Convert the cropped mathematical formula, theorem statement, or diagram into accurate, compilable AMS-LaTeX.\n\
+Rules:\n\
+1. For standalone display equations, wrap in `$$...$$` (or `\\begin{aligned}...\\end{aligned}` inside `$$...$$`).\n\
+2. For commutative diagrams, output `\\begin{tikzcd}...\\end{tikzcd}`.\n\
+3. For mixed prose + math (e.g. a scanned Theorem or Definition), preserve the text verbatim and wrap inline math in `$...$` and display math in `$$...$$`.\n\
+4. Output ONLY the transcription without commentary, explanations, or surrounding ```latex code fences.";
+
+    let user_prompt = match hint.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => format!("Transcribe this cropped mathematical region into LaTeX ({h}):"),
+        None => "Transcribe this cropped mathematical region into LaTeX:".to_string(),
+    };
+
+    let base = resolve_base_url(provider, Some(&config.llm_ollama_url), base_url_override);
+    let is_local = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    let client = build_http_client(is_local)?;
+    let max_tokens = config.llm_max_output_tokens.clamp(256, 4096);
+
+    let req = match provider {
+        LlmProvider::Disabled => unreachable!(),
+        LlmProvider::Ollama => {
+            let body = json!({
+                "model": model,
+                "stream": false,
+                "options": {
+                    "num_predict": max_tokens,
+                    "temperature": 0.05
+                },
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user", "content": user_prompt, "images": [raw_base64] }
+                ]
+            });
+            client.post(format!("{base}/api/chat")).json(&body)
+        }
+        LlmProvider::OpenAi => {
+            let key = require_cloud_key(provider, api_key)?;
+            let body = json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0.05,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    {
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": user_prompt },
+                            { "type": "image_url", "image_url": { "url": full_data_url } }
+                        ]
+                    }
+                ]
+            });
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(key.expose())
+                .json(&body)
+        }
+        LlmProvider::Anthropic => {
+            let key = require_cloud_key(provider, api_key)?;
+            let body = json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": 0.05,
+                "system": system_prompt,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": raw_base64
+                                }
+                            },
+                            { "type": "text", "text": user_prompt }
+                        ]
+                    }
+                ]
+            });
+            client
+                .post(format!("{base}/v1/messages"))
+                .header("x-api-key", key.expose())
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+        }
+        LlmProvider::Gemini => {
+            let key = require_cloud_key(provider, api_key)?;
+            let clean_model = model.strip_prefix("models/").unwrap_or(&model);
+            let body = json!({
+                "systemInstruction": {
+                    "parts": [{ "text": system_prompt }]
+                },
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": raw_base64
+                                }
+                            },
+                            { "text": user_prompt }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.05,
+                    "maxOutputTokens": max_tokens
+                }
+            });
+            client
+                .post(format!("{base}/v1beta/models/{clean_model}:generateContent"))
+                .header("x-goog-api-key", key.expose())
+                .json(&body)
+        }
+    };
+
+    let resp = req.send().await.map_err(|e| {
+        CoreError::Network(format!(
+            "{}: errore di rete: {}",
+            provider.display_name(),
+            sanitize_error_snippet(&e.to_string(), api_key)
+        ))
+    })?;
+
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+    let body_text = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(map_provider_http_error(
+            provider,
+            status,
+            &body_text,
+            retry_after.as_deref(),
+            api_key,
+        ));
+    }
+
+    let val: Value = serde_json::from_str(&body_text)
+        .map_err(|e| CoreError::Network(format!("Invalid provider response JSON: {e}")))?;
+    let (raw_text, usage) = parse_chat_response(provider, &val)?;
+    let latex_markdown = strip_outer_markdown_fence(&raw_text);
+
+    Ok(SnipLatexResult {
+        provider,
+        model,
+        latex_markdown,
+        usage,
+    })
 }

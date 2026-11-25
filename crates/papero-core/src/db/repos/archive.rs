@@ -32,6 +32,8 @@ pub struct ManualMetadataSnapshot {
     pub msc_primary: Option<String>,
     pub msc_primary_status: String,
     pub abstract_text: Option<String>,
+    #[serde(default)]
+    pub citation_key_override: Option<String>,
     pub manual_locked_fields: Vec<String>,
     #[serde(default)]
     pub metadata_verified: bool,
@@ -73,7 +75,8 @@ pub fn archive_if_manual(conn: &Connection, document_id: i64, blake3_hash: &str)
                     year, pages, edition, publisher, address, isbn, issn, doi,
                     arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer,
                     zbl_number, url, msc_primary, msc_primary_status, abstract_text,
-                    manual_locked_fields, metadata_verified, reading_status, is_starred
+                    manual_locked_fields, metadata_verified, reading_status, is_starred,
+                    citation_key_override
              FROM documents WHERE id = ?1",
             params![document_id],
             |r| {
@@ -108,6 +111,7 @@ pub fn archive_if_manual(conn: &Connection, document_id: i64, blake3_hash: &str)
                     msc_primary: r.get(25)?,
                     msc_primary_status: r.get(26)?,
                     abstract_text: r.get(27)?,
+                    citation_key_override: r.get(32)?,
                     manual_locked_fields: locked,
                     metadata_verified: r.get::<_, i64>(29)? != 0,
                     reading_status: r
@@ -136,9 +140,14 @@ pub fn archive_if_manual(conn: &Connection, document_id: i64, blake3_hash: &str)
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let has_confirmed_msc = snapshot.msc_primary_status == "confirmed";
+    let has_cite_override = snapshot
+        .citation_key_override
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
     if snapshot.manual_locked_fields.is_empty()
         && tags.is_empty()
         && !has_confirmed_msc
+        && !has_cite_override
         && !snapshot.metadata_verified
         && snapshot.reading_status == "unread"
         && !snapshot.is_starred
@@ -226,6 +235,7 @@ pub fn apply_restored_archive(
             mr_reviewer = ?23, zbl_number = ?24, url = ?25, msc_primary = ?26,
             msc_primary_status = ?27, abstract_text = ?28, manual_locked_fields = ?29,
             metadata_verified = ?30, reading_status = ?31, is_starred = ?32,
+            citation_key_override = ?35,
             metadata_source = 'manual', updated_at = ?33
          WHERE id = ?34",
         params![
@@ -262,7 +272,8 @@ pub fn apply_restored_archive(
             s.reading_status,
             s.is_starred as i64,
             now,
-            document_id
+            document_id,
+            s.citation_key_override,
         ],
     )?;
 

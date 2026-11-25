@@ -10,13 +10,15 @@ pub struct FileAnnotation {
     pub id: i64,
     pub blake3_hash: String,
     pub page_ord: u32,
-    /// `'highlight' | 'bookmark' | 'note'`
+    /// `'highlight' | 'bookmark' | 'note' | 'snip'`
     pub kind: String,
     /// `'yellow' | 'green' | 'blue' | 'pink'`
     pub color: String,
     pub rects: Vec<NormalizedRect>,
     pub quoted_text: String,
     pub note_markdown: String,
+    #[serde(default)]
+    pub image_data_url: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -33,6 +35,8 @@ pub struct NewFileAnnotation {
     pub quoted_text: String,
     #[serde(default)]
     pub note_markdown: String,
+    #[serde(default)]
+    pub image_data_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +44,8 @@ pub struct UpdateFileAnnotation {
     pub color: Option<String>,
     pub note_markdown: Option<String>,
     pub quoted_text: Option<String>,
+    #[serde(default)]
+    pub image_data_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,8 +87,29 @@ fn normalize_kind(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "bookmark" => "bookmark",
         "note" => "note",
+        "snip" => "snip",
         _ => "highlight",
     }
+}
+
+fn sanitize_image_data_url(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let valid_prefix = trimmed.starts_with("data:image/png;base64,")
+        || trimmed.starts_with("data:image/jpeg;base64,")
+        || trimmed.starts_with("data:image/webp;base64,");
+    if !valid_prefix {
+        return Err(CoreError::Config(
+            "Invalid Area Snip image format (expected PNG/JPEG/WebP data URL).".into(),
+        ));
+    }
+    if trimmed.len() > 2_800_000 {
+        return Err(CoreError::Config(
+            "Area Snip image exceeds maximum size limit (2 MB).".into(),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn normalize_color(raw: &str) -> &'static str {
@@ -120,8 +147,14 @@ fn normalize_rotation(deg: i32) -> i32 {
     }
 }
 
-fn build_search_norm(quoted: &str, note: &str) -> String {
-    let combined = if quoted.trim().is_empty() {
+fn build_search_norm(kind: &str, quoted: &str, note: &str) -> String {
+    let combined = if quoted.trim().is_empty() && note.trim().is_empty() {
+        if kind == "snip" {
+            "snip ritaglio formula diagram".to_string()
+        } else {
+            String::new()
+        }
+    } else if quoted.trim().is_empty() {
         note.trim().to_string()
     } else if note.trim().is_empty() {
         quoted.trim().to_string()
@@ -155,6 +188,7 @@ fn row_to_annotation(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileAnnotation> 
         note_markdown: r.get(7)?,
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
+        image_data_url: r.get(10)?,
     })
 }
 
@@ -163,7 +197,7 @@ pub fn list_annotations_for_hash(
     blake3_hash: &str,
 ) -> Result<Vec<FileAnnotation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, blake3_hash, page_ord, kind, color, rects_json, quoted_text, note_markdown, created_at, updated_at
+        "SELECT id, blake3_hash, page_ord, kind, color, rects_json, quoted_text, note_markdown, created_at, updated_at, image_data_url
          FROM file_annotations
          WHERE blake3_hash = ?1
          ORDER BY page_ord ASC, created_at ASC, id ASC",
@@ -199,13 +233,14 @@ pub fn create_annotation_for_hash(
     let rects_json = serde_json::to_string(&input.rects)?;
     let quoted = input.quoted_text.trim().to_string();
     let note = input.note_markdown.trim().to_string();
-    let search_norm = build_search_norm(&quoted, &note);
+    let image_data_url = sanitize_image_data_url(input.image_data_url.as_deref())?;
+    let search_norm = build_search_norm(kind, &quoted, &note);
 
     conn.execute(
         "INSERT INTO file_annotations (
             blake3_hash, page_ord, kind, color, rects_json,
-            quoted_text, note_markdown, search_norm, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            quoted_text, note_markdown, image_data_url, search_norm, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
         params![
             blake3_hash,
             page_ord as i64,
@@ -214,6 +249,7 @@ pub fn create_annotation_for_hash(
             rects_json,
             quoted,
             note,
+            image_data_url,
             search_norm,
             now
         ],
@@ -225,7 +261,7 @@ pub fn create_annotation_for_hash(
 
 pub fn get_annotation_by_id(conn: &Connection, id: i64) -> Result<Option<FileAnnotation>> {
     conn.query_row(
-        "SELECT id, blake3_hash, page_ord, kind, color, rects_json, quoted_text, note_markdown, created_at, updated_at
+        "SELECT id, blake3_hash, page_ord, kind, color, rects_json, quoted_text, note_markdown, created_at, updated_at, image_data_url
          FROM file_annotations WHERE id = ?1",
         params![id],
         row_to_annotation,
@@ -257,14 +293,18 @@ pub fn update_annotation(
         .as_deref()
         .map(|s| s.trim().to_string())
         .unwrap_or(existing.note_markdown);
-    let search_norm = build_search_norm(&quoted, &note);
+    let image_data_url = match patch.image_data_url.as_deref() {
+        Some(raw) => sanitize_image_data_url(Some(raw))?,
+        None => existing.image_data_url,
+    };
+    let search_norm = build_search_norm(&existing.kind, &quoted, &note);
     let now = chrono::Utc::now().timestamp();
 
     conn.execute(
         "UPDATE file_annotations
-         SET color = ?1, quoted_text = ?2, note_markdown = ?3, search_norm = ?4, updated_at = ?5
-         WHERE id = ?6",
-        params![color, quoted, note, search_norm, now, id],
+         SET color = ?1, quoted_text = ?2, note_markdown = ?3, image_data_url = ?4, search_norm = ?5, updated_at = ?6
+         WHERE id = ?7",
+        params![color, quoted, note, image_data_url, search_norm, now, id],
     )?;
     get_annotation_by_id(conn, id)?
         .ok_or_else(|| CoreError::NotFound(format!("annotation {id}")))
@@ -308,6 +348,7 @@ pub fn toggle_page_bookmark(
             rects: Vec::new(),
             quoted_text: String::new(),
             note_markdown: label.unwrap_or("").trim().to_string(),
+            image_data_url: None,
         },
     )?;
     Ok(Some(created))
@@ -339,7 +380,7 @@ pub fn search_annotations(
 
     let sql = if hash_filter.is_some() {
         "SELECT a.id, a.blake3_hash, a.page_ord, a.kind, a.color, a.rects_json,
-                a.quoted_text, a.note_markdown, a.created_at, a.updated_at, a.search_norm,
+                a.quoted_text, a.note_markdown, a.created_at, a.updated_at, a.image_data_url, a.search_norm,
                 (SELECT f.document_id FROM files f WHERE f.blake3_hash = a.blake3_hash LIMIT 1),
                 (SELECT f.id FROM files f WHERE f.blake3_hash = a.blake3_hash LIMIT 1),
                 COALESCE((SELECT d.title FROM files f JOIN documents d ON d.id = f.document_id WHERE f.blake3_hash = a.blake3_hash LIMIT 1), '')
@@ -348,7 +389,7 @@ pub fn search_annotations(
          ORDER BY a.page_ord ASC, a.updated_at DESC"
     } else {
         "SELECT a.id, a.blake3_hash, a.page_ord, a.kind, a.color, a.rects_json,
-                a.quoted_text, a.note_markdown, a.created_at, a.updated_at, a.search_norm,
+                a.quoted_text, a.note_markdown, a.created_at, a.updated_at, a.image_data_url, a.search_norm,
                 (SELECT f.document_id FROM files f WHERE f.blake3_hash = a.blake3_hash LIMIT 1),
                 (SELECT f.id FROM files f WHERE f.blake3_hash = a.blake3_hash LIMIT 1),
                 COALESCE((SELECT d.title FROM files f JOIN documents d ON d.id = f.document_id WHERE f.blake3_hash = a.blake3_hash LIMIT 1), '')
@@ -366,8 +407,8 @@ pub fn search_annotations(
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
         if !tokens.is_empty() {
-            let search_norm: String = r.get(10)?;
-            let doc_title_norm = normalize_math_text(r.get_ref(13)?.as_str().unwrap_or(""));
+            let search_norm: String = r.get(11)?;
+            let doc_title_norm = normalize_math_text(r.get_ref(14)?.as_str().unwrap_or(""));
             if !tokens
                 .iter()
                 .all(|t| search_norm.contains(t) || doc_title_norm.contains(t))
@@ -378,9 +419,9 @@ pub fn search_annotations(
         let ann = row_to_annotation(r)?;
         out.push(AnnotationSearchHit {
             annotation: ann,
-            document_id: r.get(11)?,
-            file_id: r.get(12)?,
-            doc_title: r.get(13)?,
+            document_id: r.get(12)?,
+            file_id: r.get(13)?,
+            doc_title: r.get(14)?,
         });
         if out.len() >= 200 {
             break;
@@ -409,12 +450,12 @@ pub fn export_annotations_markdown(conn: &Connection, file_id: Option<i64>) -> R
 
     let mut stmt = conn.prepare(
         "SELECT a.id, a.blake3_hash, a.page_ord, a.kind, a.color, a.rects_json,
-                a.quoted_text, a.note_markdown, a.created_at, a.updated_at,
+                a.quoted_text, a.note_markdown, a.created_at, a.updated_at, a.image_data_url,
                 COALESCE((SELECT d.title FROM files f JOIN documents d ON d.id = f.document_id WHERE f.blake3_hash = a.blake3_hash LIMIT 1), a.blake3_hash)
          FROM file_annotations a
          ORDER BY a.blake3_hash ASC, a.page_ord ASC, a.created_at ASC",
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(10)?, row_to_annotation(r)?)))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(11)?, row_to_annotation(r)?)))?;
     let mut grouped: BTreeMap<String, Vec<FileAnnotation>> = BTreeMap::new();
     for r in rows {
         let (title, ann) = r?;
@@ -442,9 +483,16 @@ fn format_doc_annotations_markdown(title: &str, anns: &[FileAnnotation]) -> Stri
         let kind_label = match a.kind.as_str() {
             "bookmark" => "Segnalibro",
             "note" => "Nota",
+            "snip" => "Ritaglio pagina",
             _ => "Evidenziazione",
         };
         out.push_str(&format!("### {kind_label} — p. {}\n", a.page_ord));
+        if let Some(ref img) = a.image_data_url {
+            out.push_str(&format!("![Ritaglio p. {}]({img})\n", a.page_ord));
+            if !a.quoted_text.trim().is_empty() || !a.note_markdown.trim().is_empty() {
+                out.push('\n');
+            }
+        }
         if !a.quoted_text.trim().is_empty() {
             for line in a.quoted_text.trim().lines() {
                 out.push_str("> ");
@@ -653,6 +701,7 @@ mod tests {
                 }],
                 quoted_text: "By Poincaré duality and Erdős theorem".into(),
                 note_markdown: "Verify $H^k(M) \\cong H_{n-k}(M)$.".into(),
+                image_data_url: None,
             },
         )
         .unwrap();

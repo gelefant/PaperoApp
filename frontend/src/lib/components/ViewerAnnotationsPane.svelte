@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { tr, type Lang } from '../i18n';
   import { foldMathDiacritics } from '../inDocSearch';
   import type { FileAnnotation, NormalizedRect } from '../types';
   import MathMarkdown from './MathMarkdown.svelte';
 
   interface Props {
+    lang?: Lang;
     annotations: FileAnnotation[];
     onJump: (pageOrd: number, rects: NormalizedRect[]) => void;
     onUpdateNote: (id: number, noteMarkdown: string, color?: string) => Promise<void>;
@@ -11,7 +13,14 @@
     onExportMarkdown: () => Promise<void>;
   }
 
-  let { annotations, onJump, onUpdateNote, onDelete, onExportMarkdown }: Props = $props();
+  let {
+    lang = 'it',
+    annotations,
+    onJump,
+    onUpdateNote,
+    onDelete,
+    onExportMarkdown,
+  }: Props = $props();
 
   let filterText = $state('');
   let editingId = $state<number | null>(null);
@@ -23,7 +32,9 @@
     const q = foldMathDiacritics(filterText).trim();
     if (!q) return annotations;
     return annotations.filter((a) => {
-      const hay = foldMathDiacritics(`${a.quoted_text} ${a.note_markdown} p.${a.page_ord}`);
+      const hay = foldMathDiacritics(
+        `${a.quoted_text} ${a.note_markdown} ${a.kind} p.${a.page_ord}`
+      );
       return hay.includes(q);
     });
   });
@@ -49,9 +60,10 @@
   }
 
   function kindLabel(kind: string): string {
-    if (kind === 'bookmark') return 'Segnalibro';
-    if (kind === 'note') return 'Nota';
-    return 'Evidenziazione';
+    if (kind === 'bookmark') return tr(lang, 'kindBookmark');
+    if (kind === 'note') return tr(lang, 'kindNote');
+    if (kind === 'snip') return tr(lang, 'kindSnip');
+    return tr(lang, 'kindHighlight');
   }
 </script>
 
@@ -60,14 +72,14 @@
     <input
       type="search"
       class="ann-filter"
-      placeholder="Filtra note…"
+      placeholder={tr(lang, 'filterNotesPlaceholder')}
       bind:value={filterText}
     />
     <button
       type="button"
       class="exp-btn"
       disabled={exporting || annotations.length === 0}
-      title="Esporta annotazioni in Markdown"
+      title={tr(lang, 'exportNotesMdTip')}
       onclick={triggerExport}
     >
       .md
@@ -77,8 +89,8 @@
   {#if filtered.length === 0}
     <div class="ann-empty">
       {annotations.length === 0
-        ? 'Seleziona testo nella pagina per evidenziare o aggiungere note, oppure usa il pulsante segnalibro.'
-        : 'Nessuna annotazione corrisponde al filtro.'}
+        ? tr(lang, 'emptyAnnotationsMsg')
+        : tr(lang, 'noMatchingAnnotationsMsg')}
     </div>
   {:else}
     <div class="ann-list">
@@ -97,7 +109,7 @@
               <button
                 type="button"
                 class="tiny-act"
-                title="Modifica nota"
+                title={lang === 'en' ? 'Edit note' : 'Modifica nota'}
                 onclick={() => startEdit(a)}
               >
                 ✎
@@ -105,13 +117,23 @@
               <button
                 type="button"
                 class="tiny-act danger"
-                title="Elimina"
+                title={lang === 'en' ? 'Delete' : 'Elimina'}
                 onclick={() => onDelete(a.id)}
               >
                 ×
               </button>
             </div>
           </div>
+
+          {#if a.image_data_url}
+            <button
+              type="button"
+              class="ann-snip-thumb-btn"
+              onclick={() => onJump(a.page_ord, a.rects)}
+            >
+              <img src={a.image_data_url} alt={`Snip p. ${a.page_ord}`} class="ann-snip-thumb" />
+            </button>
+          {/if}
 
           {#if a.quoted_text}
             <button
@@ -127,7 +149,7 @@
             <div class="ann-editor">
               <textarea
                 rows="3"
-                placeholder="Nota in Markdown / LaTeX ($...$)…"
+                placeholder={tr(lang, 'snipNotePlaceholder')}
                 bind:value={draftNote}
               ></textarea>
               <div class="ann-edit-bar">
@@ -143,8 +165,12 @@
                   {/each}
                 </div>
                 <div class="edit-btns">
-                  <button type="button" class="mini" onclick={() => (editingId = null)}>Annulla</button>
-                  <button type="button" class="mini primary" onclick={() => saveEdit(a.id)}>Salva</button>
+                  <button type="button" class="mini" onclick={() => (editingId = null)}>
+                    {tr(lang, 'cancel')}
+                  </button>
+                  <button type="button" class="mini primary" onclick={() => saveEdit(a.id)}>
+                    {tr(lang, 'save')}
+                  </button>
                 </div>
               </div>
             </div>
@@ -265,6 +291,24 @@
   }
   .tiny-act.danger:hover {
     color: var(--danger);
+  }
+  .ann-snip-thumb-btn {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #ffffff;
+    padding: 3px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    max-height: 110px;
+    overflow: hidden;
+  }
+  .ann-snip-thumb {
+    max-width: 100%;
+    max-height: 100px;
+    object-fit: contain;
+    display: block;
   }
   .ann-quote {
     border: none;

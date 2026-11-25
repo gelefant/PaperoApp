@@ -1111,6 +1111,7 @@ mod tests {
                     }],
                     quoted_text: "Calderón–Zygmund".into(),
                     note_markdown: "Key bound $\\|Tf\\|_p \\le C_p \\|f\\|_p$".into(),
+                    image_data_url: None,
                 },
             )
             .unwrap();

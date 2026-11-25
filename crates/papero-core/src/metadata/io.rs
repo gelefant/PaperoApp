@@ -1,16 +1,29 @@
 use crate::bibtex::{
     compute_citation_key, disambiguate_citation_keys, format_mrlookup_bibtex, parse_bibtex_entries,
-    BibtexExportOptions,
+    BibtexExportOptions, BibtexKeyPattern,
 };
 use crate::error::{CoreError, Result};
 use crate::metadata::models::{
     normalize_doi, normalize_pages, BibliographicAuthor, BibliographicRecord, DocumentMetadataView,
     WorkType,
 };
+use rusqlite::{params, Connection};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
+
+/// Sanitizes an optional user-specified BibTeX citation key override, keeping only safe BibTeX key
+/// characters (`ASCII alphanumeric`, `_`, `-`, `:`, `.`, `/`, `+`).
+pub fn sanitize_citation_key_override(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | '/' | '+'))
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
 
 pub fn metadata_view_to_record(doc: &DocumentMetadataView) -> BibliographicRecord {
     BibliographicRecord {
@@ -52,32 +65,202 @@ pub fn metadata_view_to_record(doc: &DocumentMetadataView) -> BibliographicRecor
     }
 }
 
+/// Computes the pre-disambiguation base citation key for a document, honoring `citation_key_override`.
+pub fn compute_doc_base_citation_key(
+    doc: &DocumentMetadataView,
+    rec: &BibliographicRecord,
+    pattern: BibtexKeyPattern,
+) -> String {
+    doc.citation_key_override
+        .as_deref()
+        .and_then(sanitize_citation_key_override)
+        .unwrap_or_else(|| compute_citation_key(rec, pattern))
+}
+
 /// Exports multiple documents as concatenated BibTeX/BibLaTeX entries with automatic
-/// anti-collision key disambiguation (`a`, `b`, `c`, ...).
+/// anti-collision key disambiguation (`a`, `b`, `c`, ...) and `citation_key_override` support.
 pub fn export_documents_bibtex(docs: &[DocumentMetadataView], opts: &BibtexExportOptions) -> String {
     if docs.is_empty() {
         return String::new();
     }
     let records: Vec<BibliographicRecord> = docs.iter().map(metadata_view_to_record).collect();
-    let base_keys: Vec<String> = records
+    let base_keys: Vec<String> = docs
         .iter()
-        .map(|r| compute_citation_key(r, opts.key_pattern))
+        .zip(records.iter())
+        .map(|(d, r)| compute_doc_base_citation_key(d, r, opts.key_pattern))
         .collect();
     let unique_keys = disambiguate_citation_keys(&base_keys);
 
     records
         .iter()
-        .zip(base_keys.iter())
         .zip(unique_keys.iter())
-        .map(|((rec, base_k), uniq_k)| {
+        .map(|(rec, uniq_k)| {
             let mut item_opts = opts.clone();
-            if uniq_k != base_k {
+            let auto_k = compute_citation_key(rec, opts.key_pattern);
+            if item_opts.citation_key_override.is_none() && *uniq_k != auto_k {
                 item_opts.citation_key_override = Some(uniq_k.clone());
             }
             format_mrlookup_bibtex(rec, &item_opts)
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Resolves the exact collision-disambiguated citation key (and formatted BibTeX entry) for
+/// `document_id` against either:
+/// - `collection_id` (when specified and containing `document_id`),
+/// - a `.bib`-synced collection containing `document_id` (when `global_sync_active` is false and the doc belongs to exactly one synced collection),
+/// - or the entire library in canonical export order (`updated_at DESC, id DESC`), matching `export_documents_bibtex` 100%.
+pub fn resolve_disambiguated_cite_key_for_doc(
+    conn: &Connection,
+    document_id: i64,
+    collection_id: Option<i64>,
+    global_sync_active: bool,
+    opts: &BibtexExportOptions,
+) -> Result<(String, String)> {
+    let target_views = crate::metadata::resolver::get_documents_metadata_for_export(
+        conn,
+        &[document_id],
+    )?;
+    let target_view = target_views
+        .into_iter()
+        .next()
+        .ok_or_else(|| CoreError::NotFound(format!("document {document_id}")))?;
+    let target_rec = metadata_view_to_record(&target_view);
+
+    let effective_col_id: Option<i64> = if let Some(cid) = collection_id {
+        let in_col: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collection_documents WHERE collection_id = ?1 AND document_id = ?2)",
+                params![cid, document_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        in_col.then_some(cid)
+    } else if !global_sync_active {
+        let mut st = conn.prepare(
+            "SELECT c.id FROM collections c
+             JOIN collection_documents cd ON cd.collection_id = c.id
+             WHERE cd.document_id = ?1 AND c.bib_sync_enabled != 0
+               AND c.bib_sync_path IS NOT NULL AND TRIM(c.bib_sync_path) != ''
+             ORDER BY c.sort_order ASC, c.id ASC LIMIT 2",
+        )?;
+        let synced_ids: Vec<i64> = st
+            .query_map(params![document_id], |r| r.get(0))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        (synced_ids.len() == 1).then(|| synced_ids[0])
+    } else {
+        None
+    };
+
+    let scope_ids: Vec<i64> = if let Some(cid) = effective_col_id {
+        let mut st = conn.prepare(
+            "SELECT cd.document_id
+             FROM collection_documents cd
+             JOIN documents d ON d.id = cd.document_id
+             WHERE cd.collection_id = ?1
+             ORDER BY cd.position ASC, cd.added_at DESC",
+        )?;
+        let rows = st.query_map(params![cid], |r| r.get(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        crate::metadata::resolver::list_all_document_ids(conn)?
+    };
+
+    struct DocKeyInput {
+        title: String,
+        year: Option<i64>,
+        mr_number: Option<String>,
+        override_key: Option<String>,
+    }
+
+    // Fast lightweight load of minimal key inputs (`title, year, mr_number, citation_key_override, first_author`)
+    let mut doc_meta: HashMap<i64, DocKeyInput> = HashMap::with_capacity(scope_ids.len());
+    {
+        let mut st = conn.prepare(
+            "SELECT id, title, year, mr_number, citation_key_override FROM documents",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                DocKeyInput {
+                    title: r.get(1)?,
+                    year: r.get(2)?,
+                    mr_number: r.get(3)?,
+                    override_key: r.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, item) = row?;
+            doc_meta.insert(id, item);
+        }
+    }
+
+    let mut first_authors: HashMap<i64, BibliographicAuthor> = HashMap::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT document_id, family_name, given_name, role
+             FROM document_authors
+             ORDER BY document_id ASC, CASE WHEN role = 'author' THEN 0 ELSE 1 END ASC, position ASC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                BibliographicAuthor {
+                    family_name: r.get(1)?,
+                    given_name: r.get(2)?,
+                    role: r.get(3)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (did, au) = row?;
+            first_authors.entry(did).or_insert(au);
+        }
+    }
+
+    let mut ordered_ids = Vec::with_capacity(scope_ids.len() + 1);
+    let mut base_keys = Vec::with_capacity(scope_ids.len() + 1);
+    for id in scope_ids {
+        let Some(inp) = doc_meta.get(&id) else {
+            continue;
+        };
+        ordered_ids.push(id);
+        if let Some(ov) = inp
+            .override_key
+            .as_deref()
+            .and_then(sanitize_citation_key_override)
+        {
+            base_keys.push(ov);
+            continue;
+        }
+        let mini_rec = BibliographicRecord {
+            title: inp.title.clone(),
+            year: inp.year,
+            mr_number: inp.mr_number.clone(),
+            authors: first_authors.get(&id).cloned().into_iter().collect(),
+            ..Default::default()
+        };
+        base_keys.push(compute_citation_key(&mini_rec, opts.key_pattern));
+    }
+
+    let unique_keys = disambiguate_citation_keys(&base_keys);
+    let resolved_key = ordered_ids
+        .iter()
+        .position(|&id| id == document_id)
+        .and_then(|pos| unique_keys.get(pos).cloned())
+        .unwrap_or_else(|| compute_doc_base_citation_key(&target_view, &target_rec, opts.key_pattern));
+
+    let mut fmt_opts = opts.clone();
+    let auto_key = compute_citation_key(&target_rec, opts.key_pattern);
+    if fmt_opts.citation_key_override.is_none() && resolved_key != auto_key {
+        fmt_opts.citation_key_override = Some(resolved_key.clone());
+    }
+    let formatted_bibtex = format_mrlookup_bibtex(&target_rec, &fmt_opts);
+
+    Ok((resolved_key, formatted_bibtex))
 }
 
 /// Verifies `dest` is strictly outside all configured read-only `source_roots` directories,
@@ -475,6 +658,7 @@ mod tests {
             msc_primary_status: "none".into(),
             msc_secondary: vec![],
             abstract_text: None,
+            citation_key_override: None,
             raw_mrlookup_bibtex: None,
             metadata_source: Some("manual".into()),
             metadata_license_note: None,
@@ -498,5 +682,70 @@ mod tests {
         );
         assert!(out.contains("@article {Erdos1975a,"));
         assert!(out.contains("@article {Erdos1975b,"));
+    }
+
+    #[test]
+    fn resolve_disambiguated_cite_key_respects_collisions_and_override() {
+        use crate::db::repos::docs::create_heuristic_document;
+        use crate::db::Database;
+        use rusqlite::params;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("test.sqlite"), 2).unwrap();
+        let (d1, d2) = {
+            let w = db.writer();
+            let d1 = create_heuristic_document(&w, "First Paper").unwrap();
+            let d2 = create_heuristic_document(&w, "Second Paper").unwrap();
+            for d in [d1, d2] {
+                w.execute("UPDATE documents SET year = 1975 WHERE id = ?1", params![d])
+                    .unwrap();
+                w.execute(
+                    "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+                     VALUES (?1, 'author', 0, 'Erdős', 'Paul', 'erdos')",
+                    params![d],
+                )
+                .unwrap();
+            }
+            (d1, d2)
+        };
+
+        let opts = BibtexExportOptions {
+            key_pattern: BibtexKeyPattern::AuthorYear,
+            include_source_comment: false,
+            ..Default::default()
+        };
+        {
+            let r = db.reader();
+            let all_ids = crate::metadata::resolver::list_all_document_ids(&r).unwrap();
+            let views =
+                crate::metadata::resolver::get_documents_metadata_for_export(&r, &all_ids).unwrap();
+            let full_export = export_documents_bibtex(&views, &opts);
+            let (k1, bib1) =
+                resolve_disambiguated_cite_key_for_doc(&r, d1, None, true, &opts).unwrap();
+            let (k2, bib2) =
+                resolve_disambiguated_cite_key_for_doc(&r, d2, None, true, &opts).unwrap();
+            // `list_all_document_ids` orders newest/highest-id first (`d2` -> `a`, `d1` -> `b`),
+            // matching `run_bibtex_auto_sync_now` and `export_documents_bibtex` 100%!
+            assert_eq!(k2, "Erdos1975a");
+            assert_eq!(k1, "Erdos1975b");
+            assert!(full_export.contains(&bib1));
+            assert!(full_export.contains(&bib2));
+        }
+
+        {
+            let w = db.writer();
+            w.execute(
+                "UPDATE documents SET citation_key_override = 'Erdos_Custom75' WHERE id = ?1",
+                params![d1],
+            )
+            .unwrap();
+        }
+        let r = db.reader();
+        let (k1_override, _) =
+            resolve_disambiguated_cite_key_for_doc(&r, d1, None, true, &opts).unwrap();
+        let (k2_free, _) =
+            resolve_disambiguated_cite_key_for_doc(&r, d2, None, true, &opts).unwrap();
+        assert_eq!(k1_override, "Erdos_Custom75");
+        assert_eq!(k2_free, "Erdos1975");
     }
 }

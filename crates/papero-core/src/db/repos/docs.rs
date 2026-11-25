@@ -313,10 +313,12 @@ fn replace_file_content_inner(
         let mut c_stmt = tx.prepare_cached(
             "INSERT INTO passages (
                 document_id, file_id, page_ord, printed_label, chunk_index,
-                is_alt_formula, token_count, text_content, bboxes_blob
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                is_alt_formula, token_count, text_content, bboxes_blob,
+                statement_kind, statement_label
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         for ch in passages {
+            let det = crate::extract::statements::detect_math_statement(&ch.text_content);
             c_stmt.execute(params![
                 ch.document_id,
                 ch.file_id,
@@ -327,6 +329,8 @@ fn replace_file_content_inner(
                 ch.token_count as i64,
                 ch.text_content,
                 ch.bboxes_blob,
+                det.as_ref().map(|s| s.kind),
+                det.as_ref().map(|s| s.label.as_str()),
             ])?;
             inserted_ids.push(tx.last_insert_rowid() as u64);
         }
@@ -847,7 +851,7 @@ pub fn hydrate_bm25_results_filtered(
     let sql = format!(
         "SELECT p.id, p.document_id, p.file_id, p.page_ord, p.printed_label,
                 p.text_content, p.bboxes_blob, d.work_type, d.title, f.format, f.rel_path, f.is_available,
-                p.is_alt_formula
+                p.is_alt_formula, p.statement_kind, p.statement_label
          FROM passages p
          JOIN documents d ON d.id = p.document_id
          JOIN files f ON f.id = p.file_id
@@ -874,6 +878,8 @@ pub fn hydrate_bm25_results_filtered(
         let rel_path: String = r.get(10)?;
         let is_available: bool = r.get::<_, i64>(11)? != 0;
         let is_alt_formula: bool = r.get::<_, i64>(12)? != 0;
+        let statement_kind: Option<String> = r.get(13)?;
+        let statement_label: Option<String> = r.get(14)?;
         Ok((
             pid,
             doc_id,
@@ -888,6 +894,8 @@ pub fn hydrate_bm25_results_filtered(
             rel_path,
             is_available,
             is_alt_formula,
+            statement_kind,
+            statement_label,
         ))
     })?;
 
@@ -906,6 +914,8 @@ pub fn hydrate_bm25_results_filtered(
             rel_path,
             is_available,
             is_alt_formula,
+            stored_kind,
+            stored_label,
         ) = row?;
         let score = *score_by_pid.get(&pid).unwrap_or(&0.0);
         let entry = grouped.entry(doc_id).or_insert_with(|| ContentSearchDocResult {
@@ -922,7 +932,13 @@ pub fn hydrate_bm25_results_filtered(
         if score > entry.max_score {
             entry.max_score = score;
         }
-        let detected_stmt = crate::extract::statements::detect_math_statement(&text_content);
+        let (statement_kind, statement_label) = if stored_kind.is_some() || stored_label.is_some() {
+            (stored_kind, stored_label)
+        } else if let Some(det) = crate::extract::statements::detect_math_statement(&text_content) {
+            (Some(det.kind.to_string()), Some(det.label))
+        } else {
+            (None, None)
+        };
         entry.passages.push(ContentSearchPassageHit {
             passage_id: pid,
             file_id,
@@ -932,8 +948,8 @@ pub fn hydrate_bm25_results_filtered(
             text_content,
             bboxes: unpack_bboxes(&blob),
             is_alt_formula,
-            statement_label: detected_stmt.as_ref().map(|s| s.label.clone()),
-            statement_kind: detected_stmt.map(|s| s.kind.to_string()),
+            statement_label,
+            statement_kind,
         });
     }
 

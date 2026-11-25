@@ -164,6 +164,8 @@ pub struct DocumentMetadataView {
     pub msc_primary_status: String,
     pub msc_secondary: Vec<String>,
     pub abstract_text: Option<String>,
+    #[serde(default)]
+    pub citation_key_override: Option<String>,
     pub raw_mrlookup_bibtex: Option<String>,
     pub metadata_source: Option<String>,
     pub metadata_license_note: Option<String>,

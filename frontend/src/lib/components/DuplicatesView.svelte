@@ -1,7 +1,9 @@
 <script lang="ts">
+  import type { Lang } from '../i18n';
   import type { DuplicateFileMember, DuplicateGroupView } from '../types';
 
   interface Props {
+    lang?: Lang;
     groups: DuplicateGroupView[];
     scanningDedup: boolean;
     onRunDedup: () => void;
@@ -13,6 +15,7 @@
   }
 
   let {
+    lang = 'it',
     groups,
     scanningDedup,
     onRunDedup,
@@ -30,6 +33,22 @@
   );
 
   function levelLabel(lvl: number): string {
+    if (lang === 'en') {
+      switch (lvl) {
+        case 1:
+          return 'Level 1 · Identical copies';
+        case 2:
+          return 'Level 2 · Same work ID';
+        case 3:
+          return 'Level 3 · Probable duplicate';
+        case 4:
+          return 'Level 4 · Preprint / Version';
+        case 5:
+          return 'Level 5 · Book editions';
+        default:
+          return `Level ${lvl}`;
+      }
+    }
     switch (lvl) {
       case 1:
         return 'Livello 1 · Copie identiche';
@@ -56,22 +75,34 @@
 <div class="dup-view">
   <div class="dup-header">
     <div>
-      <strong>Doppioni &amp; Edizioni ({visibleGroups.length})</strong>
+      <strong>
+        {lang === 'en'
+          ? `Duplicates & Editions (${visibleGroups.length})`
+          : `Doppioni & Edizioni (${visibleGroups.length})`}
+      </strong>
     </div>
     <div class="dup-controls">
       <label class="toggle-resolved">
         <input type="checkbox" bind:checked={showResolved} />
-        Mostra risolti
+        {lang === 'en' ? 'Show resolved' : 'Mostra risolti'}
       </label>
       <button type="button" class="primary" onclick={onRunDedup} disabled={scanningDedup}>
-        {scanningDedup ? 'Analisi…' : 'Verifica doppioni'}
+        {scanningDedup
+          ? lang === 'en'
+            ? 'Scanning…'
+            : 'Analisi…'
+          : lang === 'en'
+            ? 'Scan duplicates'
+            : 'Verifica doppioni'}
       </button>
     </div>
   </div>
 
   {#if visibleGroups.length === 0}
     <div class="empty">
-      Nessun gruppo di duplicati o edizioni da esaminare.
+      {lang === 'en'
+        ? 'No duplicate or edition groups pending review.'
+        : 'Nessun gruppo di duplicati o edizioni da esaminare.'}
     </div>
   {:else}
     <div class="groups-list">

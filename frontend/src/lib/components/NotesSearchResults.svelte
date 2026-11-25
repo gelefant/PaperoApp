@@ -22,9 +22,10 @@
   }: Props = $props();
 
   function kindLabel(kind: string): string {
-    if (kind === 'bookmark') return lang === 'en' ? 'Bookmark' : 'Segnalibro';
-    if (kind === 'note') return lang === 'en' ? 'Note' : 'Nota';
-    return lang === 'en' ? 'Highlight' : 'Evidenziazione';
+    if (kind === 'bookmark') return tr(lang, 'kindBookmark');
+    if (kind === 'note') return tr(lang, 'kindNote');
+    if (kind === 'snip') return tr(lang, 'kindSnip');
+    return tr(lang, 'kindHighlight');
   }
 </script>
 
@@ -69,6 +70,15 @@
             <span class="nr-dot dot-{hit.annotation.color}"></span>
             <span class="nr-kind">{kindLabel(hit.annotation.kind)}</span>
           </div>
+          {#if hit.annotation.image_data_url}
+            <div class="nr-snip-wrap">
+              <img
+                src={hit.annotation.image_data_url}
+                alt={`Snip p. ${hit.annotation.page_ord}`}
+                class="nr-snip-img"
+              />
+            </div>
+          {/if}
           {#if hit.annotation.quoted_text.trim()}
             <blockquote class="nr-quote">{hit.annotation.quoted_text.trim()}</blockquote>
           {/if}
@@ -209,5 +219,22 @@
   .nr-note-body {
     font-size: 12px;
     line-height: 1.45;
+  }
+  .nr-snip-wrap {
+    max-height: 110px;
+    overflow: hidden;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: #ffffff;
+    padding: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .nr-snip-img {
+    max-width: 100%;
+    max-height: 102px;
+    object-fit: contain;
+    display: block;
   }
 </style>

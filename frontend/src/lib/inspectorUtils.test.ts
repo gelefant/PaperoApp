@@ -251,4 +251,37 @@ describe('inspectorUtils', () => {
     fields.address = 'New York';
     expect(hasInspectorFormDiff(meta, fields, false)).toBe(true);
   });
+
+  it('serializes citation_key_override and detects unsaved diff without adding locks', () => {
+    const meta = makeJolliffeMeta();
+    const fields: InspectorFormFields = {
+      ...makeClearedJolliffeFields('2016'),
+      journalAbbrev: meta.journal_abbrev ?? '',
+      journalFull: meta.journal_full ?? '',
+      volume: meta.volume ?? '',
+      issueNumber: meta.issue_number ?? '',
+      pages: meta.pages ?? '',
+      doi: meta.doi ?? '',
+      mrNumber: meta.mr_number ?? '',
+      issn: meta.issn ?? '',
+      url: meta.url ?? '',
+      mscPrimary: meta.msc_primary ?? '',
+      mscSecondaryText: meta.msc_secondary.join(', '),
+      citationKeyOverride: 'Jolliffe2016_PCA',
+      touched: [],
+    };
+    expect(hasInspectorFormDiff(meta, fields, false)).toBe(true);
+    const lockRes = computeNextLocksOnTouch(
+      ['title'],
+      'citation_key_override',
+      false,
+      'Jolliffe2016_PCA'
+    );
+    expect(lockRes.lockedFields).toEqual(['title']);
+    const built = buildManualMetadataEditPayload(meta, fields, false);
+    expect(built.ok).toBe(true);
+    if (built.ok) {
+      expect(built.payload.citation_key_override).toBe('Jolliffe2016_PCA');
+    }
+  });
 });

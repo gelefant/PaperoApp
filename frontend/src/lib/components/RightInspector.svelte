@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api } from '../api';
+  import { tr, type Lang } from '../i18n';
   import { hasMathDelimiters } from '../katexLoader';
   import type {
     CollectionView,
@@ -24,6 +25,7 @@
   import MathMarkdown from './MathMarkdown.svelte';
 
   interface Props {
+    lang?: Lang;
     meta: DocumentMetadataView | null;
     selectedFileId?: number | null;
     clusters?: TopicClusterView[];
@@ -69,6 +71,7 @@
   }
 
   let {
+    lang = 'it',
     meta,
     selectedFileId = null,
     clusters = [],
@@ -136,6 +139,7 @@
   let mscPrimary = $state('');
   let mscSecondaryText = $state('');
   let abstractText = $state('');
+  let citationKeyOverride = $state('');
   let tagsText = $state('');
   let excludeFromCloud = $state(false);
   let lockedFields = $state<string[]>([]);
@@ -216,6 +220,7 @@
     mscPrimary = meta.msc_primary ?? '';
     mscSecondaryText = meta.msc_secondary.join(', ');
     abstractText = meta.abstract_text ?? '';
+    citationKeyOverride = meta.citation_key_override ?? '';
     tagsText = meta.tags.join(', ');
     excludeFromCloud = meta.exclude_from_cloud_llm;
     const nextLocked = meta.manual_locked_fields.filter(
@@ -341,6 +346,7 @@
       mscPrimary,
       mscSecondaryText,
       abstractText,
+      citationKeyOverride,
       tagsText,
       excludeFromCloud,
       touched,
@@ -617,19 +623,23 @@
 
 <aside class="inspector">
   <div class="inspector-header">
-    <strong>Ispettore Metadati</strong>
-    <button type="button" class="close-btn" onclick={onClose} title="Chiudi pannello">✕</button>
+    <strong>{tr(lang, 'inspectorTitle')}</strong>
+    <button type="button" class="close-btn" onclick={onClose} title={tr(lang, 'close')}>✕</button>
   </div>
 
   {#if loading}
-    <div class="status-msg">Caricamento metadati…</div>
+    <div class="status-msg">{lang === 'en' ? 'Loading metadata…' : 'Caricamento metadati…'}</div>
   {:else if !meta}
-    <div class="status-msg">Seleziona un documento dalla lista per visualizzare o modificare i metadati.</div>
+    <div class="status-msg">
+      {lang === 'en'
+        ? 'Select a document from the catalog to inspect or edit its metadata.'
+        : 'Seleziona un documento dalla lista per visualizzare o modificare i metadati.'}
+    </div>
   {:else}
     <div class="action-bar">
       {#if selectedFileId !== null && onOpenInViewer}
         <button type="button" onclick={onOpenInViewer}>
-          Apri nel lettore
+          {tr(lang, 'openInViewerBtn')}
         </button>
       {/if}
       <button
@@ -638,30 +648,34 @@
         disabled={fetchingOnline || saving || meta.metadata_verified}
         onclick={handleTopFetchClick}
         title={meta.metadata_verified
-          ? 'Metadati confermati: rimuovi la spunta ✓ prima di avviare la ricerca online'
-          : 'Cerca/aggiorna metadati rispettando i campi bloccati'}
+          ? lang === 'en'
+            ? 'Verified metadata: uncheck ✓ before running online lookup'
+            : 'Metadati confermati: rimuovi la spunta ✓ prima di avviare la ricerca online'
+          : lang === 'en'
+            ? 'Lookup/update metadata respecting locked fields'
+            : 'Cerca/aggiorna metadati rispettando i campi bloccati'}
       >
-        {fetchingOnline ? 'Ricerca…' : 'Aggiorna metadati'}
+        {fetchingOnline ? tr(lang, 'searchingBtn') : tr(lang, 'refreshMetadataBtn')}
       </button>
       {#if fetchingOnline && onCancelFetch}
         <button
           type="button"
           class="mini-no"
           onclick={onCancelFetch}
-          title="Interrompi subito la ricerca online in corso"
+          title={lang === 'en' ? 'Cancel active online lookup' : 'Interrompi subito la ricerca online in corso'}
         >
-          ✕ Interrompi
+          {tr(lang, 'stopBtn')}
         </button>
       {/if}
       <button type="button" onclick={handleCopyBibtexClick}>
-        Copia BibTeX
+        {tr(lang, 'copyBibtexBtn')}
       </button>
       <button
         type="button"
-        title={'Copia subito \\cite{chiave} negli appunti'}
+        title={lang === 'en' ? 'Copy disambiguated \\cite{key} to clipboard' : 'Copia subito \\cite{chiave} negli appunti'}
         onclick={handleCopyCiteClick}
       >
-        Copia \cite
+        {tr(lang, 'copyCiteBtn')}
       </button>
       {#if selectedFileId !== null && onImportAltFormula}
         <button
@@ -1252,7 +1266,17 @@
       </div>
 
       <label>
-        <span>Tag (separati da virgola)</span>
+        <span>{tr(lang, 'citationKeyOverrideLabel')}</span>
+        <input
+          type="text"
+          placeholder={tr(lang, 'citationKeyOverridePlaceholder')}
+          bind:value={citationKeyOverride}
+          oninput={() => touch('citation_key_override', citationKeyOverride)}
+        />
+      </label>
+
+      <label>
+        <span>{lang === 'en' ? 'Tags (comma-separated)' : 'Tag (separati da virgola)'}</span>
         <input type="text" bind:value={tagsText} oninput={() => touch('tags')} />
       </label>
 
@@ -1315,13 +1339,13 @@
     {#if relations && totalRelationsCount > 0}
       <details class="rel-details">
         <summary class="rel-summary">
-          <span>Documenti correlati</span>
+          <span>{tr(lang, 'relatedDocsSection')}</span>
           <span class="rel-count">{totalRelationsCount}</span>
         </summary>
         <div class="rel-body">
           {#if relations.similar.length > 0}
             <div class="rel-group">
-              <div class="rel-subhead">Simili nella tua libreria</div>
+              <div class="rel-subhead">{tr(lang, 'similarInLibrary')}</div>
               {#each relations.similar as sim (sim.document_id)}
                 <button
                   type="button"
@@ -1338,7 +1362,7 @@
           {/if}
           {#if relations.cites.length > 0}
             <div class="rel-group">
-              <div class="rel-subhead">Cita (nella libreria)</div>
+              <div class="rel-subhead">{tr(lang, 'citesInLibrary')}</div>
               {#each relations.cites as c (c.document_id)}
                 <button
                   type="button"
@@ -1353,7 +1377,7 @@
           {/if}
           {#if relations.cited_by.length > 0}
             <div class="rel-group">
-              <div class="rel-subhead">Citato da (nella libreria)</div>
+              <div class="rel-subhead">{tr(lang, 'citedByInLibrary')}</div>
               {#each relations.cited_by as cb (cb.document_id)}
                 <button
                   type="button"

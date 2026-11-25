@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api } from '../api';
+  import { tr, type Lang } from '../i18n';
   import type {
     DocLlmScope,
     LlmAnswerResult,
@@ -9,6 +10,7 @@
   import MathMarkdown from './MathMarkdown.svelte';
 
   interface Props {
+    lang?: Lang;
     documentId: number;
     fileId: number;
     currentPage: number;
@@ -21,6 +23,7 @@
   }
 
   let {
+    lang = 'it',
     documentId,
     fileId,
     currentPage,
@@ -97,11 +100,16 @@
       lastPreview = preview;
       if (preview.passages_excluded_cloud > 0 && preview.passages_included === 0) {
         errorMsg =
-          'Documento o cartella esclusi dall’invio LLM cloud. Usa Ollama locale oppure modifica l’esclusione nell’Ispettore.';
+          lang === 'en'
+            ? 'Document or folder excluded from cloud LLM transmission. Use local Ollama or adjust exclusion in the Inspector.'
+            : 'Documento o cartella esclusi dall’invio LLM cloud. Usa Ollama locale oppure modifica l’esclusione nell’Ispettore.';
         return;
       }
       if (!preview.model) {
-        errorMsg = 'Nessun modello LLM selezionato nelle Impostazioni.';
+        errorMsg =
+          lang === 'en'
+            ? 'No LLM model selected in Settings.'
+            : 'Nessun modello LLM selezionato nelle Impostazioni.';
         return;
       }
       if (preview.requires_cloud_consent) {
@@ -125,21 +133,21 @@
   }
 </script>
 
-<aside class="ask-panel" aria-label="Chiedi a questo documento">
+<aside class="ask-panel" aria-label={tr(lang, 'askDocumentTitle')}>
   <header class="ask-head">
-    <span class="ask-title">Chiedi al documento</span>
+    <span class="ask-title">{tr(lang, 'askDocumentTitle')}</span>
     <span class="ask-prov">{llmProvider}</span>
-    <button type="button" class="close-btn" title="Chiudi" onclick={onClose}>×</button>
+    <button type="button" class="close-btn" title={tr(lang, 'close')} onclick={onClose}>×</button>
   </header>
 
-  <div class="scope-row" role="group" aria-label="Ambito domanda">
+  <div class="scope-row" role="group" aria-label={lang === 'en' ? 'Question scope' : 'Ambito domanda'}>
     <button
       type="button"
       class="scope-pill"
       class:active={scope === 'document'}
       onclick={() => (scope = 'document')}
     >
-      Documento
+      {tr(lang, 'scopeDocument')}
     </button>
     <button
       type="button"
@@ -147,17 +155,23 @@
       class:active={scope === 'page'}
       onclick={() => (scope = 'page')}
     >
-      Pagina {currentPage}
+      {tr(lang, 'scopePage')} {currentPage}
     </button>
     <button
       type="button"
       class="scope-pill"
       class:active={scope === 'selection'}
       disabled={!selectionText.trim()}
-      title={selectionText.trim() ? 'Usa testo selezionato' : 'Seleziona prima un testo nella pagina'}
+      title={selectionText.trim()
+        ? lang === 'en'
+          ? 'Use selected text'
+          : 'Usa testo selezionato'
+        : lang === 'en'
+          ? 'Select text on the page first'
+          : 'Seleziona prima un testo nella pagina'}
       onclick={() => (scope = 'selection')}
     >
-      Selezione
+      {tr(lang, 'scopeSelection')}
     </button>
   </div>
 
@@ -170,7 +184,7 @@
   <form class="ask-form" onsubmit={handleSubmit}>
     <textarea
       rows="2"
-      placeholder="Es. Enuncia il teorema principale o spiega questo passaggio…"
+      placeholder={tr(lang, 'askPlaceholder')}
       bind:value={question}
       onkeydown={(e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -183,10 +197,12 @@
       {#if lastPreview}
         <span class="tok-hint">~{lastPreview.estimated_input_tokens} tok</span>
       {:else}
-        <span class="tok-hint">Invio per chiedere · citazioni [p. X]</span>
+        <span class="tok-hint">
+          {lang === 'en' ? 'Enter to ask · [p. X] citations' : 'Invio per chiedere · citazioni [p. X]'}
+        </span>
       {/if}
       <button type="submit" class="primary ask-send" disabled={streaming || !question.trim()}>
-        {streaming ? 'Risposta…' : 'Chiedi'}
+        {streaming ? tr(lang, 'askSendingBtn') : tr(lang, 'askSendBtn')}
       </button>
     </div>
   </form>
@@ -194,12 +210,14 @@
   {#if pendingConsent}
     <div class="consent-box">
       <p>
-        Invio verso <strong>{pendingConsent.provider.toUpperCase()}</strong> ({pendingConsent.passages_included}
-        estratti, ~{pendingConsent.estimated_input_tokens} token). Il file intero non viene mai caricato.
+        {lang === 'en' ? 'Sending to' : 'Invio verso'} <strong>{pendingConsent.provider.toUpperCase()}</strong> ({pendingConsent.passages_included}
+        {lang === 'en' ? 'excerpts' : 'estratti'}, ~{pendingConsent.estimated_input_tokens} token). {lang === 'en' ? 'Full files are never uploaded.' : 'Il file intero non viene mai caricato.'}
       </p>
       <div class="consent-btns">
-        <button type="button" onclick={() => (pendingConsent = null)}>Annulla</button>
-        <button type="button" class="primary" onclick={confirmConsentAndAsk}>Consenti e invia</button>
+        <button type="button" onclick={() => (pendingConsent = null)}>{tr(lang, 'cancel')}</button>
+        <button type="button" class="primary" onclick={confirmConsentAndAsk}>
+          {lang === 'en' ? 'Allow & send' : 'Consenti e invia'}
+        </button>
       </div>
     </div>
   {/if}
@@ -241,7 +259,7 @@
       </div>
     {:else if !streaming && !errorMsg}
       <p class="ask-empty">
-        Fai una domanda circoscritta a questo documento, alla pagina corrente o al testo selezionato.
+        {tr(lang, 'askEmptyHint')}
       </p>
     {/if}
   </div>

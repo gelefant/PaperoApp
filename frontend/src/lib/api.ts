@@ -5,6 +5,7 @@ import type {
   BackupReport,
   BibtexSyncReport,
   BulkMetadataProgressEvent,
+  CitationLinkItem,
   CiteKeyPayload,
   ClusteringReport,
   CollectionView,
@@ -48,6 +49,7 @@ import type {
   SavedSearchView,
   ScanProgressEvent,
   SmartPasteApplyResult,
+  SnipLatexResult,
   SourceRoot,
   TagSummary,
   TopicClusterView,
@@ -189,8 +191,11 @@ export const api = {
   dismissCandidate: (candidateId: number) =>
     invoke<void>('dismiss_candidate', { candidateId }),
 
-  getDocumentBibtex: (documentId: number) =>
-    invoke<string>('get_document_bibtex', { documentId }),
+  getDocumentBibtex: (documentId: number, collectionId?: number | null) =>
+    invoke<string>('get_document_bibtex', {
+      documentId,
+      collectionId: collectionId ?? null,
+    }),
   exportBibtexMany: (documentIds: number[], filePath?: string | null) =>
     invoke<string>('export_bibtex_many', {
       documentIds,
@@ -429,16 +434,30 @@ export const api = {
     });
   },
 
-  // Citation key & Live BibTeX Auto-Sync (v0.5.0)
-  getDocumentCiteKey: (documentId: number) =>
-    invoke<CiteKeyPayload>('get_document_cite_key_cmd', { documentId }),
+  // Citation key & Live BibTeX Auto-Sync (v0.5.0 / v0.5.3 disambiguated)
+  getDocumentCiteKey: (documentId: number, collectionId?: number | null) =>
+    invoke<CiteKeyPayload>('get_document_cite_key_cmd', {
+      documentId,
+      collectionId: collectionId ?? null,
+    }),
   syncBibtexNow: () => invoke<BibtexSyncReport>('sync_bibtex_now_cmd'),
 
-  // Smart Paste & Document Relations (v0.5.0)
+  // Smart Paste, Document Relations & Citation Bridge (v0.5.0 / v0.5.3)
   applySmartPaste: (documentId: number, rawInput: string) =>
     invoke<SmartPasteApplyResult>('apply_smart_paste_cmd', { documentId, rawInput }),
   getDocumentRelations: (documentId: number) =>
     invoke<DocumentRelationsView>('get_document_relations_cmd', { documentId }),
+  matchCitationInLibrary: (snippet: string, citingDocumentId?: number | null) =>
+    invoke<CitationLinkItem | null>('match_citation_in_library_cmd', {
+      citingDocumentId: citingDocumentId ?? null,
+      snippet,
+    }),
+  snipImageToLatex: (documentId: number, imageDataUrl: string, hint?: string | null) =>
+    invoke<SnipLatexResult>('snip_image_to_latex_cmd', {
+      documentId,
+      imageDataUrl,
+      hint: hint ?? null,
+    }),
 
   // Non-destructive Annotations, Bookmarks, Notes & Reading State (v0.5.0)
   listFileAnnotations: (fileId: number) =>

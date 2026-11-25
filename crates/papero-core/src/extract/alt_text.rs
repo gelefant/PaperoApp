@@ -64,10 +64,12 @@ pub fn import_alt_formula_markdown(
         let mut stmt = tx.prepare_cached(
             "INSERT INTO passages (
                 document_id, file_id, page_ord, printed_label, chunk_index,
-                is_alt_formula, token_count, text_content, bboxes_blob
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8)",
+                is_alt_formula, token_count, text_content, bboxes_blob,
+                statement_kind, statement_label
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for ch in &chunks {
+            let det = crate::extract::statements::detect_math_statement(&ch.text_content);
             stmt.execute(params![
                 loc.document_id,
                 file_id,
@@ -77,6 +79,8 @@ pub fn import_alt_formula_markdown(
                 ch.token_count as i64,
                 ch.text_content,
                 Vec::<u8>::new(),
+                det.as_ref().map(|s| s.kind),
+                det.as_ref().map(|s| s.label.as_str()),
             ])?;
             let pid = tx.last_insert_rowid() as u64;
             inserted_bm25.push(Bm25Passage {

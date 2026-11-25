@@ -21,12 +21,14 @@
     searchStats?: HybridSearchStats | null;
     workCategory?: WorkCategory;
     statementsOnly?: boolean;
+    statementKindGroup?: string;
     activeFilterChips?: string[];
     authorFilter?: string;
     yearFromFilter?: number | null;
     yearToFilter?: number | null;
     onChangeWorkCategory?: (cat: WorkCategory) => void;
     onToggleStatementsOnly?: (active: boolean) => void;
+    onChangeStatementKindGroup?: (group: string) => void;
     onChangeContentMetaFilters?: (patch: {
       author?: string | null;
       year_from?: number | null;
@@ -53,12 +55,14 @@
     searchStats = null,
     workCategory = 'all',
     statementsOnly = false,
+    statementKindGroup = 'all',
     activeFilterChips = [],
     authorFilter = '',
     yearFromFilter = null,
     yearToFilter = null,
     onChangeWorkCategory,
     onToggleStatementsOnly,
+    onChangeStatementKindGroup,
     onChangeContentMetaFilters,
     onClearContentFilters,
     llmProvider = 'disabled',
@@ -139,6 +143,18 @@
   }
 
   function modeBadge(mode: string): string {
+    if (lang === 'en') {
+      switch (mode) {
+        case 'bm25_vector_rerank':
+          return 'BM25 + Vector + Reranker';
+        case 'bm25_vector':
+          return 'BM25 + Vector';
+        case 'bm25_rerank':
+          return 'BM25 + Reranker';
+        default:
+          return 'BM25 only';
+      }
+    }
     switch (mode) {
       case 'bm25_vector_rerank':
         return 'BM25 + Vettoriale + Reranker';
@@ -197,12 +213,28 @@
           class="adv-filter-toggle"
           class:active={statementsOnly}
           title={lang === 'en'
-            ? 'Show only mathematical statements (Theorems, Lemmas, Propositions, Corollaries, Definitions)'
-            : 'Mostra solo enunciati matematici (Teoremi, Lemmi, Proposizioni, Corollari, Definizioni)'}
+            ? 'Show only mathematical statements (Theorems, Lemmas, Propositions, Definitions, Remarks, Examples)'
+            : 'Mostra solo enunciati matematici (Teoremi, Lemmi, Proposizioni, Definizioni, Osservazioni, Esempi)'}
           onclick={() => onToggleStatementsOnly(!statementsOnly)}
         >
           {tr(lang, 'statementsOnlyLabel')}
         </button>
+        {#if statementsOnly && onChangeStatementKindGroup}
+          <select
+            class="stmt-subselect"
+            aria-label={tr(lang, 'statementsOnlyLabel')}
+            value={statementKindGroup}
+            onchange={(e) =>
+              onChangeStatementKindGroup((e.currentTarget as HTMLSelectElement).value)}
+          >
+            <option value="all">{tr(lang, 'stmtAll')}</option>
+            <option value="theorem">{tr(lang, 'stmtTheoremGroup')}</option>
+            <option value="definition">{tr(lang, 'stmtDefinitions')}</option>
+            <option value="remark">{tr(lang, 'stmtRemarks')}</option>
+            <option value="example">{tr(lang, 'stmtExamples')}</option>
+            <option value="conjecture">{tr(lang, 'stmtConjectures')}</option>
+          </select>
+        {/if}
       {/if}
       {#if onChangeContentMetaFilters}
         <button
@@ -346,7 +378,9 @@
   {/if}
 
   {#if results.length === 0}
-    <div class="empty">Nessun passaggio trovato per «{query}».</div>
+    <div class="empty">
+      {lang === 'en' ? `No passages found for “${query}”.` : `Nessun passaggio trovato per «${query}».`}
+    </div>
   {:else}
     <div class="rows">
       {#each results as doc (doc.document_id)}
@@ -707,6 +741,16 @@
   }
   .adv-filter-toggle.active {
     border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .stmt-subselect {
+    font-size: 11px;
+    height: 24px;
+    padding: 1px 6px;
+    border-radius: 5px;
+    border: 1px solid var(--accent);
     background: var(--accent-soft);
     color: var(--accent);
     font-weight: 600;

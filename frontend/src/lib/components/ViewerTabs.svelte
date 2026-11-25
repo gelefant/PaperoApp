@@ -1,36 +1,48 @@
 <script lang="ts">
-  import type { LlmProvider, ViewerTab } from '../types';
+  import { tr, type Lang } from '../i18n';
+  import type { CitationLinkItem, LlmProvider, ViewerTab } from '../types';
+  import type { FocusedViewerPane } from '../viewerTabsState.svelte';
   import UnifiedViewer from './UnifiedViewer.svelte';
 
   interface Props {
+    lang?: Lang;
     tabs: ViewerTab[];
     activeTabId: string | null;
     splitTabId?: string | null;
+    focusedPane?: FocusedViewerPane;
     zenMode?: boolean;
     llmProvider?: LlmProvider;
     onSelectTab: (tabId: string) => void;
     onCloseTab: (tabId: string) => void;
     onSetSplitTab?: (tabId: string | null) => void;
+    onDuplicateTabToSplit?: (tabId?: string) => void;
+    onFocusPane?: (pane: FocusedViewerPane) => void;
     onToggleZen?: () => void;
     onSelectMatchIndex: (tabId: string, idx: number) => void;
     onOpenExternal: (fileId: number, pageOrd: number) => void;
+    onOpenLibraryDoc?: (doc: CitationLinkItem, inSplit: boolean) => void;
     onConsentAccepted?: (provider: LlmProvider) => void;
     onAnnotationsChanged?: () => void;
     onStatusMessage?: (msg: string) => void;
   }
 
   let {
+    lang = 'it',
     tabs,
     activeTabId,
     splitTabId = null,
+    focusedPane = 'primary',
     zenMode = false,
     llmProvider = 'disabled',
     onSelectTab,
     onCloseTab,
     onSetSplitTab,
+    onDuplicateTabToSplit,
+    onFocusPane,
     onToggleZen,
     onSelectMatchIndex,
     onOpenExternal,
+    onOpenLibraryDoc,
     onConsentAccepted,
     onAnnotationsChanged,
     onStatusMessage,
@@ -44,14 +56,17 @@
   );
 
   function toggleSplitMode() {
-    if (!onSetSplitTab) return;
     if (effectiveSplitTab) {
-      onSetSplitTab(null);
+      onSetSplitTab?.(null);
       return;
     }
     const other = tabs.find((t) => t.tabId !== activeTabId);
-    if (other) {
+    if (other && onSetSplitTab) {
       onSetSplitTab(other.tabId);
+      return;
+    }
+    if (activeTabId && onDuplicateTabToSplit) {
+      onDuplicateTabToSplit(activeTabId);
     }
   }
 </script>
@@ -59,7 +74,7 @@
 <div class="tabs-wrapper">
   {#if tabs.length === 0}
     <div class="empty-viewer">
-      Seleziona un documento o un passaggio dai risultati di ricerca (doppio clic) per aprirlo qui.
+      {tr(lang, 'emptyViewerHint')}
     </div>
   {:else}
     <div class="tab-bar">
@@ -71,35 +86,29 @@
             <button
               type="button"
               class="tab-label"
-              onclick={() => {
-                if (isSecondary && onSetSplitTab && activeTabId) {
-                  // Swap primary & split cleanly
-                  const prev = activeTabId;
-                  onSelectTab(tab.tabId);
-                  onSetSplitTab(prev);
-                } else {
-                  onSelectTab(tab.tabId);
-                }
-              }}
+              onclick={() => onSelectTab(tab.tabId)}
               oncontextmenu={(e) => {
-                if (tabs.length >= 2 && onSetSplitTab && tab.tabId !== activeTabId) {
+                if (tab.tabId === activeTabId && onDuplicateTabToSplit) {
+                  e.preventDefault();
+                  onDuplicateTabToSplit(tab.tabId);
+                } else if (onSetSplitTab && tab.tabId !== activeTabId) {
                   e.preventDefault();
                   onSetSplitTab(isSecondary ? null : tab.tabId);
                 }
               }}
-              title={tabs.length >= 2 && tab.tabId !== activeTabId
-                ? `${tab.title} (tasto destro per affiancare a destra)`
-                : tab.title}
+              title={tab.tabId === activeTabId
+                ? `${tab.title} (${tr(lang, 'duplicateSplitTip')})`
+                : `${tab.title} (${tr(lang, 'splitRightBadgeTip')})`}
             >
               {#if isSecondary}
-                <span class="split-badge" title="Affiancato a destra">◫</span>
+                <span class="split-badge" title={tr(lang, 'splitRightBadgeTip')}>◫</span>
               {/if}
               <span>{tab.title}</span>
             </button>
             <button
               type="button"
               class="tab-close"
-              title="Chiudi scheda"
+              title={tr(lang, 'closeTab')}
               onclick={() => onCloseTab(tab.tabId)}
             >
               ×
@@ -109,15 +118,30 @@
       </div>
 
       <div class="tab-bar-tools">
-        {#if tabs.length >= 2 && onSetSplitTab}
+        {#if activeTab && onDuplicateTabToSplit && tabs.length >= 2}
+          <button
+            type="button"
+            class="tb-tool-btn"
+            title={tr(lang, 'duplicateSplitTip')}
+            aria-label={tr(lang, 'duplicateSplitTip')}
+            onclick={() => onDuplicateTabToSplit?.(activeTab.tabId)}
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="8" y="8" width="12" height="12" rx="2" />
+              <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+              <path d="M14 11v6M11 14h6" />
+            </svg>
+          </button>
+        {/if}
+        {#if tabs.length >= 1 && (onSetSplitTab || onDuplicateTabToSplit)}
           <button
             type="button"
             class="tb-tool-btn"
             class:active={Boolean(effectiveSplitTab)}
             title={effectiveSplitTab
-              ? 'Chiudi vista affiancata di 2 documenti'
-              : 'Affianca 2 documenti aperti (vista doppia)'}
-            aria-label="Affianca due documenti"
+              ? tr(lang, 'splitToggleCloseTip')
+              : tr(lang, 'splitToggleOpenTip')}
+            aria-label={tr(lang, 'splitToggleOpenTip')}
             onclick={toggleSplitMode}
           >
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -131,8 +155,8 @@
             type="button"
             class="tb-tool-btn"
             class:active={zenMode}
-            title="Modalità lettura Zen (⌘\)"
-            aria-label="Modalità lettura Zen"
+            title={tr(lang, 'zenModeTip')}
+            aria-label={tr(lang, 'zenModeTip')}
             onclick={onToggleZen}
           >
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -149,18 +173,26 @@
 
     {#if activeTab}
       <div class="viewer-panes" class:split={Boolean(effectiveSplitTab)}>
-        <div class="viewer-pane">
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="viewer-pane"
+          class:pane-focused={Boolean(effectiveSplitTab) && focusedPane === 'primary'}
+          onpointerdown={() => onFocusPane?.('primary')}
+        >
           {#key activeTab.tabId}
             <UnifiedViewer
+              {lang}
               fileId={activeTab.fileId}
               targetPage={activeTab.targetPage}
               explicitPageJump={Boolean(activeTab.explicitPageJump)}
               highlightRects={activeTab.highlightRects}
               matches={activeTab.matches}
               activeMatchIndex={activeTab.activeMatchIndex}
+              isKeyboardActive={!effectiveSplitTab || focusedPane === 'primary'}
               {llmProvider}
               onSelectMatchIndex={(idx) => onSelectMatchIndex(activeTab.tabId, idx)}
               {onOpenExternal}
+              {onOpenLibraryDoc}
               {onConsentAccepted}
               {onAnnotationsChanged}
               {onStatusMessage}
@@ -169,7 +201,12 @@
         </div>
 
         {#if effectiveSplitTab}
-          <div class="viewer-pane split-right">
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="viewer-pane split-right"
+            class:pane-focused={focusedPane === 'split'}
+            onpointerdown={() => onFocusPane?.('split')}
+          >
             <div class="split-pane-head">
               <span class="split-pane-title" title={effectiveSplitTab.title}>
                 {effectiveSplitTab.title}
@@ -177,7 +214,7 @@
               <button
                 type="button"
                 class="split-pane-close"
-                title="Chiudi pannello affiancato"
+                title={tr(lang, 'closeSplitPaneTip')}
                 onclick={() => onSetSplitTab?.(null)}
               >
                 ×
@@ -186,15 +223,18 @@
             <div class="split-pane-body">
               {#key effectiveSplitTab.tabId}
                 <UnifiedViewer
+                  {lang}
                   fileId={effectiveSplitTab.fileId}
                   targetPage={effectiveSplitTab.targetPage}
                   explicitPageJump={Boolean(effectiveSplitTab.explicitPageJump)}
                   highlightRects={effectiveSplitTab.highlightRects}
                   matches={effectiveSplitTab.matches}
                   activeMatchIndex={effectiveSplitTab.activeMatchIndex}
+                  isKeyboardActive={focusedPane === 'split'}
                   {llmProvider}
                   onSelectMatchIndex={(idx) => onSelectMatchIndex(effectiveSplitTab.tabId, idx)}
                   {onOpenExternal}
+                  {onOpenLibraryDoc}
                   {onConsentAccepted}
                   {onAnnotationsChanged}
                   {onStatusMessage}
@@ -323,6 +363,10 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    border-top: 2px solid transparent;
+  }
+  .viewer-pane.pane-focused {
+    border-top-color: var(--accent);
   }
   .viewer-pane.split-right {
     border-left: 2px solid var(--border);

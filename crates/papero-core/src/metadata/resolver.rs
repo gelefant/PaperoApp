@@ -2706,6 +2706,8 @@ pub struct ManualMetadataEdit {
     pub msc_primary: Option<String>,
     pub msc_secondary: Vec<String>,
     pub abstract_text: Option<String>,
+    #[serde(default)]
+    pub citation_key_override: Option<String>,
     pub exclude_from_cloud_llm: bool,
     pub tags: Vec<String>,
     /// Explicit list of fields edited in this save so only touched fields are locked.
@@ -2877,6 +2879,13 @@ pub fn apply_manual_metadata_edit_with_locks(
         let url_val = if keep("url") { clean_opt(&edit.url) } else { None };
         let msc_primary_val = if keep("msc_primary") { clean_opt(&edit.msc_primary) } else { None };
         let abstract_val = if keep("abstract_text") { clean_opt(&edit.abstract_text) } else { None };
+        let cite_key_override_val = if keep("citation_key_override") {
+            edit.citation_key_override
+                .as_deref()
+                .and_then(crate::metadata::io::sanitize_citation_key_override)
+        } else {
+            None
+        };
         let (prev_arxiv_id, prev_mr_number): (Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT arxiv_id, mr_number FROM documents WHERE id = ?1",
@@ -2932,6 +2941,7 @@ pub fn apply_manual_metadata_edit_with_locks(
                 msc_primary = ?24,
                 msc_primary_status = CASE WHEN ?24 IS NOT NULL AND ?24 != '' THEN 'confirmed' ELSE 'none' END,
                 abstract_text = ?25,
+                citation_key_override = ?34,
                 raw_mrlookup_bibtex = CASE WHEN ?31 != 0 THEN NULL ELSE raw_mrlookup_bibtex END,
                 metadata_license_note = CASE WHEN ?32 != 0 THEN NULL ELSE metadata_license_note END,
                 manual_locked_fields = ?26,
@@ -2974,6 +2984,7 @@ pub fn apply_manual_metadata_edit_with_locks(
                 clear_raw_bib as i64,
                 reset_unlocked as i64,
                 next_source,
+                cite_key_override_val,
             ],
         )?;
 
@@ -3252,7 +3263,7 @@ pub fn get_document_metadata(db: &Database, document_id: i64) -> Result<Document
                 arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer, zbl_number,
                 url, msc_primary, msc_primary_status, abstract_text, raw_mrlookup_bibtex,
                 metadata_source, metadata_license_note, manual_locked_fields, exclude_from_cloud_llm,
-                metadata_verified, reading_status, is_starred
+                metadata_verified, reading_status, is_starred, citation_key_override
          FROM documents WHERE id = ?1",
         params![document_id],
         |r| {
@@ -3288,6 +3299,7 @@ pub fn get_document_metadata(db: &Database, document_id: i64) -> Result<Document
                 msc_primary_status: r.get(24)?,
                 msc_secondary: Vec::new(),
                 abstract_text: r.get(25)?,
+                citation_key_override: r.get(34)?,
                 raw_mrlookup_bibtex: r.get(26)?,
                 metadata_source: r.get(27)?,
                 metadata_license_note: r.get(28)?,
@@ -3427,6 +3439,7 @@ pub fn get_documents_metadata_for_export(
                 msc_primary_status: r.get(25)?,
                 msc_secondary: Vec::new(),
                 abstract_text: r.get(26)?,
+                citation_key_override: r.get(35)?,
                 raw_mrlookup_bibtex: r.get(27)?,
                 metadata_source: r.get(28)?,
                 metadata_license_note: r.get(29)?,
@@ -3449,7 +3462,7 @@ pub fn get_documents_metadata_for_export(
         arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer, zbl_number,
         url, msc_primary, msc_primary_status, abstract_text, raw_mrlookup_bibtex,
         metadata_source, metadata_license_note, manual_locked_fields, exclude_from_cloud_llm,
-        metadata_verified, reading_status, is_starred FROM documents";
+        metadata_verified, reading_status, is_starred, citation_key_override FROM documents";
 
     if document_ids.is_empty() {
         let sql = format!("{SELECT_COLS} ORDER BY updated_at DESC, id DESC");
@@ -4595,6 +4608,7 @@ mod tests {
             msc_primary: None,
             msc_secondary: vec![],
             abstract_text: None,
+            citation_key_override: None,
             exclude_from_cloud_llm: false,
             tags: vec!["fem".into()],
             edited_fields: vec!["title".into()],
@@ -4786,6 +4800,7 @@ mod tests {
                     msc_primary: None,
                     msc_secondary: vec![],
                     abstract_text: None,
+                    citation_key_override: None,
                     exclude_from_cloud_llm: false,
                     tags: vec![],
                     edited_fields: vec!["title".into(), "authors".into()],
@@ -5221,6 +5236,7 @@ mod tests {
                 msc_primary: None,
                 msc_secondary: vec![],
                 abstract_text: None,
+                citation_key_override: None,
                 exclude_from_cloud_llm: false,
                 tags: vec![],
                 edited_fields: vec!["title".into()],
@@ -6112,6 +6128,7 @@ mod tests {
                 msc_primary: None,
                 msc_secondary: vec![],
                 abstract_text: None,
+                citation_key_override: None,
                 exclude_from_cloud_llm: false,
                 tags: vec![],
                 edited_fields: vec!["journal_full".into()],
@@ -6158,6 +6175,7 @@ mod tests {
                 msc_primary: None,
                 msc_secondary: vec![],
                 abstract_text: None,
+                citation_key_override: None,
                 exclude_from_cloud_llm: false,
                 tags: vec![],
                 edited_fields: vec!["journal_abbrev".into()],
@@ -6204,6 +6222,7 @@ mod tests {
                 msc_primary: None,
                 msc_secondary: vec![],
                 abstract_text: None,
+                citation_key_override: None,
                 exclude_from_cloud_llm: false,
                 tags: vec![],
                 edited_fields: vec!["journal_abbrev".into()],

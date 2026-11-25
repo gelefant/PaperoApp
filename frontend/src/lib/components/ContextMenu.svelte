@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tr, type Lang } from '../i18n';
   import type { CollectionView, ExternalReaderPreset } from '../types';
 
   export interface ContextTarget {
@@ -12,6 +13,7 @@
   }
 
   interface Props {
+    lang?: Lang;
     target: ContextTarget | null;
     presets: ExternalReaderPreset[];
     collections?: CollectionView[];
@@ -27,6 +29,7 @@
   }
 
   let {
+    lang = 'it',
     target,
     presets,
     collections = [],
@@ -42,7 +45,7 @@
   }: Props = $props();
 
   let collectionsOpen = $state(false);
-  const unavailableReason = 'Cartella sorgente non raggiungibile';
+  const unavailableReason = $derived(tr(lang, 'unavailableFolderReason'));
 
   $effect(() => {
     if (!target) {
@@ -81,7 +84,7 @@
           onClose();
         }}
       >
-        Apri nel visualizzatore interno
+        {tr(lang, 'ctxOpenInternal')}
       </button>
 
       <button
@@ -93,7 +96,7 @@
           onClose();
         }}
       >
-        Apri con applicazione esterna
+        {tr(lang, 'ctxOpenExternal')}
       </button>
 
       {#each presets.filter((p) => p.formats.includes(target.format)) as preset}
@@ -119,7 +122,7 @@
           class="sub-toggle"
           onclick={() => (collectionsOpen = !collectionsOpen)}
         >
-          <span>Aggiungi a collezione (.bib)</span>
+          <span>{tr(lang, 'ctxAddToCollection')}</span>
           <span>{collectionsOpen ? '▾' : '▸'}</span>
         </button>
         {#if collectionsOpen}
@@ -155,7 +158,7 @@
           onClose();
         }}
       >
-        Mostra nella cartella
+        {tr(lang, 'ctxRevealInFolder')}
       </button>
 
       <button
@@ -165,7 +168,7 @@
           onClose();
         }}
       >
-        Apri Ispettore Metadati
+        {tr(lang, 'ctxOpenInspector')}
       </button>
 
       <button
@@ -175,20 +178,24 @@
           onClose();
         }}
       >
-        Copia BibTeX (MRLookup)
+        {tr(lang, 'ctxCopyBibtex')}
       </button>
 
       {#if onRunOcr}
         <button
           type="button"
           disabled={!target.isAvailable}
-          title={target.isAvailable ? 'Estrai testo con Tesseract OCR (file originale invariato)' : unavailableReason}
+          title={target.isAvailable
+            ? lang === 'en'
+              ? 'Extract text with Tesseract OCR (original file untouched)'
+              : 'Estrai testo con Tesseract OCR (file originale invariato)'
+            : unavailableReason}
           onclick={() => {
             onRunOcr(target.fileId);
             onClose();
           }}
         >
-          Esegui OCR (Tesseract)
+          {tr(lang, 'ctxRunOcr')}
         </button>
       {/if}
 
@@ -199,7 +206,7 @@
           onClose();
         }}
       >
-        Copia percorso
+        {tr(lang, 'ctxCopyPath')}
       </button>
     </div>
   </div>

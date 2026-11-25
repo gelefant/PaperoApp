@@ -34,6 +34,7 @@ export interface InspectorFormFields {
   mscPrimary: string;
   mscSecondaryText: string;
   abstractText: string;
+  citationKeyOverride?: string;
   tagsText: string;
   excludeFromCloud: boolean;
   touched: string[];
@@ -112,7 +113,7 @@ export function computeNextLocksOnTouch(
   overwriteQueryFields: boolean,
   currentValue?: string | number | null
 ): { lockedFields: string[]; modified: boolean } {
-  if (field === 'tags' || field === 'exclude_from_cloud_llm') {
+      if (field === 'tags' || field === 'exclude_from_cloud_llm' || field === 'citation_key_override') {
     return { lockedFields, modified: false };
   }
   if ((field === 'title' || field === 'authors') && overwriteQueryFields) {
@@ -179,6 +180,7 @@ export function buildManualMetadataEditPayload(
         .map((s) => s.trim())
         .filter(Boolean),
       abstract_text: optTrimmedStr(fields.abstractText),
+      citation_key_override: optTrimmedStr(fields.citationKeyOverride),
       exclude_from_cloud_llm: fields.excludeFromCloud,
       tags: fields.tagsText
         .split(',')
@@ -311,6 +313,11 @@ export function hasInspectorFormDiff(
     return true;
   }
   if (normalizeInputText(fields.abstractText) !== (meta.abstract_text ?? '').trim()) return true;
+  if (
+    normalizeInputText(fields.citationKeyOverride) !== (meta.citation_key_override ?? '').trim()
+  ) {
+    return true;
+  }
   if (normalizeInputText(fields.tagsText) !== meta.tags.join(', ').trim()) return true;
   if (fields.excludeFromCloud !== meta.exclude_from_cloud_llm) return true;
   return false;

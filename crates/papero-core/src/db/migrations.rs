@@ -148,6 +148,72 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         migrate_v8_collection_bib_sync(conn)?;
     }
 
+    if current_version < 9 {
+        migrate_v9_cite_override_statements_and_snips(conn)?;
+    }
+
+    Ok(())
+}
+
+fn migrate_v9_cite_override_statements_and_snips(conn: &Connection) -> Result<()> {
+    let table_cols = |table: &str| -> Result<std::collections::HashSet<String>> {
+        let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let iter = st.query_map([], |r| r.get::<_, String>(1))?;
+        Ok(iter.filter_map(std::result::Result::ok).collect())
+    };
+
+    let doc_cols = table_cols("documents")?;
+    let pass_cols = table_cols("passages")?;
+    let ann_cols = table_cols("file_annotations")?;
+
+    let added_stmt_cols =
+        !pass_cols.contains("statement_kind") || !pass_cols.contains("statement_label");
+
+    let tx = conn.unchecked_transaction()?;
+    if !doc_cols.contains("citation_key_override") {
+        tx.execute_batch("ALTER TABLE documents ADD COLUMN citation_key_override TEXT;")?;
+    }
+    if !pass_cols.contains("statement_kind") {
+        tx.execute_batch("ALTER TABLE passages ADD COLUMN statement_kind TEXT;")?;
+    }
+    if !pass_cols.contains("statement_label") {
+        tx.execute_batch("ALTER TABLE passages ADD COLUMN statement_label TEXT;")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_passages_stmt_kind ON passages(statement_kind) WHERE statement_kind IS NOT NULL;",
+    )?;
+    if !ann_cols.contains("image_data_url") {
+        tx.execute_batch("ALTER TABLE file_annotations ADD COLUMN image_data_url TEXT;")?;
+    }
+
+    if added_stmt_cols {
+        let mut updates: Vec<(i64, String, String)> = Vec::new();
+        {
+            let mut q = tx.prepare("SELECT id, text_content FROM passages")?;
+            let rows = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (pid, text) = row?;
+                if let Some(det) = crate::extract::statements::detect_math_statement(&text) {
+                    updates.push((pid, det.kind.to_string(), det.label));
+                }
+            }
+        }
+        if !updates.is_empty() {
+            let mut upd = tx.prepare(
+                "UPDATE passages SET statement_kind = ?1, statement_label = ?2 WHERE id = ?3",
+            )?;
+            for (pid, kind, label) in updates {
+                upd.execute(rusqlite::params![kind, label, pid])?;
+            }
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+        rusqlite::params![9i64, now],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

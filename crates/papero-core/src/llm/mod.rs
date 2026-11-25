@@ -5,8 +5,8 @@ pub mod provider;
 
 pub use citations::parse_citations;
 pub use client::{
-    generate_grounded_answer, generate_grounded_answer_streaming, list_models,
-    map_provider_http_error, send_prepared_prompt, send_prepared_prompt_streaming,
+    convert_snip_image_to_latex, generate_grounded_answer, generate_grounded_answer_streaming,
+    list_models, map_provider_http_error, send_prepared_prompt, send_prepared_prompt_streaming,
     verify_provider_key,
 };
 pub use guard::{
@@ -17,5 +17,5 @@ pub use guard::{
 };
 pub use provider::{
     DocLlmScope, LlmAnswerResult, LlmCitation, LlmKeyVerifyResult, LlmModelInfo, LlmPromptPreview,
-    LlmProvider, LlmStreamEvent, LlmUsage,
+    LlmProvider, LlmStreamEvent, LlmUsage, SnipLatexResult,
 };

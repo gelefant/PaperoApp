@@ -4,10 +4,13 @@
   import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
   import { api } from './lib/api';
   import { normalizeLang, tr } from './lib/i18n';
+  import { createLayoutState } from './lib/layoutState.svelte';
+  import { createViewerTabsState } from './lib/viewerTabsState.svelte';
   import type {
     AnnotationSearchHit,
     BackupReport,
     BibtexSyncReport,
+    CitationLinkItem,
     CollectionView,
     ContentSearchDocResult,
     ContentSearchFilter,
@@ -43,7 +46,6 @@
     UiSettingsPayload,
     UpdateCheckResult,
     VerifiedFilter,
-    ViewerTab,
     ViewerTargetPassage,
     WorkCategory,
   } from './lib/types';
@@ -98,9 +100,11 @@
   let activeLeftView = $state<'library' | 'duplicates'>('library');
   let duplicateGroups = $state.raw<DuplicateGroupView[]>([]);
   let scanningDedup = $state(false);
+  const layout = createLayoutState();
+  const viewerTabs = createViewerTabsState();
+
   let scanning = $state(false);
   let scanStatusText = $state('');
-  let sidebarCollapsed = $state(false);
   let mscTree = $state.raw<MscTreeNode[]>([]);
   let clusters = $state.raw<TopicClusterView[]>([]);
   let tags = $state.raw<TagSummary[]>([]);
@@ -111,16 +115,12 @@
   let clusteringBusy = $state(false);
   let settings = $state<UiSettingsPayload | null>(null);
   let presets = $state.raw<ExternalReaderPreset[]>([]);
-  let tabs = $state<ViewerTab[]>([]);
-  let activeTabId = $state<string | null>(null);
-  let splitTabId = $state<string | null>(null);
-  let zenMode = $state(false);
-  let zenRestore = { sidebarCollapsed: false, inspectorOpen: true };
   let totalAnnotationsCount = $state(0);
   let notesScopeActive = $state(false);
   let notesHits = $state.raw<AnnotationSearchHit[]>([]);
   let notesLoading = $state(false);
   let statementsOnly = $state(false);
+  let statementKindGroup = $state<string>('all');
   let commandPaletteOpen = $state(false);
   let classicsModalOpen = $state(false);
   let collectionBibModal = $state<CollectionView | null>(null);
@@ -215,7 +215,6 @@
           documents.find((d) => d.document_id === selectedDocId))?.file_id ?? null)
       : null
   );
-  let inspectorOpen = $state(true);
   let selectedMeta = $state<DocumentMetadataView | null>(null);
   let loadingMeta = $state(false);
   let fetchingMeta = $state(false);
@@ -280,10 +279,28 @@
     );
   }
 
-  /** Builds ContentSearchFilter propagating Tag/Cluster/Collection/Author/Year/Root/Category/Reading/Starred — intentionally excluding MSC2020. */
+  function resolveStatementKinds(group: string): string[] | null {
+    switch (group) {
+      case 'theorem':
+        return ['theorem', 'lemma', 'proposition', 'corollary'];
+      case 'definition':
+        return ['definition'];
+      case 'remark':
+        return ['remark'];
+      case 'example':
+        return ['example'];
+      case 'conjecture':
+        return ['conjecture'];
+      default:
+        return null;
+    }
+  }
+
+  /** Builds ContentSearchFilter propagating MSC2020, Tag, Cluster, Collection, Author, Year, Root, Category, Reading, Starred & Statement subtypes. */
   function buildActiveContentFilter(): ContentSearchFilter {
     return {
       root_ids: metaFilter.root_id ? [metaFilter.root_id] : null,
+      msc_prefix: metaFilter.msc_prefix || null,
       tag: metaFilter.tag || null,
       cluster_id: metaFilter.cluster_id ?? null,
       collection_id: metaFilter.collection_id ?? null,
@@ -294,12 +311,28 @@
       reading_status: metaFilter.reading_status || null,
       starred_only: metaFilter.starred_only ? true : null,
       statements_only: statementsOnly,
+      statement_kinds: statementsOnly ? resolveStatementKinds(statementKindGroup) : null,
     };
   }
 
   const activeContentFilterChips = $derived.by(() => {
     const chips: string[] = [];
-    if (statementsOnly) chips.push(tr(lang, 'statementsOnlyLabel'));
+    if (statementsOnly) {
+      const subLabel =
+        statementKindGroup === 'theorem'
+          ? tr(lang, 'stmtTheoremGroup')
+          : statementKindGroup === 'definition'
+            ? tr(lang, 'stmtDefinitions')
+            : statementKindGroup === 'remark'
+              ? tr(lang, 'stmtRemarks')
+              : statementKindGroup === 'example'
+                ? tr(lang, 'stmtExamples')
+                : statementKindGroup === 'conjecture'
+                  ? tr(lang, 'stmtConjectures')
+                  : tr(lang, 'statementsOnlyLabel');
+      chips.push(subLabel);
+    }
+    if (metaFilter.msc_prefix) chips.push(`MSC ${metaFilter.msc_prefix}`);
     if (metaFilter.tag) chips.push(`#${metaFilter.tag}`);
     if (metaFilter.cluster_id) {
       const cl = clusters.find((c) => c.id === metaFilter.cluster_id);
@@ -428,16 +461,7 @@
     const allLibraryDocs = allDocuments;
 
     // Close viewer tabs pointing to files that were removed
-    if (tabs.length > 0) {
-      const validFileIds = catalogStats.byFileId;
-      const remainingTabs = tabs.filter((t) => validFileIds.has(t.fileId));
-      if (remainingTabs.length !== tabs.length) {
-        tabs = remainingTabs;
-        if (!remainingTabs.some((t) => t.tabId === activeTabId)) {
-          activeTabId = remainingTabs[0]?.tabId ?? null;
-        }
-      }
-    }
+    viewerTabs.pruneRemovedFiles(catalogStats.byFileId);
 
     if (selectedDocId !== null) {
       if (catalogStats.byDocId.has(selectedDocId) || allLibraryDocs.some((d) => d.document_id === selectedDocId)) {
@@ -453,14 +477,7 @@
   async function applySidebarFilter(patch: Partial<MetadataSearchFilter>) {
     activeLeftView = 'library';
     metaFilter = { ...metaFilter, ...patch };
-    // MSC2020 is intentionally excluded from content search -> switch to metadata catalog
-    if ('msc_prefix' in patch && patch.msc_prefix) {
-      searchResults = null;
-      searchStats = null;
-      await refreshDocuments();
-      return;
-    }
-    // Keep content search results open & filter them coherently when clicking Tag/Cluster/Collection/Folder!
+    // Keep content search results open & filter them coherently when clicking MSC2020/Tag/Cluster/Collection/Folder!
     if (searchResults !== null && committedContentQuery.trim()) {
       await Promise.all([handleSearch(committedContentQuery), refreshDocuments()]);
       return;
@@ -470,6 +487,7 @@
 
   async function clearSidebarFilters() {
     statementsOnly = false;
+    statementKindGroup = 'all';
     metaFilter = {
       ...metaFilter,
       msc_prefix: null,
@@ -628,26 +646,25 @@
 
   async function handleToggleStatementsOnly(active: boolean) {
     statementsOnly = active;
+    if (!active) statementKindGroup = 'all';
     if (searchResults !== null && committedContentQuery.trim()) {
       await handleSearch(committedContentQuery);
     }
   }
 
+  async function handleChangeStatementKindGroup(group: string) {
+    statementKindGroup = group;
+    if (statementsOnly && searchResults !== null && committedContentQuery.trim()) {
+      await handleSearch(committedContentQuery);
+    }
+  }
+
   function handleToggleZenMode() {
-    if (!zenMode) {
-      if (tabs.length === 0) {
-        scanStatusText =
-          lang === 'en'
-            ? 'Open a document first to use Zen reading mode.'
-            : 'Apri prima un documento per usare la modalità lettura Zen.';
-        return;
-      }
-      zenRestore = { sidebarCollapsed, inspectorOpen };
-      zenMode = true;
-    } else {
-      zenMode = false;
-      sidebarCollapsed = zenRestore.sidebarCollapsed;
-      inspectorOpen = zenRestore.inspectorOpen;
+    if (!layout.toggleZenMode(viewerTabs.tabs.length > 0)) {
+      scanStatusText =
+        lang === 'en'
+          ? 'Open a document first to use Zen reading mode.'
+          : 'Apri prima un documento per usare la modalità lettura Zen.';
     }
   }
 
@@ -735,7 +752,7 @@
       },
       {
         id: 'zen',
-        label: zenMode
+        label: layout.zenMode
           ? lang === 'en'
             ? 'Exit Zen reading mode'
             : 'Esci da modalità lettura Zen'
@@ -744,6 +761,14 @@
             : 'Attiva modalità lettura Zen',
         hint: '⌘\\',
         run: handleToggleZenMode,
+      },
+      {
+        id: 'toggle-catalog',
+        label: layout.catalogCollapsed
+          ? tr(lang, 'expandCatalogTip')
+          : tr(lang, 'collapseCatalogTip'),
+        hint: '⇧⌘B',
+        run: () => layout.toggleCatalogCollapsed(),
       },
       {
         id: 'rescan',
@@ -782,7 +807,7 @@
         label: lang === 'en' ? 'Copy \\cite{key} of selected document' : 'Copia \\cite{key} del documento selezionato',
         hint: selectedMeta?.title ?? '',
         run: () => {
-          void api.getDocumentCiteKey(docId).then(async (p) => {
+          void api.getDocumentCiteKey(docId, metaFilter.collection_id ?? null).then(async (p) => {
             await navigator.clipboard.writeText(p.cite_command);
             scanStatusText = `Copiato ${p.cite_command}`;
           });
@@ -867,7 +892,7 @@
   }
 
   async function handleCopyCiteCommand(docId: number): Promise<string> {
-    const res = await api.getDocumentCiteKey(docId);
+    const res = await api.getDocumentCiteKey(docId, metaFilter.collection_id ?? null);
     try {
       await navigator.clipboard.writeText(res.cite_command);
       scanStatusText = `Copiato ${res.cite_command}`;
@@ -1059,7 +1084,7 @@
 
   function requestSelectDocument(docId: number, afterSwitch?: () => void) {
     if (
-      inspectorOpen &&
+      layout.inspectorOpen &&
       selectedDocId !== null &&
       selectedDocId !== docId &&
       inspectorRef?.hasUnsavedChanges()
@@ -1490,7 +1515,7 @@
       void api.cancelSingleMetadata();
     }
 
-    if (verified && inspectorOpen && selectedDocId === documentId) {
+    if (verified && layout.inspectorOpen && selectedDocId === documentId) {
       const saved = await inspectorRef?.savePendingIfForDoc(documentId);
       if (saved === false) return;
     }
@@ -1530,7 +1555,7 @@
           documents.find((d) => !d.metadata_verified && d.document_id !== documentId);
       }
       if (nextDoc) {
-        inspectorOpen = true;
+        layout.inspectorOpen = true;
         await loadInspectorMetadata(nextDoc.document_id);
       } else if (activeVerifiedFilter === 'unverified' && documents.length === 0) {
         selectedDocId = null;
@@ -1562,7 +1587,8 @@
     highlightRects: NormalizedRect[] = [],
     matches: ViewerTargetPassage[] = [],
     activeMatchIndex = 0,
-    explicitPageJump = false
+    explicitPageJump = false,
+    documentId?: number
   ) {
     if (settings?.viewer_open_in_separate_window) {
       await api.openDetachedViewerWindow(
@@ -1573,41 +1599,35 @@
       );
       return;
     }
+    viewerTabs.openInPrimary({
+      fileId,
+      documentId,
+      title,
+      format,
+      pageOrd,
+      highlightRects,
+      matches,
+      activeMatchIndex,
+      explicitPageJump,
+    });
+  }
 
-    const existing = tabs.find((t) => t.fileId === fileId);
-    if (existing) {
-      tabs = tabs.map((t) =>
-        t.tabId === existing.tabId
-          ? {
-              ...t,
-              targetPage: pageOrd,
-              explicitPageJump: explicitPageJump || highlightRects.length > 0 || pageOrd > 1,
-              highlightRects,
-              matches: matches.length ? matches : t.matches,
-              activeMatchIndex,
-            }
-          : t
-      );
-      activeTabId = existing.tabId;
+  function handleOpenLibraryDocFromCite(item: CitationLinkItem, inSplit: boolean) {
+    const doc = catalogStats.byDocId.get(item.document_id);
+    const fmt = doc?.format ?? 'pdf';
+    if (inSplit) {
+      viewerTabs.openInSplit({
+        fileId: item.file_id,
+        documentId: item.document_id,
+        title: item.title,
+        format: fmt,
+        pageOrd: 1,
+      });
       return;
     }
-
-    const tabId = `tab-${fileId}`;
-    tabs = [
-      ...tabs,
-      {
-        tabId,
-        fileId,
-        title,
-        format,
-        targetPage: pageOrd,
-        explicitPageJump: explicitPageJump || highlightRects.length > 0 || pageOrd > 1,
-        highlightRects,
-        matches,
-        activeMatchIndex,
-      },
-    ];
-    activeTabId = tabId;
+    requestSelectDocument(item.document_id, () => {
+      void openInViewer(item.file_id, item.title, fmt, 1, [], [], 0, false, item.document_id);
+    });
   }
 
   function handleOpenPassage(doc: ContentSearchDocResult, pass: ContentSearchPassageHit) {
@@ -1667,16 +1687,7 @@
   }
 
   function handleSelectMatchIndex(tabId: string, idx: number) {
-    tabs = tabs.map((t) => {
-      if (t.tabId !== tabId || !t.matches[idx]) return t;
-      const m = t.matches[idx];
-      return {
-        ...t,
-        activeMatchIndex: idx,
-        targetPage: m.page_ord,
-        highlightRects: m.bboxes,
-      };
-    });
+    viewerTabs.selectMatchIndex(tabId, idx);
   }
 
   async function handleCopyPath(fileId: number) {
@@ -1685,7 +1696,7 @@
   }
 
   async function handleCopyBibtex(docId: number): Promise<string> {
-    const bib = await api.getDocumentBibtex(docId);
+    const bib = await api.getDocumentBibtex(docId, metaFilter.collection_id ?? null);
     try {
       await navigator.clipboard.writeText(bib);
       scanStatusText = `BibTeX copiato negli appunti (${docId})`;
@@ -1887,7 +1898,7 @@
       else if (contextTarget) contextTarget = null;
       else if (settingsOpen) settingsOpen = false;
       else if (wizardOpen) wizardOpen = false;
-      else if (zenMode) handleToggleZenMode();
+      else if (layout.zenMode) handleToggleZenMode();
       return;
     }
 
@@ -1903,8 +1914,14 @@
       return;
     }
 
-    if (mod && e.key.toLowerCase() === 's') {
-      if (inspectorOpen && selectedDocId !== null && inspectorRef && !settingsOpen && !wizardOpen) {
+    if (mod && !e.shiftKey && e.key.toLowerCase() === 's') {
+      if (
+        layout.inspectorOpen &&
+        selectedDocId !== null &&
+        inspectorRef &&
+        !settingsOpen &&
+        !wizardOpen
+      ) {
         e.preventDefault();
         void inspectorRef.triggerSave();
       }
@@ -1925,9 +1942,15 @@
       return;
     }
 
-    if (mod && e.key.toLowerCase() === 'b') {
+    if (mod && e.shiftKey && e.key.toLowerCase() === 'b') {
       e.preventDefault();
-      sidebarCollapsed = !sidebarCollapsed;
+      layout.toggleCatalogCollapsed();
+      return;
+    }
+
+    if (mod && !e.shiftKey && e.key.toLowerCase() === 'b') {
+      e.preventDefault();
+      layout.toggleSidebarCollapsed();
       return;
     }
 
@@ -2299,7 +2322,7 @@
     />
   </main>
 {:else}
-  <div class="app-shell">
+  <div class="app-shell" class:is-resizing={layout.resizingPane !== null}>
     <TopBar
       bind:this={topBarRef}
       {lang}
@@ -2319,10 +2342,12 @@
       {mlStatus}
       {mlDownloadProgress}
       {presets}
-      {inspectorOpen}
+      inspectorOpen={layout.inspectorOpen}
       {notesScopeActive}
       hasNotes={totalAnnotationsCount > 0}
       {statementsOnly}
+      {statementKindGroup}
+      catalogCollapsed={layout.catalogCollapsed}
       updateAvailableVersion={updateInfo?.update_available ? updateInfo.latest_version : null}
       onSearch={handleSearch}
       onClearSearch={async () => {
@@ -2342,12 +2367,14 @@
       onWorkCategoryChange={handleWorkCategoryChange}
       onToggleNotesScope={handleToggleNotesScope}
       onToggleStatementsOnly={handleToggleStatementsOnly}
+      onStatementKindGroupChange={handleChangeStatementKindGroup}
+      onToggleCatalog={() => layout.toggleCatalogCollapsed()}
       onOpenClassics={() => (classicsModalOpen = true)}
       onVerifiedFilterChange={handleVerifiedFilterChange}
       onSortByChange={handleSortByChange}
       onToggleSortDir={handleToggleSortDir}
       onToggleLeftView={(view) => (activeLeftView = view)}
-      onToggleInspector={() => (inspectorOpen = !inspectorOpen)}
+      onToggleInspector={() => layout.toggleInspectorOpen()}
       onAddFolder={handleAddFolder}
       onRescan={handleRescan}
       onControlRescan={(act) => api.controlRescan(act)}
@@ -2404,257 +2431,299 @@
     {/if}
 
     <div class="workspace-body">
-      {#if !zenMode}
-      <div class="sidebar-slot" class:collapsed={sidebarCollapsed}>
-        <LeftSidebar
-          {lang}
-          collapsed={sidebarCollapsed}
-          onToggleCollapse={() => (sidebarCollapsed = !sidebarCollapsed)}
-          {mscTree}
-          {clusters}
-          {tags}
-          {roots}
-          {collections}
-          {savedSearches}
-          activeMscPrefix={metaFilter.msc_prefix ?? null}
-          activeClusterId={metaFilter.cluster_id ?? null}
-          activeTag={metaFilter.tag ?? null}
-          activeRootId={metaFilter.root_id ?? null}
-          activeCollectionId={metaFilter.collection_id ?? null}
-          activeReadingStatus={metaFilter.reading_status ?? null}
-          activeStarredOnly={Boolean(metaFilter.starred_only)}
-          activeRecentOnly={Boolean(metaFilter.recent_only)}
-          {knnBusy}
-          {clusteringBusy}
-          onSelectMsc={(code) => applySidebarFilter({ msc_prefix: code })}
-          onSelectCluster={(cid) => applySidebarFilter({ cluster_id: cid })}
-          onSelectTag={(tg) => applySidebarFilter({ tag: tg })}
-          onSelectRoot={(rid) => applySidebarFilter({ root_id: rid })}
-          onSelectCollection={(colId) => applySidebarFilter({ collection_id: colId })}
-          onSelectQuickView={handleSelectQuickView}
-          onCreateCollection={handleCreateCollection}
-          onRenameCollection={handleRenameCollection}
-          onDeleteCollection={handleDeleteCollection}
-          onReorderCollections={handleReorderCollections}
-          onConfigureCollectionBibSync={handleConfigureCollectionBibSync}
-          onSyncCollectionBibNow={handleSyncCollectionBibNow}
-          onSaveCurrentView={handleSaveCurrentView}
-          onApplySavedSearch={handleApplySavedSearch}
-          onDeleteSavedSearch={handleDeleteSavedSearch}
-          onClearAllFilters={clearSidebarFilters}
-          onRunKnnProposals={handleRunKnnProposals}
-          onRunClustering={handleRunClustering}
-          onRenameCluster={handleRenameCluster}
-        />
-      </div>
-      {/if}
-
-      <div class="main-split" class:with-inspector={!zenMode && inspectorOpen} class:zen-mode={zenMode}>
-      {#if !zenMode}
-      <section class="left-pane">
-        {#if notesScopeActive}
-          <NotesSearchResults
+      {#if !layout.zenMode}
+        <div
+          class="sidebar-slot"
+          class:collapsed={layout.sidebarCollapsed}
+          style="width: {layout.sidebarCollapsed ? 28 : layout.sidebarWidth}px;"
+        >
+          <LeftSidebar
             {lang}
-            {query}
-            hits={notesHits}
-            loading={notesLoading}
-            onOpenHit={handleOpenNoteHit}
-            onExitNotesScope={() => handleToggleNotesScope(false)}
-          />
-        {:else if activeLeftView === 'duplicates'}
-          <DuplicatesView
-            groups={duplicateGroups}
-            {scanningDedup}
-            onRunDedup={handleRunDedup}
-            onMerge={handleMergeDuplicates}
-            onResolve={handleResolveDuplicate}
-            onOpenSideBySide={handleOpenSideBySide}
-            onOpenMember={(m) => {
-              requestSelectDocument(m.document_id, () => {
-                openInViewer(m.file_id, m.title, m.format, 1);
-              });
-            }}
-            onRevealFile={(fid) => api.revealFileInFolder(fid)}
-          />
-        {:else if displayedSearchResults !== null}
-          <ContentResults
-            {lang}
-            query={committedContentQuery || query}
-            results={displayedSearchResults}
-            {searchStats}
-            workCategory={activeWorkCategory}
-            {statementsOnly}
-            activeFilterChips={activeContentFilterChips}
-            authorFilter={metaFilter.author ?? ''}
-            yearFromFilter={metaFilter.year_from ?? null}
-            yearToFilter={metaFilter.year_to ?? null}
-            onChangeWorkCategory={handleWorkCategoryChange}
-            onToggleStatementsOnly={handleToggleStatementsOnly}
-            onChangeContentMetaFilters={(patch) => applySidebarFilter(patch)}
-            onClearContentFilters={clearSidebarFilters}
-            llmProvider={settings?.llm_provider ?? 'disabled'}
-            {llmPreview}
-            {llmAnswer}
-            {llmStreamText}
-            {llmLoading}
-            {llmError}
-            onGenerateAnswer={handleGenerateLlmAnswer}
-            onOpenCitation={handleOpenCitation}
-            onOpenDocTopMatch={(doc) => {
-              const first = doc.passages[0];
-              if (first) handleOpenPassage(doc, first);
-            }}
-            onOpenPassage={handleOpenPassage}
-            onContextMenu={(e, doc, pageOrd) => {
-              contextTarget = {
-                x: e.clientX,
-                y: e.clientY,
-                documentId: doc.document_id,
-                fileId: doc.file_id,
-                format: doc.format,
-                isAvailable: doc.is_available,
-                pageOrd,
-              };
-            }}
-          />
-        {:else}
-          <DocumentList
-            {lang}
-            {documents}
-            {selectedDocId}
-            {selectedDocIds}
-            {collections}
-            workCategory={activeWorkCategory}
-            verifiedFilter={activeVerifiedFilter}
-            unverifiedCount={unverifiedDocsCount}
-            sortBy={activeSortBy}
-            sortDir={activeSortDir}
-            onChangeWorkCategory={handleWorkCategoryChange}
-            onChangeVerifiedFilter={handleVerifiedFilterChange}
-            onChangeSortBy={handleSortByChange}
-            onToggleSortDir={handleToggleSortDir}
-            onToggleVerified={(docId, verified) => handleToggleDocVerified(docId, verified, false)}
-            onToggleStarred={handleToggleStarred}
-            onSelectDoc={(doc) => {
-              requestSelectDocument(doc.document_id);
-            }}
-            onChangeSelectedDocIds={(ids) => (selectedDocIds = ids)}
-            onOpenDoc={(doc) => {
-              requestSelectDocument(doc.document_id, () => {
-                openInViewer(doc.file_id, doc.title, doc.format, 1);
-              });
-            }}
-            onConfirmMsc={handleConfirmMsc}
-            onRejectMsc={handleRejectMsc}
-            onBatchAddTag={handleBatchAddTag}
-            onBatchRemoveTag={handleBatchRemoveTag}
-            onBatchSetVerified={handleBatchSetVerified}
-            onBatchAddToCollection={handleBatchAddToCollection}
-            onBatchExportBibtex={handleBatchExportBibtex}
-            onBatchExportCsv={handleBatchExportCsv}
-            onBatchEnqueueOcr={handleBatchEnqueueOcr}
-            onContextMenu={(e, doc) => {
-              contextTarget = {
-                x: e.clientX,
-                y: e.clientY,
-                documentId: doc.document_id,
-                fileId: doc.file_id,
-                format: doc.format,
-                isAvailable: doc.is_available,
-                pageOrd: 1,
-              };
-            }}
-          />
-        {/if}
-      </section>
-      {/if}
-
-      <section class="center-pane">
-        <ViewerTabs
-          {tabs}
-          {activeTabId}
-          {splitTabId}
-          {zenMode}
-          llmProvider={settings?.llm_provider ?? 'disabled'}
-          onSelectTab={(id) => (activeTabId = id)}
-          onCloseTab={(id) => {
-            tabs = tabs.filter((t) => t.tabId !== id);
-            if (activeTabId === id) {
-              activeTabId = tabs[0]?.tabId ?? null;
-            }
-            if (splitTabId === id || tabs.length < 2) {
-              splitTabId = null;
-            }
-            if (tabs.length === 0 && zenMode) {
-              handleToggleZenMode();
-            }
-          }}
-          onSetSplitTab={(id) => (splitTabId = id)}
-          onToggleZen={handleToggleZenMode}
-          onSelectMatchIndex={handleSelectMatchIndex}
-          onOpenExternal={(fid, page) => api.openFileExternal(fid, page, null)}
-          onConsentAccepted={(prov) => {
-            if (settings) {
-              if (prov === 'anthropic') settings = { ...settings, llm_consent_anthropic: true };
-              else if (prov === 'openai') settings = { ...settings, llm_consent_openai: true };
-              else if (prov === 'gemini') settings = { ...settings, llm_consent_gemini: true };
-            }
-          }}
-          onAnnotationsChanged={refreshAnnotationsCount}
-          onStatusMessage={(msg) => (scanStatusText = msg)}
-        />
-      </section>
-
-      {#if !zenMode && inspectorOpen}
-        <section class="inspector-pane">
-          <RightInspector
-            bind:this={inspectorRef}
-            meta={selectedMeta}
-            {selectedFileId}
+            collapsed={layout.sidebarCollapsed}
+            onToggleCollapse={() => layout.toggleSidebarCollapsed()}
+            {mscTree}
             {clusters}
+            {tags}
+            {roots}
             {collections}
-            loading={loadingMeta}
-            fetchingOnline={fetchingMeta}
-            lastFetchMessage={fetchStatusMsg}
-            onSave={handleSaveDocMetadata}
-            onFlushSave={handleFlushDocMetadata}
-            onSaveAndFetch={handleSaveAndFetchDocMetadata}
-            onFetchMetadata={handleFetchDocMetadata}
-            onCancelFetch={handleCancelSingleMetadata}
-            onToggleVerified={handleToggleDocVerified}
-            {hasNextUnverified}
-            onConfirmCandidate={handleConfirmCandidate}
-            onDismissCandidate={handleDismissCandidate}
-            onCopyBibtex={handleCopyBibtex}
-            onCopyCiteCommand={handleCopyCiteCommand}
-            onApplySmartPaste={handleApplySmartPaste}
-            onSetReadingStatus={handleSetReadingStatus}
-            onSetStarred={handleToggleStarred}
-            onAddToCollection={handleAddDocToCollection}
-            onRemoveFromCollection={handleRemoveDocFromCollection}
-            onSelectRelatedDoc={(docId) => requestSelectDocument(docId)}
-            onImportAltFormula={handleImportAltFormula}
-            onRunOcr={handleRunOcrForFile}
-            onConfirmMsc={handleConfirmMsc}
-            onRejectMsc={handleRejectMsc}
-            onSetCluster={handleSetDocCluster}
-            onRemoveCluster={handleRemoveDocCluster}
-            onAddTag={handleAddDocTag}
-            onRemoveTag={handleRemoveDocTag}
-            onOpenInViewer={() => {
-              if (selectedFileId !== null && selectedMeta) {
-                const doc = catalogStats.byFileId.get(selectedFileId);
-                openInViewer(selectedFileId, selectedMeta.title, doc?.format ?? 'pdf', 1);
+            {savedSearches}
+            activeMscPrefix={metaFilter.msc_prefix ?? null}
+            activeClusterId={metaFilter.cluster_id ?? null}
+            activeTag={metaFilter.tag ?? null}
+            activeRootId={metaFilter.root_id ?? null}
+            activeCollectionId={metaFilter.collection_id ?? null}
+            activeReadingStatus={metaFilter.reading_status ?? null}
+            activeStarredOnly={Boolean(metaFilter.starred_only)}
+            activeRecentOnly={Boolean(metaFilter.recent_only)}
+            {knnBusy}
+            {clusteringBusy}
+            onSelectMsc={(code) => applySidebarFilter({ msc_prefix: code })}
+            onSelectCluster={(cid) => applySidebarFilter({ cluster_id: cid })}
+            onSelectTag={(tg) => applySidebarFilter({ tag: tg })}
+            onSelectRoot={(rid) => applySidebarFilter({ root_id: rid })}
+            onSelectCollection={(colId) => applySidebarFilter({ collection_id: colId })}
+            onSelectQuickView={handleSelectQuickView}
+            onCreateCollection={handleCreateCollection}
+            onRenameCollection={handleRenameCollection}
+            onDeleteCollection={handleDeleteCollection}
+            onReorderCollections={handleReorderCollections}
+            onConfigureCollectionBibSync={handleConfigureCollectionBibSync}
+            onSyncCollectionBibNow={handleSyncCollectionBibNow}
+            onSaveCurrentView={handleSaveCurrentView}
+            onApplySavedSearch={handleApplySavedSearch}
+            onDeleteSavedSearch={handleDeleteSavedSearch}
+            onClearAllFilters={clearSidebarFilters}
+            onRunKnnProposals={handleRunKnnProposals}
+            onRunClustering={handleRunClustering}
+            onRenameCluster={handleRenameCluster}
+          />
+        </div>
+        {#if !layout.sidebarCollapsed}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="pane-resizer"
+            class:active={layout.resizingPane === 'sidebar'}
+            onpointerdown={(e) => layout.startResize('sidebar', e)}
+          ></div>
+        {/if}
+      {/if}
+
+      <div class="main-split">
+        {#if !layout.zenMode}
+          {#if layout.catalogCollapsed}
+            <button
+              type="button"
+              class="catalog-collapsed-rail"
+              title={tr(lang, 'expandCatalogTip')}
+              aria-label={tr(lang, 'expandCatalogTip')}
+              onclick={() => layout.toggleCatalogCollapsed()}
+            >
+              <span>»</span>
+              <span class="rail-vert-label">{tr(lang, 'catalogHeader')}</span>
+            </button>
+          {:else}
+            <section class="left-pane" style="width: {layout.catalogWidth}px;">
+              {#if notesScopeActive}
+                <NotesSearchResults
+                  {lang}
+                  {query}
+                  hits={notesHits}
+                  loading={notesLoading}
+                  onOpenHit={handleOpenNoteHit}
+                  onExitNotesScope={() => handleToggleNotesScope(false)}
+                />
+              {:else if activeLeftView === 'duplicates'}
+                <DuplicatesView
+                  {lang}
+                  groups={duplicateGroups}
+                  {scanningDedup}
+                  onRunDedup={handleRunDedup}
+                  onMerge={handleMergeDuplicates}
+                  onResolve={handleResolveDuplicate}
+                  onOpenSideBySide={handleOpenSideBySide}
+                  onOpenMember={(m) => {
+                    requestSelectDocument(m.document_id, () => {
+                      openInViewer(m.file_id, m.title, m.format, 1);
+                    });
+                  }}
+                  onRevealFile={(fid) => api.revealFileInFolder(fid)}
+                />
+              {:else if displayedSearchResults !== null}
+                <ContentResults
+                  {lang}
+                  query={committedContentQuery || query}
+                  results={displayedSearchResults}
+                  {searchStats}
+                  workCategory={activeWorkCategory}
+                  {statementsOnly}
+                  {statementKindGroup}
+                  activeFilterChips={activeContentFilterChips}
+                  authorFilter={metaFilter.author ?? ''}
+                  yearFromFilter={metaFilter.year_from ?? null}
+                  yearToFilter={metaFilter.year_to ?? null}
+                  onChangeWorkCategory={handleWorkCategoryChange}
+                  onToggleStatementsOnly={handleToggleStatementsOnly}
+                  onChangeStatementKindGroup={handleChangeStatementKindGroup}
+                  onChangeContentMetaFilters={(patch) => applySidebarFilter(patch)}
+                  onClearContentFilters={clearSidebarFilters}
+                  llmProvider={settings?.llm_provider ?? 'disabled'}
+                  {llmPreview}
+                  {llmAnswer}
+                  {llmStreamText}
+                  {llmLoading}
+                  {llmError}
+                  onGenerateAnswer={handleGenerateLlmAnswer}
+                  onOpenCitation={handleOpenCitation}
+                  onOpenDocTopMatch={(doc) => {
+                    const first = doc.passages[0];
+                    if (first) handleOpenPassage(doc, first);
+                  }}
+                  onOpenPassage={handleOpenPassage}
+                  onContextMenu={(e, doc, pageOrd) => {
+                    contextTarget = {
+                      x: e.clientX,
+                      y: e.clientY,
+                      documentId: doc.document_id,
+                      fileId: doc.file_id,
+                      format: doc.format,
+                      isAvailable: doc.is_available,
+                      pageOrd,
+                    };
+                  }}
+                />
+              {:else}
+                <DocumentList
+                  {lang}
+                  {documents}
+                  {selectedDocId}
+                  {selectedDocIds}
+                  {collections}
+                  workCategory={activeWorkCategory}
+                  verifiedFilter={activeVerifiedFilter}
+                  unverifiedCount={unverifiedDocsCount}
+                  sortBy={activeSortBy}
+                  sortDir={activeSortDir}
+                  onChangeWorkCategory={handleWorkCategoryChange}
+                  onChangeVerifiedFilter={handleVerifiedFilterChange}
+                  onChangeSortBy={handleSortByChange}
+                  onToggleSortDir={handleToggleSortDir}
+                  onToggleVerified={(docId, verified) =>
+                    handleToggleDocVerified(docId, verified, false)}
+                  onToggleStarred={handleToggleStarred}
+                  onSelectDoc={(doc) => {
+                    requestSelectDocument(doc.document_id);
+                  }}
+                  onChangeSelectedDocIds={(ids) => (selectedDocIds = ids)}
+                  onOpenDoc={(doc) => {
+                    requestSelectDocument(doc.document_id, () => {
+                      openInViewer(doc.file_id, doc.title, doc.format, 1);
+                    });
+                  }}
+                  onConfirmMsc={handleConfirmMsc}
+                  onRejectMsc={handleRejectMsc}
+                  onBatchAddTag={handleBatchAddTag}
+                  onBatchRemoveTag={handleBatchRemoveTag}
+                  onBatchSetVerified={handleBatchSetVerified}
+                  onBatchAddToCollection={handleBatchAddToCollection}
+                  onBatchExportBibtex={handleBatchExportBibtex}
+                  onBatchExportCsv={handleBatchExportCsv}
+                  onBatchEnqueueOcr={handleBatchEnqueueOcr}
+                  onContextMenu={(e, doc) => {
+                    contextTarget = {
+                      x: e.clientX,
+                      y: e.clientY,
+                      documentId: doc.document_id,
+                      fileId: doc.file_id,
+                      format: doc.format,
+                      isAvailable: doc.is_available,
+                      pageOrd: 1,
+                    };
+                  }}
+                />
+              {/if}
+            </section>
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+              class="pane-resizer"
+              class:active={layout.resizingPane === 'catalog'}
+              onpointerdown={(e) => layout.startResize('catalog', e)}
+            ></div>
+          {/if}
+        {/if}
+
+        <section class="center-pane">
+          <ViewerTabs
+            {lang}
+            tabs={viewerTabs.tabs}
+            activeTabId={viewerTabs.activeTabId}
+            splitTabId={viewerTabs.splitTabId}
+            focusedPane={viewerTabs.focusedPane}
+            zenMode={layout.zenMode}
+            llmProvider={settings?.llm_provider ?? 'disabled'}
+            onSelectTab={(id) => viewerTabs.selectTab(id)}
+            onCloseTab={(id) => {
+              viewerTabs.closeTab(id);
+              if (viewerTabs.tabs.length === 0 && layout.zenMode) {
+                handleToggleZenMode();
               }
             }}
-            onClose={() => (inspectorOpen = false)}
+            onSetSplitTab={(id) => viewerTabs.setSplitTab(id)}
+            onDuplicateTabToSplit={(id) => viewerTabs.duplicateTabToSplit(id)}
+            onFocusPane={(pane) => (viewerTabs.focusedPane = pane)}
+            onToggleZen={handleToggleZenMode}
+            onSelectMatchIndex={handleSelectMatchIndex}
+            onOpenExternal={(fid, page) => api.openFileExternal(fid, page, null)}
+            onOpenLibraryDoc={handleOpenLibraryDocFromCite}
+            onConsentAccepted={(prov) => {
+              if (settings) {
+                if (prov === 'anthropic') settings = { ...settings, llm_consent_anthropic: true };
+                else if (prov === 'openai') settings = { ...settings, llm_consent_openai: true };
+                else if (prov === 'gemini') settings = { ...settings, llm_consent_gemini: true };
+              }
+            }}
+            onAnnotationsChanged={refreshAnnotationsCount}
+            onStatusMessage={(msg) => (scanStatusText = msg)}
           />
         </section>
-      {/if}
-    </div>
+
+        {#if !layout.zenMode && layout.inspectorOpen}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="pane-resizer"
+            class:active={layout.resizingPane === 'inspector'}
+            onpointerdown={(e) => layout.startResize('inspector', e)}
+          ></div>
+          <section class="inspector-pane" style="width: {layout.inspectorWidth}px;">
+            <RightInspector
+              bind:this={inspectorRef}
+              {lang}
+              meta={selectedMeta}
+              {selectedFileId}
+              {clusters}
+              {collections}
+              loading={loadingMeta}
+              fetchingOnline={fetchingMeta}
+              lastFetchMessage={fetchStatusMsg}
+              onSave={handleSaveDocMetadata}
+              onFlushSave={handleFlushDocMetadata}
+              onSaveAndFetch={handleSaveAndFetchDocMetadata}
+              onFetchMetadata={handleFetchDocMetadata}
+              onCancelFetch={handleCancelSingleMetadata}
+              onToggleVerified={handleToggleDocVerified}
+              {hasNextUnverified}
+              onConfirmCandidate={handleConfirmCandidate}
+              onDismissCandidate={handleDismissCandidate}
+              onCopyBibtex={handleCopyBibtex}
+              onCopyCiteCommand={handleCopyCiteCommand}
+              onApplySmartPaste={handleApplySmartPaste}
+              onSetReadingStatus={handleSetReadingStatus}
+              onSetStarred={handleToggleStarred}
+              onAddToCollection={handleAddDocToCollection}
+              onRemoveFromCollection={handleRemoveDocFromCollection}
+              onSelectRelatedDoc={(docId) => requestSelectDocument(docId)}
+              onImportAltFormula={handleImportAltFormula}
+              onRunOcr={handleRunOcrForFile}
+              onConfirmMsc={handleConfirmMsc}
+              onRejectMsc={handleRejectMsc}
+              onSetCluster={handleSetDocCluster}
+              onRemoveCluster={handleRemoveDocCluster}
+              onAddTag={handleAddDocTag}
+              onRemoveTag={handleRemoveDocTag}
+              onOpenInViewer={() => {
+                if (selectedFileId !== null && selectedMeta) {
+                  const doc = catalogStats.byFileId.get(selectedFileId);
+                  openInViewer(selectedFileId, selectedMeta.title, doc?.format ?? 'pdf', 1);
+                }
+              }}
+              onClose={() => (layout.inspectorOpen = false)}
+            />
+          </section>
+        {/if}
+      </div>
     </div>
 
     <ContextMenu
+      {lang}
       target={contextTarget}
       {presets}
       {collections}
@@ -2665,7 +2734,7 @@
       }}
       onOpenExternal={(fid, page, tpl) => api.openFileExternal(fid, page, tpl)}
       onInspectMetadata={(docId) => {
-        inspectorOpen = true;
+        layout.inspectorOpen = true;
         requestSelectDocument(docId);
       }}
       onCopyBibtex={(docId) => handleCopyBibtex(docId)}
@@ -2702,7 +2771,7 @@
       open={classicsModalOpen}
       {lang}
       onSelectLibraryDoc={(docId) => {
-        inspectorOpen = true;
+        layout.inspectorOpen = true;
         requestSelectDocument(docId);
       }}
       onStatusMessage={(msg) => (scanStatusText = msg)}
@@ -2941,43 +3010,83 @@
     height: 100vh;
     overflow: hidden;
   }
+  .app-shell.is-resizing {
+    user-select: none;
+    cursor: col-resize;
+  }
   .workspace-body {
     flex: 1;
     display: flex;
     overflow: hidden;
   }
   .sidebar-slot {
-    width: 245px;
     flex-shrink: 0;
     height: 100%;
     overflow: hidden;
   }
   .sidebar-slot.collapsed {
-    width: 28px;
+    width: 28px !important;
   }
   .main-split {
     flex: 1;
     min-width: 0;
-    display: grid;
-    grid-template-columns: minmax(300px, 34%) 1fr;
+    display: flex;
     overflow: hidden;
   }
-  .main-split.with-inspector {
-    grid-template-columns: minmax(290px, 30%) 1fr minmax(300px, 340px);
-  }
-  .main-split.zen-mode {
-    grid-template-columns: 1fr;
-  }
   .left-pane {
-    border-right: 1px solid var(--border);
+    flex-shrink: 0;
     background: var(--bg-panel);
     overflow: hidden;
   }
   .center-pane {
+    flex: 1;
+    min-width: 240px;
     overflow: hidden;
   }
   .inspector-pane {
+    flex-shrink: 0;
     overflow: hidden;
+  }
+  .pane-resizer {
+    width: 5px;
+    flex-shrink: 0;
+    cursor: col-resize;
+    background: var(--border);
+    position: relative;
+    transition: background 0.12s;
+    z-index: 6;
+  }
+  .pane-resizer:hover,
+  .pane-resizer.active {
+    background: var(--accent);
+  }
+  .catalog-collapsed-rail {
+    width: 26px;
+    flex-shrink: 0;
+    border: none;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--bg-panel);
+    color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .catalog-collapsed-rail:hover {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .rail-vert-label {
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
   .consent-backdrop {
     position: fixed;

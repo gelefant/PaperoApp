@@ -14,12 +14,14 @@ use std::time::Instant;
 
 pub const DEFAULT_RRF_K: f32 = 60.0;
 
-/// Filters propagated to both hybrid (BM25 + HNSW vector) and pure BM25 content search.
-/// Intentionally omits MSC2020 filtering per Papero design.
+/// Filters propagated to both hybrid (BM25 + HNSW vector) and pure BM25 content search,
+/// including MSC2020 prefix and optional mathematical statement subtype filtering.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContentSearchFilter {
     #[serde(default)]
     pub root_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub msc_prefix: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
     #[serde(default)]
@@ -40,6 +42,10 @@ pub struct ContentSearchFilter {
     pub starred_only: Option<bool>,
     #[serde(default)]
     pub statements_only: bool,
+    /// Optional canonical statement kinds to match when filtering statements
+    /// (e.g. `["theorem", "lemma", "proposition", "corollary"]`, `["definition"]`, `["remark"]`, `["example"]`).
+    #[serde(default)]
+    pub statement_kinds: Option<Vec<String>>,
 }
 
 impl ContentSearchFilter {
@@ -56,8 +62,35 @@ impl ContentSearchFilter {
         }
     }
 
+    pub fn has_statement_filter(&self) -> bool {
+        self.statements_only
+            || self
+                .statement_kinds
+                .as_ref()
+                .is_some_and(|kinds| kinds.iter().any(|k| !k.trim().is_empty()))
+    }
+
+    pub fn matches_statement_kind(&self, kind: Option<&str>) -> bool {
+        if let Some(kinds) = self
+            .statement_kinds
+            .as_ref()
+            .filter(|ks| ks.iter().any(|k| !k.trim().is_empty()))
+        {
+            return kind.is_some_and(|actual| {
+                kinds
+                    .iter()
+                    .any(|want| want.trim().eq_ignore_ascii_case(actual))
+            });
+        }
+        if self.statements_only {
+            return kind.is_some();
+        }
+        true
+    }
+
     pub fn has_doc_level_filters(&self) -> bool {
-        self.tag.as_deref().is_some_and(|s| !s.trim().is_empty())
+        self.msc_prefix.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || self.tag.as_deref().is_some_and(|s| !s.trim().is_empty())
             || self.cluster_id.is_some()
             || self.collection_id.is_some()
             || self.author.as_deref().is_some_and(|s| !s.trim().is_empty())
@@ -256,12 +289,12 @@ where
 
     let bm25_fetch_limit = if allowed_doc_ids.is_some() && bm25_pushdown_docs.is_none() {
         (top_n * 8).max(400)
-    } else if effective_filter.statements_only {
+    } else if effective_filter.has_statement_filter() {
         (top_n * 5).clamp(150, 400)
     } else {
         top_n
     };
-    let vector_fetch_limit = if effective_filter.statements_only {
+    let vector_fetch_limit = if effective_filter.has_statement_filter() {
         (top_n * 4).clamp(120, 320)
     } else {
         top_n
@@ -329,13 +362,18 @@ where
     let pids: Vec<u64> = fused.iter().map(|c| c.passage_id).collect();
     let hydrated = hydrate_passages_by_ids(conn, &pids)?;
 
-    if effective_filter.statements_only {
+    if effective_filter.has_statement_filter() {
         fused.retain(|c| {
-            hydrated
-                .get(&c.passage_id)
-                .is_some_and(|row| {
-                    crate::extract::statements::detect_math_statement(&row.text_content).is_some()
-                })
+            hydrated.get(&c.passage_id).is_some_and(|row| {
+                let effective_kind = row
+                    .statement_kind
+                    .as_deref()
+                    .or_else(|| {
+                        crate::extract::statements::detect_math_statement(&row.text_content)
+                            .map(|s| s.kind)
+                    });
+                effective_filter.matches_statement_kind(effective_kind)
+            })
         });
         if fused.is_empty() {
             return Ok(HybridSearchResponse {
@@ -572,6 +610,8 @@ pub(crate) struct HydratedPassage {
     pub text_content: String,
     pub bboxes_blob: Vec<u8>,
     pub is_alt_formula: bool,
+    pub statement_kind: Option<String>,
+    pub statement_label: Option<String>,
     pub work_type: String,
     pub title: String,
     pub format: String,
@@ -579,8 +619,8 @@ pub(crate) struct HydratedPassage {
     pub is_available: bool,
 }
 
-/// Pure BM25 content search honoring the full [`ContentSearchFilter`] (Tag, Cluster, Collection,
-/// Author, Year range, Folder roots, Paper/Books — excluding MSC2020).
+/// Pure BM25 content search honoring the full [`ContentSearchFilter`] (MSC2020, Tag, Cluster,
+/// Collection, Author, Year range, Folder roots, Paper/Books, and Statement subtypes).
 pub fn search_bm25_filtered(
     conn: &Connection,
     bm25: &Bm25Index,
@@ -610,9 +650,10 @@ pub fn search_bm25_filtered(
             None
         }
     });
+    let has_stmt_filter = filter.has_statement_filter();
     let fetch_limit = if allowed_docs.is_some() && pushdown.is_none() {
         (limit * 8).max(400)
-    } else if filter.statements_only {
+    } else if has_stmt_filter {
         (limit * 5).clamp(150, 400)
     } else {
         limit
@@ -621,15 +662,16 @@ pub fn search_bm25_filtered(
     if let Some(ref set) = allowed_docs {
         if pushdown.is_none() {
             hits.retain(|h| set.contains(&(h.document_id as i64)));
-            if !filter.statements_only {
+            if !has_stmt_filter {
                 hits.truncate(limit);
             }
         }
     }
     let mut docs = hydrate_bm25_results(conn, &hits)?;
-    if filter.statements_only {
+    if has_stmt_filter {
         for doc in &mut docs {
-            doc.passages.retain(|p| p.statement_label.is_some());
+            doc.passages
+                .retain(|p| filter.matches_statement_kind(p.statement_kind.as_deref()));
             doc.max_score = doc.passages.first().map(|p| p.score).unwrap_or(0.0);
         }
         docs.retain(|d| !d.passages.is_empty());
@@ -677,6 +719,12 @@ pub fn resolve_content_filter_doc_ids(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let p_msc = filter
+        .msc_prefix
+        .as_deref()
+        .map(str::trim)
+        .map(|s| s.strip_suffix("-XX").or_else(|| s.strip_suffix("-xx")).unwrap_or(s).trim())
+        .filter(|s| !s.is_empty());
     let author_q = filter
         .author
         .as_deref()
@@ -705,6 +753,13 @@ pub fn resolve_content_filter_doc_ids(
                 SELECT 1 FROM collection_documents cd
                 WHERE cd.document_id = d.id AND cd.collection_id = ?5
            ))
+           AND (?6 IS NULL OR (
+                UPPER(COALESCE(d.msc_primary, '')) LIKE UPPER(?6) || '%'
+                OR EXISTS (
+                    SELECT 1 FROM document_msc_secondary dms
+                    WHERE dms.document_id = d.id AND UPPER(dms.msc_code) LIKE UPPER(?6) || '%'
+                )
+           ))
            {cat_clause}
            {reading_clause}
            {starred_clause}"
@@ -716,6 +771,7 @@ pub fn resolve_content_filter_doc_ids(
         p_tag,
         filter.cluster_id,
         filter.collection_id,
+        p_msc,
     ])?;
 
     let mut allowed = HashSet::new();
@@ -857,7 +913,8 @@ fn hydrate_passages_by_ids(
             .join(",");
         let sql = format!(
             "SELECT p.id, p.document_id, p.file_id, p.page_ord, p.printed_label,
-                    p.text_content, p.bboxes_blob, p.is_alt_formula, d.work_type, d.title, f.format, f.rel_path, f.is_available
+                    p.text_content, p.bboxes_blob, p.is_alt_formula, p.statement_kind, p.statement_label,
+                    d.work_type, d.title, f.format, f.rel_path, f.is_available
              FROM passages p
              JOIN documents d ON d.id = p.document_id
              JOIN files f ON f.id = p.file_id
@@ -877,11 +934,13 @@ fn hydrate_passages_by_ids(
                 text_content: r.get(5)?,
                 bboxes_blob: r.get(6)?,
                 is_alt_formula: r.get::<_, i64>(7)? != 0,
-                work_type: r.get(8)?,
-                title: r.get(9)?,
-                format: r.get(10)?,
-                rel_path: r.get(11)?,
-                is_available: r.get::<_, i64>(12)? != 0,
+                statement_kind: r.get(8)?,
+                statement_label: r.get(9)?,
+                work_type: r.get(10)?,
+                title: r.get(11)?,
+                format: r.get(12)?,
+                rel_path: r.get(13)?,
+                is_available: r.get::<_, i64>(14)? != 0,
             })
         })?;
         for row in rows {
@@ -915,7 +974,16 @@ pub(crate) fn aggregate_and_sort_documents(
                 max_score: 0.0,
                 passages: Vec::new(),
             });
-        let detected_stmt = crate::extract::statements::detect_math_statement(&row.text_content);
+        let (statement_kind, statement_label) =
+            if row.statement_kind.is_some() || row.statement_label.is_some() {
+                (row.statement_kind.clone(), row.statement_label.clone())
+            } else if let Some(det) =
+                crate::extract::statements::detect_math_statement(&row.text_content)
+            {
+                (Some(det.kind.to_string()), Some(det.label))
+            } else {
+                (None, None)
+            };
         entry.passages.push(ContentSearchPassageHit {
             passage_id: row.passage_id,
             file_id: row.file_id,
@@ -925,8 +993,8 @@ pub(crate) fn aggregate_and_sort_documents(
             text_content: row.text_content.clone(),
             bboxes: unpack_bboxes(&row.bboxes_blob),
             is_alt_formula: row.is_alt_formula,
-            statement_label: detected_stmt.as_ref().map(|s| s.label.clone()),
-            statement_kind: detected_stmt.map(|s| s.kind.to_string()),
+            statement_label,
+            statement_kind,
         });
     }
 
@@ -1613,5 +1681,60 @@ mod tests {
             stmt_hits[0].passages[0].statement_label.as_deref(),
             Some("Theorem 3.2")
         );
+        assert_eq!(
+            stmt_hits[0].passages[0].statement_kind.as_deref(),
+            Some("theorem")
+        );
+
+        // Subtype filter: filtering for `definition` only should exclude `theorem`
+        let def_hits = search_bm25_filtered(
+            &r,
+            &bm25,
+            "compact resolvent",
+            &ContentSearchFilter {
+                statements_only: true,
+                statement_kinds: Some(vec!["definition".into()]),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert!(def_hits.is_empty());
+
+        // MSC2020 prefix filter in content search
+        {
+            let w = db.writer();
+            w.execute(
+                "UPDATE documents SET msc_primary = '47A10' WHERE title = 'Spectral Analysis'",
+                [],
+            )
+            .unwrap();
+        }
+        let r2 = db.reader();
+        let msc_match = search_bm25_filtered(
+            &r2,
+            &bm25,
+            "compact resolvent",
+            &ContentSearchFilter {
+                msc_prefix: Some("47".into()),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(msc_match.len(), 1);
+
+        let msc_miss = search_bm25_filtered(
+            &r2,
+            &bm25,
+            "compact resolvent",
+            &ContentSearchFilter {
+                msc_prefix: Some("35".into()),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert!(msc_miss.is_empty());
     }
 }

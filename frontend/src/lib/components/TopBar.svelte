@@ -38,6 +38,8 @@
     notesScopeActive?: boolean;
     hasNotes?: boolean;
     statementsOnly?: boolean;
+    statementKindGroup?: string;
+    catalogCollapsed?: boolean;
     updateAvailableVersion?: string | null;
     onSearch: (q: string) => void;
     onClearSearch: () => void;
@@ -46,6 +48,8 @@
     onWorkCategoryChange?: (cat: WorkCategory) => void;
     onToggleNotesScope?: (active: boolean) => void;
     onToggleStatementsOnly?: (active: boolean) => void;
+    onStatementKindGroupChange?: (group: string) => void;
+    onToggleCatalog?: () => void;
     onOpenClassics?: () => void;
     onVerifiedFilterChange?: (vf: VerifiedFilter) => void;
     onSortByChange?: (sortBy: SortField) => void;
@@ -90,6 +94,8 @@
     notesScopeActive = false,
     hasNotes = false,
     statementsOnly = false,
+    statementKindGroup = 'all',
+    catalogCollapsed = false,
     updateAvailableVersion = null,
     onSearch,
     onClearSearch,
@@ -98,6 +104,8 @@
     onWorkCategoryChange,
     onToggleNotesScope,
     onToggleStatementsOnly,
+    onStatementKindGroupChange,
+    onToggleCatalog,
     onOpenClassics,
     onVerifiedFilterChange,
     onSortByChange,
@@ -319,12 +327,28 @@
         class:active={statementsOnly}
         aria-pressed={statementsOnly}
         title={lang === 'en'
-          ? 'Statements only: Theorems, Lemmas, Propositions, Corollaries, Definitions (works immediately with BM25 or hybrid search)'
-          : 'Solo enunciati: Teoremi, Lemmi, Proposizioni, Corollari, Definizioni (funziona subito anche solo con BM25)'}
+          ? 'Statements only: Theorems, Lemmas, Propositions, Definitions, Remarks, Examples'
+          : 'Solo enunciati: Teoremi, Lemmi, Proposizioni, Definizioni, Osservazioni, Esempi'}
         onclick={() => onToggleStatementsOnly(!statementsOnly)}
       >
         § {tr(lang, 'statementsShortLabel')}
       </button>
+      {#if statementsOnly && onStatementKindGroupChange}
+        <select
+          class="stmt-kind-select"
+          aria-label={tr(lang, 'statementsOnlyLabel')}
+          value={statementKindGroup}
+          onchange={(e) =>
+            onStatementKindGroupChange((e.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value="all">{tr(lang, 'stmtAll')}</option>
+          <option value="theorem">{tr(lang, 'stmtTheoremGroup')}</option>
+          <option value="definition">{tr(lang, 'stmtDefinitions')}</option>
+          <option value="remark">{tr(lang, 'stmtRemarks')}</option>
+          <option value="example">{tr(lang, 'stmtExamples')}</option>
+          <option value="conjecture">{tr(lang, 'stmtConjectures')}</option>
+        </select>
+      {/if}
     {/if}
     {#if query.trim()}
       <button
@@ -595,6 +619,25 @@
         {/if}
       </button>
 
+      {#if onToggleCatalog}
+        <button
+          type="button"
+          class="icon-btn tip-end"
+          class:active-toggle={!catalogCollapsed}
+          data-tip={catalogCollapsed
+            ? tr(lang, 'expandCatalogTip')
+            : tr(lang, 'collapseCatalogTip')}
+          aria-label={tr(lang, 'catalogHeader')}
+          onclick={onToggleCatalog}
+        >
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <path d="M9 4v16" />
+            <path d="M5.5 8h2M5.5 12h2M5.5 16h2" />
+          </svg>
+        </button>
+      {/if}
+
       <button
         type="button"
         class="icon-btn tip-end"
@@ -656,7 +699,7 @@
 {#if searchMode === 'metadata'}
   <div class="meta-filter-bar">
     <label>
-      Tipo:
+      {lang === 'en' ? 'Type:' : 'Tipo:'}
       <select
         value={effectiveWorkCat}
         onchange={(e) => {
@@ -671,7 +714,7 @@
       </select>
     </label>
     <label>
-      Controllo:
+      {lang === 'en' ? 'Review:' : 'Controllo:'}
       <select
         value={effectiveVerifiedFilter}
         onchange={(e) => {
@@ -686,13 +729,13 @@
       </select>
     </label>
     <label>
-      Formato:
+      {lang === 'en' ? 'Format:' : 'Formato:'}
       <select
         value={metaFilter.format ?? ''}
         onchange={(e) =>
           onMetaFilterChange({ ...metaFilter, format: (e.currentTarget as HTMLSelectElement).value || null })}
       >
-        <option value="">Tutti</option>
+        <option value="">{tr(lang, 'filterAll')}</option>
         <option value="pdf">PDF</option>
         <option value="djvu">DjVu</option>
       </select>
@@ -701,14 +744,14 @@
       MSC:
       <input
         type="text"
-        placeholder="es. 14"
+        placeholder={lang === 'en' ? 'e.g. 14' : 'es. 14'}
         value={metaFilter.msc_prefix ?? ''}
         oninput={(e) =>
           scheduleMetaFilterChange({ ...metaFilter, msc_prefix: (e.currentTarget as HTMLInputElement).value || null })}
       />
     </label>
     <label>
-      Da anno:
+      {lang === 'en' ? 'From:' : 'Da anno:'}
       <input
         type="number"
         placeholder="1950"
@@ -720,7 +763,7 @@
       />
     </label>
     <label>
-      A anno:
+      {lang === 'en' ? 'To:' : 'A anno:'}
       <input
         type="number"
         placeholder="2026"
@@ -733,7 +776,7 @@
     </label>
     <div class="meta-sort-group">
       <label>
-        Ordina:
+        {lang === 'en' ? 'Sort:' : 'Ordina:'}
         <select
           value={effectiveSortBy}
           onchange={(e) => {
@@ -1302,6 +1345,17 @@
     background: var(--accent-soft);
     color: var(--accent);
     border-color: var(--accent);
+  }
+  .stmt-kind-select {
+    height: 26px;
+    font-size: 11px;
+    padding: 0 6px;
+    border-radius: 6px;
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+    flex-shrink: 0;
   }
   .search-clear-btn {
     display: inline-flex;

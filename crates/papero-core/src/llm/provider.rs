@@ -153,6 +153,14 @@ pub enum DocLlmScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnipLatexResult {
+    pub provider: LlmProvider,
+    pub model: String,
+    pub latex_markdown: String,
+    pub usage: LlmUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum LlmStreamEvent {
     Delta { text: String },

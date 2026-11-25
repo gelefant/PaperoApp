@@ -3,6 +3,7 @@
   import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from 'pdfjs-dist';
   import { save as saveFileDialog } from '@tauri-apps/plugin-dialog';
   import { api } from '../api';
+  import { tr, type Lang } from '../i18n';
   import { createPdfRangeTransport, loadPdfJs, type PdfJsModule } from '../pdfjsLoader';
   import {
     djvuSpansToPositionedItems,
@@ -12,6 +13,7 @@
     type PositionedTextItem,
   } from '../inDocSearch';
   import type {
+    CitationLinkItem,
     DocLlmScope,
     ExtractedSpan,
     FileAnnotation,
@@ -27,9 +29,16 @@
     computePassageCenterFraction,
     resolveGoToPage,
   } from '../viewerUtils';
+  import {
+    cropSourceElementToPngDataUrl,
+    extractBibEntryNearViewportY,
+    normalizeDragRect,
+    type PositionedLineToken,
+  } from '../viewerSnipUtils';
   import { attachSelectableTextLayer } from '../textLayerSelection';
   import ViewerAnnotationsPane from './ViewerAnnotationsPane.svelte';
   import ViewerAskPanel from './ViewerAskPanel.svelte';
+  import ViewerSnipPopover from './ViewerSnipPopover.svelte';
 
   const MAX_CANVAS_PIXELS = 16_777_216; // 16 MP cap prevents 80+ MB Retina BackingStore spikes
   const THUMB_ROW_HEIGHT = 176;
@@ -313,30 +322,36 @@
   }
 
   interface Props {
+    lang?: Lang;
     fileId: number;
     targetPage?: number;
     explicitPageJump?: boolean;
     highlightRects?: NormalizedRect[];
     matches?: ViewerTargetPassage[];
     activeMatchIndex?: number;
+    isKeyboardActive?: boolean;
     llmProvider?: LlmProvider;
     onSelectMatchIndex?: (idx: number) => void;
     onOpenExternal?: (fileId: number, pageOrd: number) => void;
+    onOpenLibraryDoc?: (doc: CitationLinkItem, inSplit: boolean) => void;
     onConsentAccepted?: (provider: LlmProvider) => void;
     onAnnotationsChanged?: () => void;
     onStatusMessage?: (msg: string) => void;
   }
 
   let {
+    lang = 'it',
     fileId,
     targetPage = 1,
     explicitPageJump = false,
     highlightRects = [],
     matches = [],
     activeMatchIndex = 0,
+    isKeyboardActive = true,
     llmProvider = 'disabled',
     onSelectMatchIndex,
     onOpenExternal,
+    onOpenLibraryDoc,
     onConsentAccepted,
     onAnnotationsChanged,
     onStatusMessage,
@@ -384,12 +399,32 @@
     noteColor: 'yellow' | 'green' | 'blue' | 'pink';
   } | null>(null);
 
-  // Hover micro-preview for internal PDF links (\ref, \cite, equations, TOC)
+  // Area Snip tool (⇧⌘S): visual formula/diagram/region capture + optional Vision LaTeX
+  let snipMode = $state(false);
+  let snipDrag = $state<{
+    pageOrd: number;
+    startX: number;
+    startY: number;
+    curX: number;
+    curY: number;
+    slotW: number;
+    slotH: number;
+  } | null>(null);
+  let snipPopover = $state<{
+    pageOrd: number;
+    rect: NormalizedRect;
+    imageDataUrl: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Hover micro-preview for internal PDF links (\ref, \cite, equations, TOC) + inter-document library bridge
   let linkPreview = $state<{
     pageOrd: number;
     printedLabel: string | null;
     dest: unknown;
     imageUrl: string | null;
+    matchedLibraryDoc: CitationLinkItem | null;
     loading: boolean;
     x: number;
     y: number;
@@ -399,7 +434,10 @@
   let linkHoverShowTimer: ReturnType<typeof setTimeout> | null = null;
   let linkHoverHideTimer: ReturnType<typeof setTimeout> | null = null;
   let linkPreviewSeq = 0;
-  const linkPreviewCache = new Map<string, { url: string; w: number; h: number }>();
+  const linkPreviewCache = new Map<
+    string,
+    { url: string; w: number; h: number; matchedDoc: CitationLinkItem | null }
+  >();
 
   // Ask this document slide-over (visible ONLY when llmProvider !== 'disabled')
   let askOpen = $state(false);
@@ -706,6 +744,7 @@
 
   function handleViewportScroll() {
     selectionPopover = null;
+    snipPopover = null;
     clearLinkPreviewTimers();
     linkPreview = null;
     if (scrollRafId !== null) return;
@@ -918,6 +957,7 @@
         printedLabel,
         dest,
         imageUrl: cached.url,
+        matchedLibraryDoc: cached.matchedDoc,
         loading: false,
         x,
         y,
@@ -932,6 +972,7 @@
       printedLabel,
       dest,
       imageUrl: null,
+      matchedLibraryDoc: null,
       loading: true,
       x,
       y,
@@ -947,10 +988,11 @@
       const targetScale = Math.max(0.7, Math.min(1.6, previewW / Math.max(1, baseVp.width)));
       const vp = page.getViewport({ scale: targetScale, rotation: effRot });
 
+      let destVy: number | null = null;
       let cropTopCss = 0;
       if (resolved.pdfTopY !== null) {
         const [, vy] = vp.convertToViewportPoint(0, resolved.pdfTopY);
-        // Position destination slightly below top edge so theorem/equation header has breathing room
+        destVy = vy;
         cropTopCss = Math.max(0, Math.min(Math.max(0, vp.height - previewH), vy - 24));
       }
       const cssW = Math.min(previewW, Math.round(vp.width));
@@ -965,12 +1007,33 @@
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, off.width, off.height);
 
-      const task = page.render({
+      const renderPromise = page.render({
         canvasContext: ctx,
         viewport: vp,
         transform: [dpr, 0, 0, dpr, 0, -cropTopCss * dpr],
-      });
-      await task.promise;
+      }).promise;
+
+      const citeMatchPromise = (async (): Promise<CitationLinkItem | null> => {
+        if (!onOpenLibraryDoc) return null;
+        try {
+          const tc = await page.getTextContent();
+          const tokens: PositionedLineToken[] = [];
+          for (const raw of tc.items) {
+            if (!raw || typeof (raw as { str?: unknown }).str !== 'string') continue;
+            const it = raw as { str: string; transform?: number[] };
+            if (!it.str.trim() || !Array.isArray(it.transform) || it.transform.length < 6) continue;
+            const [vx, vy] = vp.convertToViewportPoint(it.transform[4], it.transform[5]);
+            tokens.push({ str: it.str, x: vx, y: vy });
+          }
+          const snippet = extractBibEntryNearViewportY(tokens, destVy, vp.height);
+          if (snippet.length < 12) return null;
+          return await api.matchCitationInLibrary(snippet, info?.document_id ?? null);
+        } catch {
+          return null;
+        }
+      })();
+
+      const [, matchedDoc] = await Promise.all([renderPromise, citeMatchPromise]);
       if (destroyed || seq !== linkPreviewSeq || pdfDoc !== doc) return;
 
       const url = off.toDataURL('image/png');
@@ -980,12 +1043,13 @@
         const oldest = linkPreviewCache.keys().next().value;
         if (oldest) linkPreviewCache.delete(oldest);
       }
-      linkPreviewCache.set(cacheKey, { url, w: cssW, h: cssH });
+      linkPreviewCache.set(cacheKey, { url, w: cssW, h: cssH, matchedDoc });
       linkPreview = {
         pageOrd: resolved.pageOrd,
         printedLabel,
         dest,
         imageUrl: url,
+        matchedLibraryDoc: matchedDoc,
         loading: false,
         x,
         y,
@@ -1028,7 +1092,7 @@
   }
 
   function handleViewportMouseUp() {
-    if (!scrollEl || !info) return;
+    if (snipMode || !scrollEl || !info) return;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
       selectionPopover = null;
@@ -1121,6 +1185,112 @@
     selectionPopover = null;
   }
 
+  function handleSnipPointerDown(pageOrd: number, e: PointerEvent) {
+    if (!snipMode || e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const overlay = e.currentTarget as HTMLElement;
+    const rect = overlay.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    try {
+      overlay.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore synthetic pointer
+    }
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    snipDrag = {
+      pageOrd,
+      startX: sx,
+      startY: sy,
+      curX: sx,
+      curY: sy,
+      slotW: rect.width,
+      slotH: rect.height,
+    };
+  }
+
+  function handleSnipPointerMove(pageOrd: number, e: PointerEvent) {
+    if (!snipDrag || snipDrag.pageOrd !== pageOrd) return;
+    const overlay = e.currentTarget as HTMLElement;
+    const rect = overlay.getBoundingClientRect();
+    snipDrag = {
+      ...snipDrag,
+      curX: Math.max(0, Math.min(rect.width, e.clientX - rect.left)),
+      curY: Math.max(0, Math.min(rect.height, e.clientY - rect.top)),
+    };
+  }
+
+  function handleSnipPointerUp(pageOrd: number, e: PointerEvent) {
+    if (!snipDrag || snipDrag.pageOrd !== pageOrd) return;
+    const drag = snipDrag;
+    snipDrag = null;
+    const overlay = e.currentTarget as HTMLElement;
+    try {
+      overlay.releasePointerCapture(e.pointerId);
+    } catch {
+      // Ignore
+    }
+    const normRect = normalizeDragRect(
+      drag.startX,
+      drag.startY,
+      drag.curX,
+      drag.curY,
+      drag.slotW,
+      drag.slotH,
+      10
+    );
+    if (!normRect) return;
+
+    const slotEl = overlay.closest<HTMLElement>('.page-slot');
+    const mediaEl = slotEl?.querySelector<HTMLCanvasElement | HTMLImageElement>('.page-media');
+    if (!slotEl || !mediaEl) return;
+
+    const dataUrl = cropSourceElementToPngDataUrl(mediaEl, normRect);
+    if (!dataUrl) return;
+
+    snipMode = false;
+    const slotBounds = slotEl.getBoundingClientRect();
+    const shellRect = shellEl?.getBoundingClientRect();
+    const anchorRight = slotBounds.left + (normRect.x + normRect.w) * slotBounds.width;
+    const anchorTop = slotBounds.top + normRect.y * slotBounds.height;
+    const popX = shellRect
+      ? Math.max(12, Math.min(shellRect.width - 344, anchorRight - shellRect.left - 180))
+      : 24;
+    const popY = shellRect
+      ? Math.max(46, Math.min(shellRect.height - 340, anchorTop - shellRect.top + 12))
+      : 64;
+
+    snipPopover = {
+      pageOrd,
+      rect: normRect,
+      imageDataUrl: dataUrl,
+      x: popX,
+      y: popY,
+    };
+  }
+
+  async function handleSaveSnipAnnotation(opts: {
+    pageOrd: number;
+    rect: NormalizedRect;
+    imageDataUrl: string;
+    noteMarkdown: string;
+    color: 'yellow' | 'green' | 'blue' | 'pink';
+  }) {
+    await api.createFileAnnotation(fileId, {
+      page_ord: opts.pageOrd,
+      kind: 'snip',
+      color: opts.color,
+      rects: [opts.rect],
+      quoted_text: '',
+      note_markdown: opts.noteMarkdown,
+      image_data_url: opts.imageDataUrl,
+    });
+    await refreshAnnotations(fileId);
+    onAnnotationsChanged?.();
+    sidebarMode = 'annotations';
+  }
+
   async function handleUpdateAnnotation(id: number, noteMarkdown: string, color?: string) {
     await api.updateFileAnnotation(id, {
       note_markdown: noteMarkdown,
@@ -1163,6 +1333,9 @@
     jumpBackStack = [];
     jumpForwardStack = [];
     selectionPopover = null;
+    snipMode = false;
+    snipDrag = null;
+    snipPopover = null;
     clearLinkPreviewTimers();
     linkPreview = null;
     linkPreviewCache.clear();
@@ -1599,9 +1772,17 @@
   }
 
   function handleWindowKeydown(e: KeyboardEvent) {
-    if (destroyed) return;
+    if (destroyed || !isKeyboardActive) return;
     const mod = e.metaKey || e.ctrlKey;
-    if (mod && e.key.toLowerCase() === 'f') {
+    if (mod && e.shiftKey && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      snipMode = !snipMode;
+      snipDrag = null;
+      snipPopover = null;
+      selectionPopover = null;
+      return;
+    }
+    if (mod && !e.shiftKey && e.key.toLowerCase() === 'f') {
       e.preventDefault();
       void openFindBar();
       return;
@@ -1621,7 +1802,12 @@
       return;
     }
     if (e.key === 'Escape') {
-      if (selectionPopover) {
+      if (snipPopover) {
+        snipPopover = null;
+      } else if (snipMode) {
+        snipMode = false;
+        snipDrag = null;
+      } else if (selectionPopover) {
         selectionPopover = null;
       } else if (showViewPopover) {
         showViewPopover = false;
@@ -1696,8 +1882,8 @@
         type="button"
         class="v-icon-btn"
         class:active={sidebarMode === 'thumbnails'}
-        title="Miniature pagine"
-        aria-label="Miniature pagine"
+        title={tr(lang, 'thumbnailsTip')}
+        aria-label={tr(lang, 'thumbnailsTip')}
         onclick={() => {
           sidebarMode = sidebarMode === 'thumbnails' ? 'none' : 'thumbnails';
           thumbScrollTop = Math.max(0, (currentPage - 2) * THUMB_ROW_HEIGHT);
@@ -1714,8 +1900,8 @@
         type="button"
         class="v-icon-btn"
         class:active={sidebarMode === 'outline'}
-        title="Indice del documento"
-        aria-label="Indice del documento"
+        title={tr(lang, 'outlineTip')}
+        aria-label={tr(lang, 'outlineTip')}
         onclick={() => (sidebarMode = sidebarMode === 'outline' ? 'none' : 'outline')}
       >
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
@@ -1726,8 +1912,8 @@
         type="button"
         class="v-icon-btn"
         class:active={sidebarMode === 'annotations'}
-        title={`Annotazioni e segnalibri (${annotations.length})`}
-        aria-label="Annotazioni e segnalibri"
+        title={`${tr(lang, 'annotationsTip')} (${annotations.length})`}
+        aria-label={tr(lang, 'annotationsTip')}
         onclick={() => (sidebarMode = sidebarMode === 'annotations' ? 'none' : 'annotations')}
       >
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1890,14 +2076,33 @@
       </div>
     {/if}
 
-    <!-- Right-aligned discreet tools: Find (⌘F), View Options (Color/2-up/Rotate), Ask Doc (if LLM active), External -->
+    <!-- Right-aligned discreet tools: Area Snip (⇧⌘S), Find (⌘F), View Options (Color/2-up/Rotate), Ask Doc (if LLM active), External -->
     <div class="group right-tools">
       <button
         type="button"
         class="v-icon-btn"
+        class:active={snipMode}
+        title={tr(lang, 'areaSnipTip')}
+        aria-label={tr(lang, 'areaSnipTip')}
+        onclick={() => {
+          snipMode = !snipMode;
+          snipDrag = null;
+          snipPopover = null;
+          selectionPopover = null;
+        }}
+      >
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 2v14a2 2 0 0 0 2 2h14" />
+          <path d="M18 22V8a2 2 0 0 0-2-2H2" />
+        </svg>
+      </button>
+
+      <button
+        type="button"
+        class="v-icon-btn"
         class:active={findBarOpen}
-        title="Trova nel documento (⌘F)"
-        aria-label="Trova nel documento"
+        title={tr(lang, 'findInDocTip')}
+        aria-label={tr(lang, 'findInDocTip')}
         onclick={() => (findBarOpen ? closeFindBar() : openFindBar())}
       >
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" aria-hidden="true">
@@ -1911,8 +2116,8 @@
           type="button"
           class="v-icon-btn"
           class:active={showViewPopover || colorMode !== 'normal' || spreadMode || rotationDeg !== 0}
-          title="Aspetto pagina (Seppia/Notte, Doppia pagina, Rotazione)"
-          aria-label="Opzioni visualizzazione pagina"
+          title={tr(lang, 'viewOptionsTip')}
+          aria-label={tr(lang, 'viewOptionsTip')}
           onclick={() => (showViewPopover = !showViewPopover)}
         >
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1922,56 +2127,56 @@
         </button>
 
         {#if showViewPopover}
-          <div class="view-popover" role="dialog" aria-label="Opzioni vista">
+          <div class="view-popover" role="dialog" aria-label={tr(lang, 'viewOptionsTip')}>
             <div class="vp-row">
-              <span class="vp-label">Colore pagina</span>
+              <span class="vp-label">{tr(lang, 'pageColorLabel')}</span>
               <div class="vp-seg">
                 <button
                   type="button"
                   class:active={colorMode === 'normal'}
                   onclick={() => setColorMode('normal')}
                 >
-                  Normale
+                  {tr(lang, 'colorNormal')}
                 </button>
                 <button
                   type="button"
                   class:active={colorMode === 'sepia'}
                   onclick={() => setColorMode('sepia')}
                 >
-                  Seppia
+                  {tr(lang, 'colorSepia')}
                 </button>
                 <button
                   type="button"
                   class:active={colorMode === 'night'}
                   onclick={() => setColorMode('night')}
                 >
-                  Notte
+                  {tr(lang, 'colorNight')}
                 </button>
               </div>
             </div>
 
             <div class="vp-row">
-              <span class="vp-label">Layout</span>
+              <span class="vp-label">{tr(lang, 'layoutLabel')}</span>
               <div class="vp-seg">
                 <button
                   type="button"
                   class:active={!spreadMode}
                   onclick={() => (spreadMode = false)}
                 >
-                  1 pagina
+                  {tr(lang, 'onePage')}
                 </button>
                 <button
                   type="button"
                   class:active={spreadMode}
                   onclick={() => (spreadMode = true)}
                 >
-                  2 pagine
+                  {tr(lang, 'twoPages')}
                 </button>
               </div>
             </div>
 
             <div class="vp-row">
-              <span class="vp-label">Rotazione {rotationDeg ? `(${rotationDeg}°)` : ''}</span>
+              <span class="vp-label">{tr(lang, 'rotationLabel')} {rotationDeg ? `(${rotationDeg}°)` : ''}</span>
               <div class="vp-seg">
                 <button type="button" onclick={() => rotateBy(-90)}>↺ −90°</button>
                 <button type="button" onclick={() => rotateBy(90)}>↻ +90°</button>
@@ -2023,6 +2228,39 @@
     </div>
   </div>
 
+  {#if snipMode}
+    <div class="snip-mode-banner" role="status">
+      <span>✂ {tr(lang, 'areaSnipBanner')}</span>
+      <button
+        type="button"
+        class="snip-banner-cancel"
+        onclick={() => {
+          snipMode = false;
+          snipDrag = null;
+        }}
+      >
+        {tr(lang, 'cancel')}
+      </button>
+    </div>
+  {/if}
+
+  {#if snipPopover && info}
+    <ViewerSnipPopover
+      {lang}
+      documentId={info.document_id}
+      pageOrd={snipPopover.pageOrd}
+      rect={snipPopover.rect}
+      imageDataUrl={snipPopover.imageDataUrl}
+      x={snipPopover.x}
+      y={snipPopover.y}
+      {llmProvider}
+      onSaveSnipAnnotation={handleSaveSnipAnnotation}
+      {onConsentAccepted}
+      {onStatusMessage}
+      onClose={() => (snipPopover = null)}
+    />
+  {/if}
+
   <!-- Floating Find bar (progressive disclosure: appears only on ⌘F / Find click) -->
   {#if findBarOpen}
     <form class="floating-find-bar" onsubmit={runInDocSearch}>
@@ -2031,7 +2269,7 @@
         class="find-input"
         bind:this={findInputEl}
         bind:value={docSearchQuery}
-        placeholder="Trova nel documento (es. Poincare, Erdos)…"
+        placeholder={tr(lang, 'findPlaceholder')}
         onkeydown={(e) => {
           if (e.key === 'Enter' && docSearchMatches.length > 0 && !searchingDoc) {
             e.preventDefault();
@@ -2042,17 +2280,17 @@
           }
         }}
       />
-      <button type="submit" class="v-icon-btn" disabled={searchingDoc} title="Cerca">
+      <button type="submit" class="v-icon-btn" disabled={searchingDoc} title={tr(lang, 'btnSearch')}>
         {searchingDoc ? '…' : '↵'}
       </button>
       {#if docSearchMatches.length > 0}
         <span class="match-count">{docSearchIdx + 1}/{docSearchMatches.length}</span>
-        <button type="button" class="v-icon-btn" title="Precedente (Shift+Invio)" onclick={() => stepDocSearch(-1)}>◀</button>
-        <button type="button" class="v-icon-btn" title="Successivo (Invio)" onclick={() => stepDocSearch(1)}>▶</button>
+        <button type="button" class="v-icon-btn" title="Shift+Enter" onclick={() => stepDocSearch(-1)}>◀</button>
+        <button type="button" class="v-icon-btn" title="Enter" onclick={() => stepDocSearch(1)}>▶</button>
       {:else if docSearchQuery.trim() && !searchingDoc}
         <span class="match-count zero">0</span>
       {/if}
-      <button type="button" class="v-icon-btn" title="Chiudi (Esc)" onclick={closeFindBar}>×</button>
+      <button type="button" class="v-icon-btn" title={tr(lang, 'close')} onclick={closeFindBar}>×</button>
     </form>
   {/if}
 
@@ -2067,7 +2305,7 @@
     >
       <div class="lp-head">
         <span>
-          Anteprima p. {linkPreview.printedLabel ?? linkPreview.pageOrd}
+          {tr(lang, 'linkPreviewLabel')} {linkPreview.printedLabel ?? linkPreview.pageOrd}
         </span>
         <button
           type="button"
@@ -2079,7 +2317,7 @@
             if (d !== undefined) void handleInternalPdfLink(d);
           }}
         >
-          Vai alla pagina ↗
+          {tr(lang, 'goToPageBtn')}
         </button>
       </div>
       <div class="lp-body" style="height: {linkPreview.height}px;">
@@ -2096,15 +2334,48 @@
           >
             <img
               src={linkPreview.imageUrl}
-              alt={`Anteprima pagina ${linkPreview.pageOrd}`}
+              alt={`Preview p. ${linkPreview.pageOrd}`}
               class="lp-img"
               style="width: {linkPreview.width}px; height: {linkPreview.height}px;"
             />
           </button>
         {:else}
-          <div class="lp-loading">Caricamento anteprima…</div>
+          <div class="lp-loading">{lang === 'en' ? 'Loading preview…' : 'Caricamento anteprima…'}</div>
         {/if}
       </div>
+      {#if linkPreview.matchedLibraryDoc && onOpenLibraryDoc}
+        {@const matchedDoc = linkPreview.matchedLibraryDoc}
+        <div class="lp-library-bridge">
+          <div class="lp-lib-info" title={matchedDoc.title}>
+            <span class="lp-lib-badge">✓ {tr(lang, 'ownedInLibraryBadge')}</span>
+            <span class="lp-lib-title">{matchedDoc.title}</span>
+          </div>
+          <div class="lp-lib-actions">
+            <button
+              type="button"
+              class="lp-lib-btn primary"
+              onclick={() => {
+                clearLinkPreviewTimers();
+                linkPreview = null;
+                onOpenLibraryDoc(matchedDoc, false);
+              }}
+            >
+              {tr(lang, 'openInPaperoBtn')}
+            </button>
+            <button
+              type="button"
+              class="lp-lib-btn"
+              onclick={() => {
+                clearLinkPreviewTimers();
+                linkPreview = null;
+                onOpenLibraryDoc(matchedDoc, true);
+              }}
+            >
+              {tr(lang, 'openSideBySideBtn')}
+            </button>
+          </div>
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -2223,7 +2494,7 @@
         {:else if sidebarMode === 'outline'}
           <div class="outline-tree">
             {#if info.outline.length === 0}
-              <div class="empty-side">Nessun indice disponibile nel documento.</div>
+              <div class="empty-side">{tr(lang, 'noOutlineMsg')}</div>
             {:else}
               {#snippet renderOutline(items: OutlineItem[], depth: number)}
                 {#each items as item}
@@ -2249,6 +2520,7 @@
           </div>
         {:else if sidebarMode === 'annotations'}
           <ViewerAnnotationsPane
+            {lang}
             {annotations}
             onJump={(p, rects) => jumpToPage(p, rects, true)}
             onUpdateNote={handleUpdateAnnotation}
@@ -2271,7 +2543,7 @@
       }}
     >
       {#if loading}
-        <div class="center-msg">Caricamento documento…</div>
+        <div class="center-msg">{tr(lang, 'loadingDocumentMsg')}</div>
       {:else if loadError}
         <div class="center-msg error">{loadError}</div>
       {:else if info}
@@ -2338,17 +2610,38 @@
                 </div>
               {/if}
 
-              <!-- Saved non-destructive highlight & note overlays -->
+              <!-- Saved non-destructive highlight, note & snip overlays -->
               {#if pageAnns.length > 0}
                 <div class="annotation-layer">
                   {#each pageAnns as ann (ann.id)}
                     {#each ann.rects as r}
                       <div
                         class="ann-rect ann-{ann.color}"
+                        class:ann-snip={ann.kind === 'snip'}
                         style="left: {r.x * 100}%; top: {r.y * 100}%; width: {r.w * 100}%; height: {r.h * 100}%;"
                       ></div>
                     {/each}
                   {/each}
+                </div>
+              {/if}
+
+              {#if snipMode}
+                <div
+                  class="snip-capture-overlay"
+                  onpointerdown={(e) => handleSnipPointerDown(slot.pageOrd, e)}
+                  onpointermove={(e) => handleSnipPointerMove(slot.pageOrd, e)}
+                  onpointerup={(e) => handleSnipPointerUp(slot.pageOrd, e)}
+                >
+                  {#if snipDrag && snipDrag.pageOrd === slot.pageOrd}
+                    {@const dx = Math.min(snipDrag.startX, snipDrag.curX)}
+                    {@const dy = Math.min(snipDrag.startY, snipDrag.curY)}
+                    {@const dw = Math.abs(snipDrag.curX - snipDrag.startX)}
+                    {@const dh = Math.abs(snipDrag.curY - snipDrag.startY)}
+                    <div
+                      class="snip-drag-box"
+                      style="left: {dx}px; top: {dy}px; width: {dw}px; height: {dh}px;"
+                    ></div>
+                  {/if}
                 </div>
               {/if}
 
@@ -2384,6 +2677,7 @@
 
     {#if askOpen && llmProvider !== 'disabled' && info}
       <ViewerAskPanel
+        {lang}
         documentId={info.document_id}
         {fileId}
         {currentPage}
@@ -2782,6 +3076,49 @@
   .ann-pink {
     background: rgba(244, 114, 182, 0.32);
   }
+  .ann-rect.ann-snip {
+    background: rgba(59, 130, 246, 0.08);
+    border: 1.5px dashed rgba(37, 99, 235, 0.7);
+    mix-blend-mode: normal;
+  }
+  .snip-mode-banner {
+    position: absolute;
+    top: 44px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 29;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: var(--bg-panel);
+    border: 1px solid var(--accent);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--accent);
+    max-width: calc(100% - 28px);
+  }
+  .snip-banner-cancel {
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 999px;
+  }
+  .snip-capture-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 8;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  .snip-drag-box {
+    position: absolute;
+    border: 2px dashed var(--accent);
+    background: rgba(59, 130, 246, 0.16);
+    border-radius: 3px;
+    pointer-events: none;
+  }
   .find-box {
     position: absolute;
     background: rgba(250, 204, 21, 0.36);
@@ -2882,5 +3219,52 @@
   .lp-loading {
     font-size: 11px;
     color: #64748b;
+  }
+  .lp-library-bridge {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 5px 2px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-panel);
+  }
+  .lp-lib-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }
+  .lp-lib-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(16, 185, 129, 0.14);
+    color: #047857;
+    border: 1px solid rgba(16, 185, 129, 0.34);
+    flex-shrink: 0;
+  }
+  .lp-lib-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .lp-lib-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .lp-lib-btn {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 5px;
+    cursor: pointer;
   }
 </style>

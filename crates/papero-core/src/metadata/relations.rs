@@ -905,6 +905,282 @@ fn looks_like_book_reference(
     BOOK_MARKERS.iter().any(|m| combined.contains(m))
 }
 
+fn ref_isbn_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\bISBN(?:-1[03])?:?\s*([0-9Xx][0-9Xx -]{8,16}[0-9Xx])\b").unwrap())
+}
+
+fn contains_word_subslice(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn extract_all_years_from_str(raw: &str) -> HashSet<i64> {
+    let mut out = HashSet::new();
+    let bytes = raw.as_bytes();
+    for win in bytes.windows(4) {
+        if win.iter().all(|b| b.is_ascii_digit()) {
+            if let Ok(s) = std::str::from_utf8(win) {
+                if let Ok(y) = s.parse::<i64>() {
+                    if (1700..=2100).contains(&y) {
+                        out.insert(y);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolves a raw bibliography entry snippet (extracted near a PDF internal `\cite{...}` target)
+/// against the local library offline (`< 5 ms`), returning the matching owned [`CitationLinkItem`]
+/// when a high-confidence match exists (DOI, arXiv, MR, ISBN-10/13, or title + author + year).
+pub fn resolve_citation_snippet_in_library(
+    conn: &Connection,
+    citing_document_id: Option<i64>,
+    snippet: &str,
+) -> Result<Option<CitationLinkItem>> {
+    let trimmed = snippet.trim();
+    if trimmed.len() < 8 {
+        return Ok(None);
+    }
+    let bounded: String = trimmed.chars().take(1600).collect();
+
+    let finish = |doc_id: i64, source: &str| -> Result<Option<CitationLinkItem>> {
+        if citing_document_id == Some(doc_id) {
+            return Ok(None);
+        }
+        let mut map = hydrate_brief_docs(conn, &[doc_id])?;
+        let Some((file_id, title, authors_summary, year, _)) = map.remove(&doc_id) else {
+            return Ok(None);
+        };
+        if file_id <= 0 {
+            return Ok(None);
+        }
+        Ok(Some(CitationLinkItem {
+            document_id: doc_id,
+            file_id,
+            title,
+            authors_summary,
+            year,
+            source: source.to_string(),
+        }))
+    };
+
+    // 1. Exact identifier matching (DOI / book-chapter DOI stem, arXiv, MR, ISBN-10/13/ISBN-9)
+    let lut = load_library_id_lookup(conn)?;
+    for m in ref_doi_re().find_iter(&bounded) {
+        if let Some(d) = normalize_doi(m.as_str()) {
+            let hit = lut
+                .by_doi
+                .get(&d)
+                .copied()
+                .or_else(|| doi_book_stem(&d).and_then(|stem| lut.by_doi.get(&stem).copied()));
+            if let Some(doc_id) = hit {
+                if let Some(item) = finish(doc_id, "doi")? {
+                    return Ok(Some(item));
+                }
+            }
+        }
+    }
+    for cap in ref_arxiv_re().captures_iter(&bounded) {
+        if let Some(ax) = normalize_arxiv_base_id(&cap[1]) {
+            if let Some(&doc_id) = lut.by_arxiv.get(&ax) {
+                if let Some(item) = finish(doc_id, "arxiv")? {
+                    return Ok(Some(item));
+                }
+            }
+        }
+    }
+    for cap in ref_mr_re().captures_iter(&bounded) {
+        if let Some(mr) = normalize_mr_digits(&cap[1]) {
+            if let Some(&doc_id) = lut.by_mr.get(&mr) {
+                if let Some(item) = finish(doc_id, "mr")? {
+                    return Ok(Some(item));
+                }
+            }
+        }
+    }
+    for cap in ref_isbn_re().captures_iter(&bounded) {
+        if let Some(norm_isbn) = normalize_isbn_digits(&cap[1]) {
+            let core9 = isbn9_core(&norm_isbn);
+            let mut stmt = conn.prepare(
+                "SELECT id, isbn FROM documents WHERE isbn IS NOT NULL AND TRIM(isbn) != ''",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for r in rows {
+                let (doc_id, raw_doc_isbn) = r?;
+                if let Some(doc_isbn) = normalize_isbn_digits(&raw_doc_isbn) {
+                    let same = doc_isbn == norm_isbn
+                        || (core9.is_some() && isbn9_core(&doc_isbn) == core9);
+                    if same {
+                        if let Some(item) = finish(doc_id, "isbn")? {
+                            return Ok(Some(item));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fuzzy structured match against local library titles + author surnames + years
+    //    (boosted by pre-linked `document_citations` edges when present).
+    let snippet_words = tokenize_alnum_words(&bounded);
+    if snippet_words.len() < 3 {
+        return Ok(None);
+    }
+    let snippet_word_set: HashSet<&str> = snippet_words.iter().map(String::as_str).collect();
+    let snippet_years = extract_all_years_from_str(&bounded);
+
+    let known_cited: HashSet<i64> = if let Some(cid) = citing_document_id {
+        let mut stmt =
+            conn.prepare("SELECT cited_doc_id FROM document_citations WHERE citing_doc_id = ?1")?;
+        let rows = stmt.query_map(params![cid], |r| r.get::<_, i64>(0))?;
+        rows.filter_map(std::result::Result::ok).collect()
+    } else {
+        HashSet::new()
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.title, d.year, d.work_type,
+                COALESCE(GROUP_CONCAT(da.family_name, '|'), '')
+         FROM documents d
+         LEFT JOIN document_authors da ON da.document_id = d.id AND da.role = 'author'
+         WHERE EXISTS (SELECT 1 FROM files f WHERE f.document_id = d.id)
+         GROUP BY d.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut best: Option<(i32, i64, &'static str)> = None;
+
+    for row in rows {
+        let (doc_id, doc_title, doc_year, work_type, authors_concat) = row?;
+        if citing_document_id == Some(doc_id) {
+            continue;
+        }
+        let mut title_words = tokenize_alnum_words(&doc_title);
+        if title_words.len() >= 2 && is_leading_article(&title_words[0]) {
+            title_words.remove(0);
+        }
+        if title_words.is_empty() {
+            continue;
+        }
+
+        // Prevent Part I / Part II / Part III / Part IV cross-matching in BOTH directions
+        let part_conflict = ["ii", "iii", "iv", "v", "vi"].iter().any(|pt| {
+            title_words.iter().any(|w| w == pt) != snippet_word_set.contains(pt)
+        }) || (title_words.last().is_some_and(|w| w == "i") && !snippet_word_set.contains("i"));
+        if part_conflict {
+            continue;
+        }
+
+        let sig_words: Vec<&str> = title_words
+            .iter()
+            .map(String::as_str)
+            .filter(|w| w.len() >= 3 && !is_title_stopword(w))
+            .collect();
+        if sig_words.is_empty() {
+            continue;
+        }
+
+        let matched_sig = sig_words
+            .iter()
+            .filter(|&&w| snippet_word_set.contains(w))
+            .count();
+
+        let contiguous = contains_word_subslice(&snippet_words, &title_words);
+        let title_char_len: usize = title_words.iter().map(String::len).sum();
+        let high_sig_overlap = sig_words.len() >= 4
+            && matched_sig + usize::from(sig_words.len() >= 6) >= sig_words.len();
+
+        if !contiguous && !high_sig_overlap {
+            continue;
+        }
+
+        // Check author surname match
+        let author_tokens: Vec<String> = authors_concat
+            .split('|')
+            .filter(|s| !s.trim().is_empty())
+            .flat_map(tokenize_alnum_words)
+            .filter(|w| w.len() >= 3)
+            .collect();
+        let has_authors = !author_tokens.is_empty();
+        let author_matched = author_tokens
+            .iter()
+            .any(|a| snippet_word_set.contains(a.as_str()));
+
+        // Check year compatibility
+        let year_delta: Option<i64> = match (doc_year, snippet_years.is_empty()) {
+            (Some(dy), false) => snippet_years.iter().map(|sy| (sy - dy).abs()).min(),
+            _ => None,
+        };
+        let is_book = work_type == "book";
+        let year_ok = match year_delta {
+            Some(d) => d <= if is_book { 15 } else { 2 },
+            None => true,
+        };
+        if !year_ok {
+            continue;
+        }
+
+        let in_doc_citations = known_cited.contains(&doc_id);
+
+        // Require sufficient corroborating evidence for short titles
+        let accepted = if title_words.len() >= 4 && contiguous {
+            author_matched || year_delta.is_some_and(|d| d <= 1) || in_doc_citations || !has_authors
+        } else if contiguous && title_words.len() >= 2 && title_char_len >= 11 {
+            author_matched && (year_delta.is_some() || in_doc_citations || is_book)
+        } else {
+            high_sig_overlap && author_matched && (year_delta.is_some() || in_doc_citations)
+        };
+        if !accepted {
+            continue;
+        }
+
+        let mut score: i32 = (matched_sig.min(12) as i32) * 4;
+        if contiguous {
+            score += 80 + (title_words.len().min(10) as i32) * 3;
+        }
+        if in_doc_citations {
+            score += 45;
+        }
+        if author_matched {
+            score += 35;
+        }
+        if let Some(d) = year_delta {
+            if d == 0 {
+                score += 25;
+            } else if d <= 2 {
+                score += 12;
+            }
+        }
+
+        let src = if in_doc_citations {
+            "citation_graph"
+        } else {
+            "bibliography_match"
+        };
+        if best.as_ref().is_none_or(|(best_score, _, _)| score > *best_score) {
+            best = Some((score, doc_id, src));
+        }
+    }
+
+    if let Some((_, doc_id, src)) = best {
+        return finish(doc_id, src);
+    }
+    Ok(None)
+}
+
 fn clean_ref_title(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ").trim_matches(['.', ',', ';', '"', '\'']).to_string()
 }
@@ -2379,5 +2655,130 @@ mod tests {
             vec!["Functional Analysis", "Regularity for Navier-Stokes Equations II"],
             "Expected only Rudin's Functional Analysis and Smith's Part II, got: {titles:?}"
         );
+    }
+
+    #[test]
+    fn resolve_citation_snippet_matches_owned_identifiers_and_fuzzy_bib_entries() {
+        use crate::db::repos::docs::NewFileRecord;
+        use crate::db::repos::roots::{insert_source_root, NewSourceRoot};
+        use crate::db::Database;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("cite_bridge.sqlite"), 2).unwrap();
+        let w = db.writer();
+        insert_source_root(
+            &w,
+            &NewSourceRoot {
+                id: "r1".into(),
+                label: "Papers".into(),
+                root_path: "/tmp/papers".into(),
+                is_network_or_cloud: false,
+            },
+        )
+        .unwrap();
+
+        let add_with_file = |title: &str, name: &str| -> i64 {
+            let doc_id = create_heuristic_document(&w, title).unwrap();
+            let rel = format!("{name}.pdf");
+            let hash = format!("b3_{name}");
+            insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: doc_id,
+                    root_id: "r1",
+                    rel_path: &rel,
+                    format: "pdf",
+                    size_bytes: 1024,
+                    mtime_ns: 1,
+                    blake3_hash: &hash,
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            doc_id
+        };
+
+        let citing = add_with_file("Current Survey Paper", "survey");
+        let hartshorne = add_with_file("Algebraic Geometry", "hartshorne");
+        w.execute(
+            "UPDATE documents SET work_type = 'book', year = 1977, isbn = '0-387-90244-9' WHERE id = ?1",
+            params![hartshorne],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Hartshorne', 'Robin', 'hartshorne')",
+            params![hartshorne],
+        )
+        .unwrap();
+
+        let ckn = add_with_file(
+            "Partial regularity of suitable weak solutions of the Navier-Stokes equations",
+            "ckn82",
+        );
+        w.execute(
+            "UPDATE documents SET year = 1982, doi = '10.1002/cpa.3160350604' WHERE id = ?1",
+            params![ckn],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Caffarelli', 'Luis', 'caffarelli')",
+            params![ckn],
+        )
+        .unwrap();
+
+        let part1 = add_with_file("Regularity for Navier-Stokes Equations I", "part1");
+        w.execute(
+            "UPDATE documents SET year = 2021 WHERE id = ?1",
+            params![part1],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Smith', 'Alice', 'smith')",
+            params![part1],
+        )
+        .unwrap();
+
+        // 1. Unstructured book entry without ISBN matches Hartshorne via title + author + year
+        let m1 = resolve_citation_snippet_in_library(
+            &w,
+            Some(citing),
+            "[Har77] R. Hartshorne, Algebraic Geometry, Graduate Texts in Mathematics 52, Springer, 1977.",
+        )
+        .unwrap()
+        .expect("should match Hartshorne");
+        assert_eq!(m1.document_id, hartshorne);
+
+        // 2. Entry with typographic en-dash and no DOI still matches CKN82
+        let m2 = resolve_citation_snippet_in_library(
+            &w,
+            Some(citing),
+            "[CKN82] L. Caffarelli, R. Kohn, L. Nirenberg, Partial regularity of suitable weak solutions of the Navier–Stokes equations, Comm. Pure Appl. Math. 35 (1982), 771–831.",
+        )
+        .unwrap()
+        .expect("should match CKN82");
+        assert_eq!(m2.document_id, ckn);
+
+        // 3. Exact DOI match
+        let m3 = resolve_citation_snippet_in_library(
+            &w,
+            Some(citing),
+            "[14] See https://doi.org/10.1002/cpa.3160350604 for details.",
+        )
+        .unwrap()
+        .expect("should match CKN82 by DOI");
+        assert_eq!(m3.document_id, ckn);
+        assert_eq!(m3.source, "doi");
+
+        // 4. Unowned Part II must NOT falsely match owned Part I
+        let miss = resolve_citation_snippet_in_library(
+            &w,
+            Some(citing),
+            "[Sm22] A. Smith, Regularity for Navier-Stokes Equations II, Invent. Math., 2022.",
+        )
+        .unwrap();
+        assert!(miss.is_none(), "Part II should not match Part I: {miss:?}");
     }
 }
