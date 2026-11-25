@@ -394,6 +394,11 @@ where
 
     let lang_arg = env.selected_langs.join("+");
     let dpi = config.ocr_dpi.clamp(150, 350);
+    let max_pages = if config.ocr_front_pages_only {
+        Some(config.ocr_front_pages_count.clamp(1, 50))
+    } else {
+        None
+    };
     let ocr_tmp_dir = cache_dir.join("ocr_tmp");
     fs::create_dir_all(&ocr_tmp_dir)?;
 
@@ -404,6 +409,7 @@ where
             &env.tesseract_path,
             &lang_arg,
             dpi,
+            max_pages,
             &ocr_tmp_dir,
             config.pdfium_lib_path.as_deref(),
             control,
@@ -417,6 +423,7 @@ where
             config.ddjvu_bin.as_deref(),
             &lang_arg,
             dpi,
+            max_pages,
             &ocr_tmp_dir,
             control,
             &mut progress_cb,
@@ -426,7 +433,7 @@ where
         ))),
     };
 
-    let pages = match extract_res {
+    let (real_total_pages, pages) = match extract_res {
         Ok(p) => p,
         Err(e) => {
             let w = db.writer();
@@ -435,7 +442,8 @@ where
         }
     };
 
-    let page_count = pages.len() as u32;
+    let pages_processed = pages.len() as u32;
+    let page_count = real_total_pages.max(pages_processed);
     let doc = ExtractedDocument {
         page_count,
         has_text_layer: true,
@@ -555,7 +563,7 @@ where
     Ok(OcrFileReport {
         file_id,
         document_id: loc.document_id,
-        pages_processed: page_count,
+        pages_processed,
         passages_indexed,
         languages_used: lang_arg,
     })
@@ -658,26 +666,30 @@ fn run_ocr_pdf<F>(
     tesseract_bin: &str,
     lang_arg: &str,
     dpi: u32,
+    max_pages: Option<u32>,
     ocr_tmp_dir: &Path,
     pdfium_lib_path: Option<&Path>,
     control: Option<&ScanControl>,
     progress_cb: &mut F,
-) -> Result<Vec<ExtractedPage>>
+) -> Result<(u32, Vec<ExtractedPage>)>
 where
     F: FnMut(OcrProgressEvent),
 {
     let pdf_path_owned = pdf_path.to_path_buf();
-    let total_pages = with_pdfium(pdfium_lib_path, move |pdfium| {
+    let real_total_pages = with_pdfium(pdfium_lib_path, move |pdfium| {
         let doc = open_pdf_document(pdfium, &pdf_path_owned)?;
         Ok(doc.pages().len() as u32)
     })?;
-    let mut pages = Vec::with_capacity(total_pages as usize);
+    let target_pages = max_pages
+        .map(|cap| real_total_pages.min(cap))
+        .unwrap_or(real_total_pages);
+    let mut pages = Vec::with_capacity(target_pages as usize);
 
-    for batch_start in (0..total_pages).step_by(4) {
+    for batch_start in (0..target_pages).step_by(4) {
         if let Some(ctrl) = control {
             ctrl.wait_if_paused()?;
         }
-        let batch_end = (batch_start + 4).min(total_pages);
+        let batch_end = (batch_start + 4).min(target_pages);
         let pdf_batch_path = pdf_path.to_path_buf();
         let ocr_batch_dir = ocr_tmp_dir.to_path_buf();
         let rendered_batch = with_pdfium(pdfium_lib_path, move |pdfium| {
@@ -720,7 +732,7 @@ where
             progress_cb(OcrProgressEvent {
                 file_id,
                 page_ord,
-                total_pages,
+                total_pages: target_pages,
             });
             let tsv = invoke_tesseract_tsv(tesseract_bin, &tmp_png_path, lang_arg, dpi)?;
             pages.push(parse_tesseract_tsv(
@@ -733,7 +745,7 @@ where
         }
     }
 
-    Ok(pages)
+    Ok((real_total_pages, pages))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,10 +757,11 @@ fn run_ocr_djvu<F>(
     ddjvu_bin: Option<&str>,
     lang_arg: &str,
     dpi: u32,
+    max_pages: Option<u32>,
     ocr_tmp_dir: &Path,
     control: Option<&ScanControl>,
     progress_cb: &mut F,
-) -> Result<Vec<ExtractedPage>>
+) -> Result<(u32, Vec<ExtractedPage>)>
 where
     F: FnMut(OcrProgressEvent),
 {
@@ -775,20 +788,23 @@ where
             djvu_path.display()
         )));
     }
-    let total_pages: u32 = String::from_utf8_lossy(&count_out.stdout)
+    let real_total_pages: u32 = String::from_utf8_lossy(&count_out.stdout)
         .trim()
         .parse()
         .map_err(|_| CoreError::CorruptFile("invalid DjVu page count".into()))?;
+    let target_pages = max_pages
+        .map(|cap| real_total_pages.min(cap))
+        .unwrap_or(real_total_pages);
 
-    let mut pages = Vec::with_capacity(total_pages as usize);
-    for page_ord in 1..=total_pages {
+    let mut pages = Vec::with_capacity(target_pages as usize);
+    for page_ord in 1..=target_pages {
         if let Some(ctrl) = control {
             ctrl.wait_if_paused()?;
         }
         progress_cb(OcrProgressEvent {
             file_id,
             page_ord,
-            total_pages,
+            total_pages: target_pages,
         });
 
         let tmp_pnm_path = ocr_tmp_dir.join(format!("ocr_{file_id}_p{page_ord}.pnm"));
@@ -820,7 +836,7 @@ where
         pages.push(parse_tesseract_tsv(&tsv, page_ord, 0.0, 0.0, None)?);
     }
 
-    Ok(pages)
+    Ok((real_total_pages, pages))
 }
 
 fn write_rgba_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {

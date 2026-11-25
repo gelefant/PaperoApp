@@ -77,6 +77,14 @@ export function sanitizeUiSettings(
       fallback.search_min_score ?? 0
     ),
     ocr_dpi: coerceClampedInt(draft.ocr_dpi, 150, 350, fallback.ocr_dpi || 250),
+    ocr_front_pages_only: Boolean(draft.ocr_front_pages_only),
+    ocr_front_pages_count: coerceClampedInt(
+      draft.ocr_front_pages_count,
+      1,
+      50,
+      fallback.ocr_front_pages_count ?? 8
+    ),
+    check_updates_on_startup: draft.check_updates_on_startup ?? fallback.check_updates_on_startup ?? true,
     llm_max_passages: coerceClampedInt(
       draft.llm_max_passages,
       1,

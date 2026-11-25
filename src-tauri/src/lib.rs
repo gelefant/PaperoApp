@@ -314,6 +314,15 @@ pub fn run() {
             commands::generate_llm_answer_stream_cmd,
             commands::preview_doc_llm_prompt_cmd,
             commands::ask_document_llm_stream_cmd,
+            commands::count_total_annotations_cmd,
+            commands::set_collection_bib_sync_cmd,
+            commands::sync_collection_bibtex_now_cmd,
+            commands::get_missing_classics_cmd,
+            commands::get_storage_health_cmd,
+            commands::compact_database_cmd,
+            commands::clear_render_cache_cmd,
+            commands::check_app_update_cmd,
+            commands::open_external_url_cmd,
         ])
         .run(tauri::generate_context!());
 

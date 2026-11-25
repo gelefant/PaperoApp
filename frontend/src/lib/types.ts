@@ -52,6 +52,8 @@ export interface ContentSearchPassageHit {
   text_content: string;
   bboxes: NormalizedRect[];
   is_alt_formula?: boolean;
+  statement_label?: string | null;
+  statement_kind?: string | null;
 }
 
 export interface ContentSearchDocResult {
@@ -192,6 +194,9 @@ export interface UiSettingsPayload {
   tesseract_bin: string | null;
   ocr_languages: string | null;
   ocr_dpi: number;
+  ocr_front_pages_only?: boolean;
+  ocr_front_pages_count?: number;
+  check_updates_on_startup?: boolean;
   llm_provider: LlmProvider;
   llm_model: string | null;
   llm_ollama_url: string;
@@ -457,6 +462,7 @@ export interface ContentSearchFilter {
   work_category?: WorkCategory | string | null;
   reading_status?: ReadingStatus | string | null;
   starred_only?: boolean | null;
+  statements_only?: boolean;
 }
 
 export interface ImportMetadataReport {
@@ -754,6 +760,8 @@ export interface CollectionView {
   name: string;
   color_hex: string | null;
   sort_order: number;
+  bib_sync_path?: string | null;
+  bib_sync_enabled?: boolean;
   document_count: number;
   document_ids: number[];
 }
@@ -808,4 +816,53 @@ export interface SmartPasteApplyResult {
   summary: string;
   outcome: ResolveOutcome | null;
   metadata: DocumentMetadataView;
+}
+
+export interface MissingClassicCiter {
+  document_id: number;
+  title: string;
+  year: number | null;
+}
+
+export interface MissingClassicItem {
+  title: string;
+  authors: string;
+  year: number | null;
+  venue: string | null;
+  work_category: 'paper' | 'book' | string;
+  doi: string | null;
+  arxiv_id: string | null;
+  isbn: string | null;
+  cited_by_count: number;
+  citing_docs: MissingClassicCiter[];
+}
+
+export interface StorageHealthReport {
+  data_dir: string;
+  db_bytes: number;
+  wal_bytes: number;
+  tantivy_bytes: number;
+  vector_bytes: number;
+  djvu_cache_bytes: number;
+  models_bytes: number;
+  logs_bytes: number;
+  total_bytes: number;
+  documents_count: number;
+  passages_count: number;
+  annotations_count: number;
+}
+
+export interface CompactionReport {
+  before_bytes: number;
+  after_bytes: number;
+  reclaimed_bytes: number;
+}
+
+export interface UpdateCheckResult {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  release_notes: string | null;
+  published_at: string | null;
 }

@@ -38,6 +38,8 @@ pub struct ContentSearchFilter {
     pub reading_status: Option<String>, // "unread" | "reading" | "read"
     #[serde(default)]
     pub starred_only: Option<bool>,
+    #[serde(default)]
+    pub statements_only: bool,
 }
 
 impl ContentSearchFilter {
@@ -254,6 +256,13 @@ where
 
     let bm25_fetch_limit = if allowed_doc_ids.is_some() && bm25_pushdown_docs.is_none() {
         (top_n * 8).max(400)
+    } else if effective_filter.statements_only {
+        (top_n * 5).clamp(150, 400)
+    } else {
+        top_n
+    };
+    let vector_fetch_limit = if effective_filter.statements_only {
+        (top_n * 4).clamp(120, 320)
     } else {
         top_n
     };
@@ -273,7 +282,7 @@ where
 
         let vec_res = run_vector_branch(
             trimmed,
-            top_n,
+            vector_fetch_limit,
             allowed_pids.as_ref(),
             ctx.as_mut(),
         );
@@ -319,6 +328,37 @@ where
     // Hydrate candidate passages once from SQLite.
     let pids: Vec<u64> = fused.iter().map(|c| c.passage_id).collect();
     let hydrated = hydrate_passages_by_ids(conn, &pids)?;
+
+    if effective_filter.statements_only {
+        fused.retain(|c| {
+            hydrated
+                .get(&c.passage_id)
+                .is_some_and(|row| {
+                    crate::extract::statements::detect_math_statement(&row.text_content).is_some()
+                })
+        });
+        if fused.is_empty() {
+            return Ok(HybridSearchResponse {
+                results: Vec::new(),
+                stats: HybridSearchStats {
+                    mode: if vector_active {
+                        "bm25_vector".into()
+                    } else {
+                        "bm25_only".into()
+                    },
+                    bm25_hits: bm25_hits.len(),
+                    vector_hits: vector_hits.len(),
+                    rrf_candidates: 0,
+                    reranked_count: 0,
+                    total_ms: t_start.elapsed().as_secs_f64() * 1000.0,
+                    bm25_ms,
+                    embed_query_ms,
+                    vector_ms,
+                    rerank_ms: 0.0,
+                },
+            });
+        }
+    }
 
     // Apply optional cross-encoder reranking on top-M RRF candidates when vector/reranker exist.
     let mut reranked_count = 0usize;
@@ -572,6 +612,8 @@ pub fn search_bm25_filtered(
     });
     let fetch_limit = if allowed_docs.is_some() && pushdown.is_none() {
         (limit * 8).max(400)
+    } else if filter.statements_only {
+        (limit * 5).clamp(150, 400)
     } else {
         limit
     };
@@ -579,10 +621,24 @@ pub fn search_bm25_filtered(
     if let Some(ref set) = allowed_docs {
         if pushdown.is_none() {
             hits.retain(|h| set.contains(&(h.document_id as i64)));
-            hits.truncate(limit);
+            if !filter.statements_only {
+                hits.truncate(limit);
+            }
         }
     }
     let mut docs = hydrate_bm25_results(conn, &hits)?;
+    if filter.statements_only {
+        for doc in &mut docs {
+            doc.passages.retain(|p| p.statement_label.is_some());
+            doc.max_score = doc.passages.first().map(|p| p.score).unwrap_or(0.0);
+        }
+        docs.retain(|d| !d.passages.is_empty());
+        docs.sort_by(|a, b| {
+            b.max_score
+                .partial_cmp(&a.max_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     if docs.len() > limit {
         docs.truncate(limit);
     }
@@ -859,6 +915,7 @@ pub(crate) fn aggregate_and_sort_documents(
                 max_score: 0.0,
                 passages: Vec::new(),
             });
+        let detected_stmt = crate::extract::statements::detect_math_statement(&row.text_content);
         entry.passages.push(ContentSearchPassageHit {
             passage_id: row.passage_id,
             file_id: row.file_id,
@@ -868,6 +925,8 @@ pub(crate) fn aggregate_and_sort_documents(
             text_content: row.text_content.clone(),
             bboxes: unpack_bboxes(&row.bboxes_blob),
             is_alt_formula: row.is_alt_formula,
+            statement_label: detected_stmt.as_ref().map(|s| s.label.clone()),
+            statement_kind: detected_stmt.map(|s| s.kind.to_string()),
         });
     }
 
@@ -1422,5 +1481,137 @@ mod tests {
         .unwrap();
         assert_eq!(yr_hits.len(), 1);
         assert_eq!(yr_hits[0].document_id, d2);
+    }
+
+    #[test]
+    fn statements_only_filter_keeps_theorem_headers_and_excludes_prose() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("stmt.db"), 2).unwrap();
+        let bm25 = Bm25Index::in_ram().unwrap();
+        {
+            let w = db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "r1".into(),
+                    label: "Math".into(),
+                    root_path: dir.path().to_string_lossy().into_owned(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+            let d1 = create_heuristic_document(&w, "Spectral Analysis").unwrap();
+            let f1 = insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d1,
+                    root_id: "r1",
+                    rel_path: "spectral.pdf",
+                    format: "pdf",
+                    size_bytes: 100,
+                    mtime_ns: 1,
+                    blake3_hash: "s1",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            let pids = replace_file_pages_and_passages(
+                &w,
+                f1,
+                2,
+                true,
+                None,
+                &[
+                    FilePageInsert {
+                        file_id: f1,
+                        page_ord: 1,
+                        printed_label: Some("1".into()),
+                        width_pts: 600.0,
+                        height_pts: 800.0,
+                        text_source: "pdf".into(),
+                    },
+                    FilePageInsert {
+                        file_id: f1,
+                        page_ord: 2,
+                        printed_label: Some("2".into()),
+                        width_pts: 600.0,
+                        height_pts: 800.0,
+                        text_source: "pdf".into(),
+                    },
+                ],
+                &[
+                    PassageInsert {
+                        document_id: d1,
+                        file_id: f1,
+                        page_ord: 1,
+                        printed_label: Some("1".into()),
+                        chunk_index: 0,
+                        is_alt_formula: false,
+                        token_count: 15,
+                        text_content: "By Theorem 3.2 the compact resolvent operator has discrete spectrum.".into(),
+                        bboxes_blob: Vec::new(),
+                    },
+                    PassageInsert {
+                        document_id: d1,
+                        file_id: f1,
+                        page_ord: 2,
+                        printed_label: Some("2".into()),
+                        chunk_index: 0,
+                        is_alt_formula: false,
+                        token_count: 18,
+                        text_content: "Theorem 3.2 (Compact Resolvent). Every self-adjoint operator with compact resolvent has discrete spectrum.".into(),
+                        bboxes_blob: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+            bm25.add_passages(&[
+                Bm25Passage {
+                    passage_id: pids[0],
+                    document_id: d1 as u64,
+                    file_id: f1 as u64,
+                    root_id: "r1".into(),
+                    text_content: "By Theorem 3.2 the compact resolvent operator has discrete spectrum.".into(),
+                },
+                Bm25Passage {
+                    passage_id: pids[1],
+                    document_id: d1 as u64,
+                    file_id: f1 as u64,
+                    root_id: "r1".into(),
+                    text_content: "Theorem 3.2 (Compact Resolvent). Every self-adjoint operator with compact resolvent has discrete spectrum.".into(),
+                },
+            ])
+            .unwrap();
+            bm25.commit().unwrap();
+        }
+
+        let r = db.reader();
+        let all_hits = search_bm25_filtered(
+            &r,
+            &bm25,
+            "compact resolvent",
+            &ContentSearchFilter::default(),
+            10,
+        )
+        .unwrap();
+        assert_eq!(all_hits[0].passages.len(), 2);
+
+        let stmt_hits = search_bm25_filtered(
+            &r,
+            &bm25,
+            "compact resolvent",
+            &ContentSearchFilter {
+                statements_only: true,
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(stmt_hits.len(), 1);
+        assert_eq!(stmt_hits[0].passages.len(), 1);
+        assert_eq!(
+            stmt_hits[0].passages[0].statement_label.as_deref(),
+            Some("Theorem 3.2")
+        );
     }
 }

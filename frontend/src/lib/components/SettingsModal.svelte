@@ -16,7 +16,9 @@
     OcrEnvironmentStatus,
     SettingsTabId,
     SourceRoot,
+    StorageHealthReport,
     UiSettingsPayload,
+    UpdateCheckResult,
   } from '../types';
   import { normalizeLang, tr } from '../i18n';
 
@@ -47,6 +49,8 @@
     onUpdateBackupNow?: () => Promise<void>;
     onRestoreBackup: () => Promise<void>;
     onLaunchWizard: () => void;
+    updateInfo?: UpdateCheckResult | null;
+    onUpdateInfoChange?: (info: UpdateCheckResult | null) => void;
     onClose: () => void;
   }
 
@@ -77,6 +81,8 @@
     onUpdateBackupNow,
     onRestoreBackup,
     onLaunchWizard,
+    updateInfo = null,
+    onUpdateInfoChange,
     onClose,
   }: Props = $props();
 
@@ -252,6 +258,73 @@
   let llmErr = $state('');
   let bibSyncBusy = $state(false);
   let bibSyncMsg = $state('');
+  let storageHealth = $state<StorageHealthReport | null>(null);
+  let maintBusy = $state(false);
+  let maintMsg = $state('');
+  let updateBusy = $state(false);
+  let updateErr = $state('');
+
+  function formatDiskBytes(bytes: number): string {
+    if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${bytes} B`;
+  }
+
+  async function refreshStorageHealth() {
+    try {
+      storageHealth = await api.getStorageHealth();
+    } catch {
+      storageHealth = null;
+    }
+  }
+
+  async function handleCompactDatabase() {
+    maintBusy = true;
+    maintMsg = '';
+    try {
+      const rep = await api.compactDatabase();
+      await refreshStorageHealth();
+      maintMsg =
+        lang === 'en'
+          ? `Database compacted (${formatDiskBytes(rep.reclaimed_bytes)} reclaimed).`
+          : `Database compattato (${formatDiskBytes(rep.reclaimed_bytes)} recuperati).`;
+    } catch (e) {
+      maintMsg = String(e);
+    } finally {
+      maintBusy = false;
+    }
+  }
+
+  async function handleClearRenderCache() {
+    maintBusy = true;
+    maintMsg = '';
+    try {
+      const cleared = await api.clearRenderCache();
+      await refreshStorageHealth();
+      maintMsg =
+        lang === 'en'
+          ? `Render cache cleared (${formatDiskBytes(cleared)} freed).`
+          : `Cache di rendering svuotata (${formatDiskBytes(cleared)} liberati).`;
+    } catch (e) {
+      maintMsg = String(e);
+    } finally {
+      maintBusy = false;
+    }
+  }
+
+  async function handleManualUpdateCheck() {
+    updateBusy = true;
+    updateErr = '';
+    try {
+      const res = await api.checkAppUpdate(true);
+      onUpdateInfoChange?.(res);
+    } catch (e) {
+      updateErr = String(e);
+    } finally {
+      updateBusy = false;
+    }
+  }
 
   function citeKeyPreview(pattern?: BibtexKeyPattern): string {
     switch (pattern) {
@@ -317,6 +390,7 @@
       llmErr = '';
       onRefreshMlStatus();
       onRefreshOcrStatus?.();
+      void refreshStorageHealth();
       api
         .getLlmKeyStatus()
         .then((st) => {
@@ -672,6 +746,56 @@
                   </div>
                 </div>
               {/if}
+              <div class="status-box">
+                <div class="prof-row">
+                  <strong>{lang === 'en' ? 'Software Updates' : 'Aggiornamenti'}</strong>
+                  <button type="button" disabled={updateBusy} onclick={handleManualUpdateCheck}>
+                    {updateBusy
+                      ? '…'
+                      : lang === 'en'
+                        ? 'Check now'
+                        : 'Controlla ora'}
+                  </button>
+                </div>
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.check_updates_on_startup ?? true}
+                    onchange={(e) =>
+                      (draft.check_updates_on_startup = (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>
+                    {lang === 'en'
+                      ? 'Check discretely for new Papero releases on startup'
+                      : 'Controlla in modo discreto nuovi aggiornamenti di Papero all’avvio'}
+                  </span>
+                </label>
+                {#if updateInfo?.update_available}
+                  <div class="notice">
+                    {lang === 'en'
+                      ? `New version v${updateInfo.latest_version} available (installed: v${updateInfo.current_version}).`
+                      : `Nuova versione v${updateInfo.latest_version} disponibile (installata: v${updateInfo.current_version}).`}
+                    <button
+                      type="button"
+                      class="primary"
+                      style="margin-left: 8px;"
+                      onclick={() => updateInfo && void api.openExternalUrl(updateInfo.release_url)}
+                    >
+                      {lang === 'en' ? 'Open Release ↗' : 'Scarica Release ↗'}
+                    </button>
+                  </div>
+                {:else if updateInfo}
+                  <div class="sub-hdr">
+                    {lang === 'en'
+                      ? `Papero v${updateInfo.current_version} is up to date.`
+                      : `Papero v${updateInfo.current_version} è aggiornato all’ultima versione.`}
+                  </div>
+                {/if}
+                {#if updateErr}
+                  <div class="err-msg">{updateErr}</div>
+                {/if}
+              </div>
+
               <div>
                 <button
                   type="button"
@@ -869,6 +993,38 @@
                   />
                 </label>
               </div>
+              <div class="status-box">
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(draft.ocr_front_pages_only)}
+                    onchange={(e) =>
+                      (draft.ocr_front_pages_only = (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>
+                    {lang === 'en'
+                      ? 'Fast front-pages OCR (extract only the first N pages for quick cataloging of long scans)'
+                      : 'OCR rapido solo prime pagine (estrae solo le prime N pagine per catalogare subito scansioni lunghe)'}
+                  </span>
+                </label>
+                {#if draft.ocr_front_pages_only}
+                  <label style="max-width: 220px;">
+                    <span>{lang === 'en' ? 'Leading pages to OCR (1–50)' : 'Numero prime pagine (1–50)'}</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="50"
+                      value={draft.ocr_front_pages_count ?? 8}
+                      oninput={(e) =>
+                        (draft.ocr_front_pages_count = Math.max(
+                          1,
+                          Math.min(50, Number((e.currentTarget as HTMLInputElement).value) || 8)
+                        ))}
+                    />
+                  </label>
+                {/if}
+              </div>
+
               {#if onRunPendingOcr}
                 <div class="row-actions">
                   <button
@@ -1388,10 +1544,56 @@
               {#if backupError}
                 <div class="err-msg">{backupError}</div>
               {/if}
+
+              <div class="status-box" style="margin-top: 6px;">
+                <div class="prof-row">
+                  <strong>
+                    {lang === 'en' ? 'Local Storage Health & Maintenance' : 'Salute & Manutenzione locale'}
+                  </strong>
+                  <button type="button" disabled={maintBusy} onclick={refreshStorageHealth}>
+                    ↻
+                  </button>
+                </div>
+                {#if storageHealth}
+                  <div class="sub-hdr">
+                    SQLite: <strong>{formatDiskBytes(storageHealth.db_bytes + storageHealth.wal_bytes)}</strong>
+                    · BM25: <strong>{formatDiskBytes(storageHealth.tantivy_bytes)}</strong>
+                    · Vettori: <strong>{formatDiskBytes(storageHealth.vector_bytes)}</strong>
+                    · Cache: <strong>{formatDiskBytes(storageHealth.djvu_cache_bytes)}</strong>
+                    · ML: <strong>{formatDiskBytes(storageHealth.models_bytes)}</strong>
+                  </div>
+                  <div class="sub-hdr">
+                    {lang === 'en' ? 'Total AppData' : 'Totale AppData'}:
+                    <strong>{formatDiskBytes(storageHealth.total_bytes)}</strong>
+                    · {storageHealth.documents_count} doc · {storageHealth.passages_count} pass. · {storageHealth.annotations_count} note
+                  </div>
+                {/if}
+                <div class="row-actions">
+                  <button type="button" disabled={maintBusy} onclick={handleCompactDatabase}>
+                    {maintBusy
+                      ? '…'
+                      : lang === 'en'
+                        ? 'Compact DB (VACUUM)'
+                        : 'Compatta DB (VACUUM)'}
+                  </button>
+                  <button type="button" disabled={maintBusy} onclick={handleClearRenderCache}>
+                    {maintBusy
+                      ? '…'
+                      : lang === 'en'
+                        ? 'Clear render cache'
+                        : 'Svuota cache render'}
+                  </button>
+                </div>
+                {#if maintMsg}
+                  <div class="notice">{maintMsg}</div>
+                {/if}
+              </div>
             </div>
           {:else}
             <div class="shortcuts-list">
-              <div class="sc-row"><kbd>/</kbd> <kbd>Cmd/Ctrl + K</kbd> <span>{lang === 'en' ? 'Focus search bar' : 'Focus sulla barra di ricerca'}</span></div>
+              <div class="sc-row"><kbd>Cmd/Ctrl + K</kbd> <span>{lang === 'en' ? 'Open global Command Palette' : 'Apri Command Palette globale'}</span></div>
+              <div class="sc-row"><kbd>/</kbd> <span>{lang === 'en' ? 'Focus search bar' : 'Focus sulla barra di ricerca'}</span></div>
+              <div class="sc-row"><kbd>Cmd/Ctrl + \</kbd> <span>{lang === 'en' ? 'Toggle Zen reading mode' : 'Attiva/disattiva modalità lettura Zen'}</span></div>
               <div class="sc-row"><kbd>Cmd/Ctrl + F</kbd> <span>{lang === 'en' ? 'Find inside open PDF / DjVu' : 'Trova nel documento aperto (PDF / DjVu)'}</span></div>
               <div class="sc-row"><kbd>Alt + ← / →</kbd> <span>{lang === 'en' ? 'Back / Forward jump history in viewer' : 'Indietro / Avanti nella cronologia di salto del viewer'}</span></div>
               <div class="sc-row"><kbd>Cmd/Ctrl + S</kbd> <span>{lang === 'en' ? 'Save metadata changes in Inspector' : 'Salva modifiche metadati nell’Ispettore'}</span></div>
@@ -1399,7 +1601,7 @@
               <div class="sc-row"><kbd>Cmd/Ctrl + B</kbd> <span>{lang === 'en' ? 'Toggle left sidebar' : 'Mostra/nascondi barra laterale sinistra'}</span></div>
               <div class="sc-row"><kbd>Cmd/Ctrl + R</kbd> <span>{lang === 'en' ? 'Incremental rescan' : 'Riscansione incrementale cartelle'}</span></div>
               <div class="sc-row"><kbd>Cmd/Ctrl + ,</kbd> <span>{lang === 'en' ? 'Open settings' : 'Apri Impostazioni'}</span></div>
-              <div class="sc-row"><kbd>Esc</kbd> <span>{lang === 'en' ? 'Close modal / Find bar / popover' : 'Chiudi modale / barra Trova / popover'}</span></div>
+              <div class="sc-row"><kbd>Esc</kbd> <span>{lang === 'en' ? 'Close modal / Zen mode / Find bar' : 'Chiudi modale / modalità Zen / barra Trova'}</span></div>
             </div>
           {/if}
         </section>

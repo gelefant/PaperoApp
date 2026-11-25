@@ -511,4 +511,30 @@ export const api = {
     invoke<number>('batch_set_verified_cmd', { documentIds, verified }),
   batchEnqueueOcr: (documentIds: number[]) =>
     invoke<number>('batch_enqueue_ocr_cmd', { documentIds }),
+
+  // v0.5.1: Annotation count, Per-collection .bib sync, Missing Classics, Storage Health & Updates
+  countTotalAnnotations: () => invoke<number>('count_total_annotations_cmd'),
+  setCollectionBibSync: (
+    collectionId: number,
+    bibSyncPath: string | null,
+    bibSyncEnabled: boolean
+  ) =>
+    invoke<CollectionView>('set_collection_bib_sync_cmd', {
+      collectionId,
+      bibSyncPath,
+      bibSyncEnabled,
+    }),
+  syncCollectionBibtexNow: (collectionId: number) =>
+    invoke<[string, number]>('sync_collection_bibtex_now_cmd', { collectionId }),
+  getMissingClassics: (category?: 'all' | 'paper' | 'book', limit?: number) =>
+    invoke<import('./types').MissingClassicItem[]>('get_missing_classics_cmd', {
+      category: category ?? 'all',
+      limit: limit ?? 50,
+    }),
+  getStorageHealth: () => invoke<import('./types').StorageHealthReport>('get_storage_health_cmd'),
+  compactDatabase: () => invoke<import('./types').CompactionReport>('compact_database_cmd'),
+  clearRenderCache: () => invoke<number>('clear_render_cache_cmd'),
+  checkAppUpdate: (manual = false) =>
+    invoke<import('./types').UpdateCheckResult>('check_app_update_cmd', { manual }),
+  openExternalUrl: (url: string) => invoke<void>('open_external_url_cmd', { url }),
 };

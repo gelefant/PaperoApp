@@ -5,6 +5,7 @@
   import { api } from './lib/api';
   import { normalizeLang, tr } from './lib/i18n';
   import type {
+    AnnotationSearchHit,
     BackupReport,
     BibtexSyncReport,
     CollectionView,
@@ -40,6 +41,7 @@
     TagSummary,
     TopicClusterView,
     UiSettingsPayload,
+    UpdateCheckResult,
     VerifiedFilter,
     ViewerTab,
     ViewerTargetPassage,
@@ -49,6 +51,7 @@
   import LeftSidebar from './lib/components/LeftSidebar.svelte';
   import DocumentList from './lib/components/DocumentList.svelte';
   import ContentResults from './lib/components/ContentResults.svelte';
+  import NotesSearchResults from './lib/components/NotesSearchResults.svelte';
   import ViewerTabs from './lib/components/ViewerTabs.svelte';
   import UnifiedViewer from './lib/components/UnifiedViewer.svelte';
   import ContextMenu, { type ContextTarget } from './lib/components/ContextMenu.svelte';
@@ -56,6 +59,8 @@
   import DuplicatesView from './lib/components/DuplicatesView.svelte';
   import FirstRunWizard from './lib/components/FirstRunWizard.svelte';
   import SettingsModal from './lib/components/SettingsModal.svelte';
+  import CommandPalette, { type PaletteAction } from './lib/components/CommandPalette.svelte';
+  import SuggestedClassicsModal from './lib/components/SuggestedClassicsModal.svelte';
 
   // Check if launched as a detached viewer window (`?viewerFileId=...&page=...`)
   const urlParams = new URLSearchParams(window.location.search);
@@ -108,6 +113,20 @@
   let presets = $state.raw<ExternalReaderPreset[]>([]);
   let tabs = $state<ViewerTab[]>([]);
   let activeTabId = $state<string | null>(null);
+  let splitTabId = $state<string | null>(null);
+  let zenMode = $state(false);
+  let zenRestore = { sidebarCollapsed: false, inspectorOpen: true };
+  let totalAnnotationsCount = $state(0);
+  let notesScopeActive = $state(false);
+  let notesHits = $state.raw<AnnotationSearchHit[]>([]);
+  let notesLoading = $state(false);
+  let statementsOnly = $state(false);
+  let commandPaletteOpen = $state(false);
+  let classicsModalOpen = $state(false);
+  let collectionBibModal = $state<CollectionView | null>(null);
+  let collectionBibBusy = $state(false);
+  let collectionBibErr = $state('');
+  let updateInfo = $state<UpdateCheckResult | null>(null);
   let contextTarget = $state<ContextTarget | null>(null);
   let topBarRef = $state<{ focusSearch?: () => void } | null>(null);
   let inspectorRef = $state<{
@@ -274,11 +293,13 @@
       work_category: activeWorkCategory !== 'all' ? activeWorkCategory : null,
       reading_status: metaFilter.reading_status || null,
       starred_only: metaFilter.starred_only ? true : null,
+      statements_only: statementsOnly,
     };
   }
 
   const activeContentFilterChips = $derived.by(() => {
     const chips: string[] = [];
+    if (statementsOnly) chips.push(tr(lang, 'statementsOnlyLabel'));
     if (metaFilter.tag) chips.push(`#${metaFilter.tag}`);
     if (metaFilter.cluster_id) {
       const cl = clusters.find((c) => c.id === metaFilter.cluster_id);
@@ -448,6 +469,7 @@
   }
 
   async function clearSidebarFilters() {
+    statementsOnly = false;
     metaFilter = {
       ...metaFilter,
       msc_prefix: null,
@@ -551,6 +573,232 @@
     await Promise.all([refreshTaxonomy(), refreshDocuments()]);
     if (selectedDocId === docId) await loadInspectorMetadata(docId);
   }
+
+  async function refreshAnnotationsCount() {
+    try {
+      const cnt = await api.countTotalAnnotations();
+      totalAnnotationsCount = cnt;
+      if (cnt === 0 && notesScopeActive) {
+        notesScopeActive = false;
+        notesHits = [];
+      } else if (notesScopeActive) {
+        void runNotesSearch(query);
+      }
+    } catch {
+      // Ignore transient startup race
+    }
+  }
+
+  async function runNotesSearch(q: string) {
+    notesLoading = true;
+    try {
+      notesHits = await api.searchAnnotations(q.trim(), null);
+    } catch {
+      notesHits = [];
+    } finally {
+      notesLoading = false;
+    }
+  }
+
+  async function handleToggleNotesScope(active: boolean) {
+    if (active && totalAnnotationsCount === 0) return;
+    notesScopeActive = active;
+    if (active) {
+      activeLeftView = 'library';
+      await runNotesSearch(query);
+    } else {
+      notesHits = [];
+    }
+  }
+
+  function handleOpenNoteHit(hit: AnnotationSearchHit) {
+    if (!hit.file_id) return;
+    const doc = hit.document_id !== null ? catalogStats.byDocId.get(hit.document_id) : undefined;
+    const fid = hit.file_id;
+    const title = hit.doc_title || doc?.title || `File #${fid}`;
+    const fmt = doc?.format ?? 'pdf';
+    if (hit.document_id !== null) {
+      requestSelectDocument(hit.document_id, () => {
+        openInViewer(fid, title, fmt, hit.annotation.page_ord, hit.annotation.rects);
+      });
+    } else {
+      openInViewer(fid, title, fmt, hit.annotation.page_ord, hit.annotation.rects);
+    }
+  }
+
+  async function handleToggleStatementsOnly(active: boolean) {
+    statementsOnly = active;
+    if (committedContentQuery.trim()) {
+      await handleSearch(committedContentQuery);
+    }
+  }
+
+  function handleToggleZenMode() {
+    if (!zenMode) {
+      if (tabs.length === 0) {
+        scanStatusText =
+          lang === 'en'
+            ? 'Open a document first to use Zen reading mode.'
+            : 'Apri prima un documento per usare la modalità lettura Zen.';
+        return;
+      }
+      zenRestore = { sidebarCollapsed, inspectorOpen };
+      zenMode = true;
+    } else {
+      zenMode = false;
+      sidebarCollapsed = zenRestore.sidebarCollapsed;
+      inspectorOpen = zenRestore.inspectorOpen;
+    }
+  }
+
+  async function handleConfigureCollectionBibSync(col: CollectionView) {
+    collectionBibErr = '';
+    collectionBibModal = col;
+  }
+
+  async function handleChooseCollectionBibPath() {
+    const col = collectionBibModal;
+    if (!col) return;
+    collectionBibBusy = true;
+    collectionBibErr = '';
+    try {
+      const safeName =
+        col.name
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, '_')
+          .replace(/^_+|_+$/g, '') || `collezione_${col.id}`;
+      const chosen = await saveFileDialog({
+        defaultPath: col.bib_sync_path || `${safeName}.bib`,
+        filters: [{ name: 'BibTeX', extensions: ['bib'] }],
+      });
+      if (!chosen) return;
+      const updated = await api.setCollectionBibSync(col.id, chosen, true);
+      collectionBibModal = updated;
+      await refreshTaxonomy();
+      scanStatusText =
+        lang === 'en'
+          ? `Linked "${updated.name}" to ${chosen} (Auto-Sync active)`
+          : `Collezione «${updated.name}» collegata a ${chosen} (Auto-Sync attivo)`;
+    } catch (e) {
+      collectionBibErr = String(e);
+    } finally {
+      collectionBibBusy = false;
+    }
+  }
+
+  async function handleUnlinkCollectionBib() {
+    const col = collectionBibModal;
+    if (!col) return;
+    collectionBibBusy = true;
+    collectionBibErr = '';
+    try {
+      const updated = await api.setCollectionBibSync(col.id, null, false);
+      collectionBibModal = updated;
+      await refreshTaxonomy();
+      scanStatusText =
+        lang === 'en'
+          ? `Unlinked .bib auto-sync for "${updated.name}"`
+          : `Auto-Sync .bib scollegato per «${updated.name}»`;
+    } catch (e) {
+      collectionBibErr = String(e);
+    } finally {
+      collectionBibBusy = false;
+    }
+  }
+
+  async function handleSyncCollectionBibNow(col: CollectionView) {
+    collectionBibBusy = true;
+    collectionBibErr = '';
+    try {
+      const [path, count] = await api.syncCollectionBibtexNow(col.id);
+      scanStatusText =
+        lang === 'en'
+          ? `Synced ${count} entries from "${col.name}" to ${path}`
+          : `Sincronizzate ${count} voci di «${col.name}» in ${path}`;
+    } catch (e) {
+      const msg = String(e);
+      collectionBibErr = msg;
+      scanStatusText = msg;
+    } finally {
+      collectionBibBusy = false;
+    }
+  }
+
+  const paletteActions = $derived.by((): PaletteAction[] => {
+    const list: PaletteAction[] = [
+      {
+        id: 'classics',
+        label: tr(lang, 'suggestedClassicsTitle'),
+        hint: lang === 'en' ? 'Missing most-cited papers & books' : 'Paper e libri più citati che mancano',
+        run: () => (classicsModalOpen = true),
+      },
+      {
+        id: 'zen',
+        label: zenMode
+          ? lang === 'en'
+            ? 'Exit Zen reading mode'
+            : 'Esci da modalità lettura Zen'
+          : lang === 'en'
+            ? 'Enter Zen reading mode'
+            : 'Attiva modalità lettura Zen',
+        hint: '⌘\\',
+        run: handleToggleZenMode,
+      },
+      {
+        id: 'rescan',
+        label: tr(lang, 'rescan'),
+        hint: '⌘R',
+        run: () => {
+          if (!scanning && roots.length > 0) void handleRescan();
+        },
+      },
+      {
+        id: 'settings',
+        label: tr(lang, 'settings'),
+        hint: '⌘,',
+        run: () => {
+          settingsInitialTab = null;
+          settingsOpen = true;
+        },
+      },
+      {
+        id: 'export-bib',
+        label: tr(lang, 'exportBib'),
+        hint: lang === 'en' ? 'Export visible catalog to .bib' : 'Esporta catalogo corrente in .bib',
+        run: () => void handleExportBibtex(),
+      },
+      {
+        id: 'backup',
+        label: tr(lang, 'createBackupBtn'),
+        hint: '.papero-backup',
+        run: () => void handleCreateBackup(),
+      },
+    ];
+    if (selectedDocId !== null) {
+      const docId = selectedDocId;
+      list.unshift({
+        id: 'copy-cite',
+        label: lang === 'en' ? 'Copy \\cite{key} of selected document' : 'Copia \\cite{key} del documento selezionato',
+        hint: selectedMeta?.title ?? '',
+        run: () => {
+          void api.getDocumentCiteKey(docId).then(async (p) => {
+            await navigator.clipboard.writeText(p.cite_command);
+            scanStatusText = `Copiato ${p.cite_command}`;
+          });
+        },
+      });
+    }
+    if (settings?.bibtex_auto_sync_enabled && settings?.bibtex_auto_sync_path) {
+      list.push({
+        id: 'sync-bib',
+        label: lang === 'en' ? 'Sync global .bib now' : 'Sincronizza file .bib globale ora',
+        hint: settings.bibtex_auto_sync_path,
+        run: () => void api.syncBibtexNow().catch(() => {}),
+      });
+    }
+    return list;
+  });
 
   async function handleSaveCurrentView(name: string) {
     const mode = searchResults !== null || searchMode === 'content' ? 'content' : 'metadata';
@@ -934,6 +1182,15 @@
       wizardOpen = true;
     }
     await refreshLibrary();
+    void refreshAnnotationsCount();
+    if (cfg.check_updates_on_startup !== false && cfg.network_lookups_enabled) {
+      api
+        .checkAppUpdate(false)
+        .then((res) => {
+          if (!appDestroyed) updateInfo = res;
+        })
+        .catch(() => {});
+    }
     if (appDestroyed) return;
     const unFs = await listen('library-fs-updated', () => {
       if (appDestroyed) return;
@@ -1133,6 +1390,10 @@
     llmError = '';
     llmPreview = null;
     cloudConsentModal = null;
+    if (notesScopeActive) {
+      await runNotesSearch(q);
+      return;
+    }
     if (searchMode === 'metadata') {
       searchResults = null;
       searchStats = null;
@@ -1618,11 +1879,27 @@
         target.isContentEditable);
 
     if (e.key === 'Escape') {
-      if (pendingDocSwitch) pendingDocSwitch = null;
+      if (commandPaletteOpen) commandPaletteOpen = false;
+      else if (classicsModalOpen) classicsModalOpen = false;
+      else if (collectionBibModal) collectionBibModal = null;
+      else if (pendingDocSwitch) pendingDocSwitch = null;
       else if (cloudConsentModal) cloudConsentModal = null;
       else if (contextTarget) contextTarget = null;
       else if (settingsOpen) settingsOpen = false;
       else if (wizardOpen) wizardOpen = false;
+      else if (zenMode) handleToggleZenMode();
+      return;
+    }
+
+    if (mod && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      commandPaletteOpen = !commandPaletteOpen;
+      return;
+    }
+
+    if (mod && e.key === '\\') {
+      e.preventDefault();
+      handleToggleZenMode();
       return;
     }
 
@@ -1634,7 +1911,7 @@
       return;
     }
 
-    if ((e.key === '/' && !mod && !inEditable) || (mod && e.key.toLowerCase() === 'k')) {
+    if (e.key === '/' && !mod && !inEditable) {
       e.preventDefault();
       topBarRef?.focusSearch?.();
       return;
@@ -2043,6 +2320,9 @@
       {mlDownloadProgress}
       {presets}
       {inspectorOpen}
+      {notesScopeActive}
+      hasNotes={totalAnnotationsCount > 0}
+      updateAvailableVersion={updateInfo?.update_available ? updateInfo.latest_version : null}
       onSearch={handleSearch}
       onClearSearch={async () => {
         searchReqSeq++;
@@ -2050,11 +2330,17 @@
         committedContentQuery = '';
         searchResults = null;
         searchStats = null;
-        await refreshDocuments();
+        if (notesScopeActive) {
+          await runNotesSearch('');
+        } else {
+          await refreshDocuments();
+        }
       }}
       onSearchModeChange={handleSearchModeChange}
       onMetaFilterChange={handleMetaFilterChange}
       onWorkCategoryChange={handleWorkCategoryChange}
+      onToggleNotesScope={handleToggleNotesScope}
+      onOpenClassics={() => (classicsModalOpen = true)}
       onVerifiedFilterChange={handleVerifiedFilterChange}
       onSortByChange={handleSortByChange}
       onToggleSortDir={handleToggleSortDir}
@@ -2116,6 +2402,7 @@
     {/if}
 
     <div class="workspace-body">
+      {#if !zenMode}
       <div class="sidebar-slot" class:collapsed={sidebarCollapsed}>
         <LeftSidebar
           {lang}
@@ -2147,6 +2434,8 @@
           onRenameCollection={handleRenameCollection}
           onDeleteCollection={handleDeleteCollection}
           onReorderCollections={handleReorderCollections}
+          onConfigureCollectionBibSync={handleConfigureCollectionBibSync}
+          onSyncCollectionBibNow={handleSyncCollectionBibNow}
           onSaveCurrentView={handleSaveCurrentView}
           onApplySavedSearch={handleApplySavedSearch}
           onDeleteSavedSearch={handleDeleteSavedSearch}
@@ -2156,10 +2445,21 @@
           onRenameCluster={handleRenameCluster}
         />
       </div>
+      {/if}
 
-      <div class="main-split" class:with-inspector={inspectorOpen}>
+      <div class="main-split" class:with-inspector={!zenMode && inspectorOpen} class:zen-mode={zenMode}>
+      {#if !zenMode}
       <section class="left-pane">
-        {#if activeLeftView === 'duplicates'}
+        {#if notesScopeActive}
+          <NotesSearchResults
+            {lang}
+            {query}
+            hits={notesHits}
+            loading={notesLoading}
+            onOpenHit={handleOpenNoteHit}
+            onExitNotesScope={() => handleToggleNotesScope(false)}
+          />
+        {:else if activeLeftView === 'duplicates'}
           <DuplicatesView
             groups={duplicateGroups}
             {scanningDedup}
@@ -2181,11 +2481,13 @@
             results={displayedSearchResults}
             {searchStats}
             workCategory={activeWorkCategory}
+            {statementsOnly}
             activeFilterChips={activeContentFilterChips}
             authorFilter={metaFilter.author ?? ''}
             yearFromFilter={metaFilter.year_from ?? null}
             yearToFilter={metaFilter.year_to ?? null}
             onChangeWorkCategory={handleWorkCategoryChange}
+            onToggleStatementsOnly={handleToggleStatementsOnly}
             onChangeContentMetaFilters={(patch) => applySidebarFilter(patch)}
             onClearContentFilters={clearSidebarFilters}
             llmProvider={settings?.llm_provider ?? 'disabled'}
@@ -2263,11 +2565,14 @@
           />
         {/if}
       </section>
+      {/if}
 
       <section class="center-pane">
         <ViewerTabs
           {tabs}
           {activeTabId}
+          {splitTabId}
+          {zenMode}
           llmProvider={settings?.llm_provider ?? 'disabled'}
           onSelectTab={(id) => (activeTabId = id)}
           onCloseTab={(id) => {
@@ -2275,7 +2580,15 @@
             if (activeTabId === id) {
               activeTabId = tabs[0]?.tabId ?? null;
             }
+            if (splitTabId === id || tabs.length < 2) {
+              splitTabId = null;
+            }
+            if (tabs.length === 0 && zenMode) {
+              handleToggleZenMode();
+            }
           }}
+          onSetSplitTab={(id) => (splitTabId = id)}
+          onToggleZen={handleToggleZenMode}
           onSelectMatchIndex={handleSelectMatchIndex}
           onOpenExternal={(fid, page) => api.openFileExternal(fid, page, null)}
           onConsentAccepted={(prov) => {
@@ -2285,11 +2598,12 @@
               else if (prov === 'gemini') settings = { ...settings, llm_consent_gemini: true };
             }
           }}
+          onAnnotationsChanged={refreshAnnotationsCount}
           onStatusMessage={(msg) => (scanStatusText = msg)}
         />
       </section>
 
-      {#if inspectorOpen}
+      {#if !zenMode && inspectorOpen}
         <section class="inspector-pane">
           <RightInspector
             bind:this={inspectorRef}
@@ -2341,6 +2655,7 @@
     <ContextMenu
       target={contextTarget}
       {presets}
+      {collections}
       onClose={() => (contextTarget = null)}
       onOpenInternal={(fid, page) => {
         const doc = catalogStats.byFileId.get(fid);
@@ -2352,10 +2667,116 @@
         requestSelectDocument(docId);
       }}
       onCopyBibtex={(docId) => handleCopyBibtex(docId)}
+      onToggleCollection={(colId, docId, currentlyIn) => {
+        if (currentlyIn) {
+          void handleRemoveDocFromCollection(colId, docId);
+        } else {
+          void handleAddDocToCollection(colId, docId);
+        }
+      }}
       onRunOcr={(fid) => handleRunOcrForFile(fid)}
       onRevealInFolder={(fid) => api.revealFileInFolder(fid)}
       onCopyPath={handleCopyPath}
     />
+
+    <CommandPalette
+      open={commandPaletteOpen}
+      {lang}
+      documents={allDocuments}
+      {collections}
+      {savedSearches}
+      actions={paletteActions}
+      onOpenDocument={(doc) => {
+        requestSelectDocument(doc.document_id, () => {
+          openInViewer(doc.file_id, doc.title, doc.format, 1);
+        });
+      }}
+      onSelectCollection={(colId) => void applySidebarFilter({ collection_id: colId })}
+      onApplySavedSearch={(sv) => void handleApplySavedSearch(sv)}
+      onClose={() => (commandPaletteOpen = false)}
+    />
+
+    <SuggestedClassicsModal
+      open={classicsModalOpen}
+      {lang}
+      onSelectLibraryDoc={(docId) => {
+        inspectorOpen = true;
+        requestSelectDocument(docId);
+      }}
+      onStatusMessage={(msg) => (scanStatusText = msg)}
+      onClose={() => (classicsModalOpen = false)}
+    />
+
+    {#if collectionBibModal}
+      <div
+        class="consent-backdrop"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Sincronizzazione .bib collezione"
+      >
+        <div class="consent-dialog">
+          <h3>
+            {lang === 'en'
+              ? `Dedicated .bib file — ${collectionBibModal.name}`
+              : `File .bib dedicato — ${collectionBibModal.name}`}
+          </h3>
+          <p>
+            {lang === 'en'
+              ? 'Papero keeps this external .bib file automatically synced whenever you add/remove documents from this collection or edit their metadata (strictly outside source folders).'
+              : 'Papero mantiene sincronizzato automaticamente questo file .bib esterno ogni volta che aggiungi/rimuovi documenti da questa collezione o modifichi i loro metadati (sempre fuori dalle cartelle sorgente).'}
+          </p>
+          {#if collectionBibModal.bib_sync_enabled && collectionBibModal.bib_sync_path}
+            <p class="consent-excl" style="word-break: break-all;">
+              {collectionBibModal.bib_sync_path}
+            </p>
+          {:else}
+            <p class="consent-note">
+              {lang === 'en'
+                ? 'No .bib file linked to this collection yet.'
+                : 'Nessun file .bib ancora associato a questa collezione.'}
+            </p>
+          {/if}
+          {#if collectionBibErr}
+            <div class="consent-warn">{collectionBibErr}</div>
+          {/if}
+          <div class="consent-actions">
+            {#if collectionBibModal.bib_sync_enabled && collectionBibModal.bib_sync_path}
+              <button
+                type="button"
+                disabled={collectionBibBusy}
+                onclick={handleUnlinkCollectionBib}
+              >
+                {lang === 'en' ? 'Unlink' : 'Scollega'}
+              </button>
+              <button
+                type="button"
+                disabled={collectionBibBusy}
+                onclick={() => collectionBibModal && handleSyncCollectionBibNow(collectionBibModal)}
+              >
+                {lang === 'en' ? 'Sync now' : 'Sincronizza ora'}
+              </button>
+            {/if}
+            <button
+              type="button"
+              class="primary"
+              disabled={collectionBibBusy}
+              onclick={handleChooseCollectionBibPath}
+            >
+              {collectionBibModal.bib_sync_path
+                ? lang === 'en'
+                  ? 'Change .bib file…'
+                  : 'Cambia file .bib…'
+                : lang === 'en'
+                  ? 'Create / Choose .bib file…'
+                  : 'Crea / Scegli file .bib…'}
+            </button>
+            <button type="button" onclick={() => (collectionBibModal = null)}>
+              {tr(lang, 'close')}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
 
     {#if settings}
       <FirstRunWizard
@@ -2409,6 +2830,8 @@
           settingsInitialTab = null;
           wizardOpen = true;
         }}
+        {updateInfo}
+        onUpdateInfoChange={(info) => (updateInfo = info)}
         onClose={() => {
           settingsOpen = false;
           settingsInitialTab = null;
@@ -2539,6 +2962,9 @@
   }
   .main-split.with-inspector {
     grid-template-columns: minmax(290px, 30%) 1fr minmax(300px, 340px);
+  }
+  .main-split.zen-mode {
+    grid-template-columns: 1fr;
   }
   .left-pane {
     border-right: 1px solid var(--border);

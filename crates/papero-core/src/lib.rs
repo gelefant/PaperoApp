@@ -10,6 +10,7 @@ pub mod extract;
 pub mod fs;
 pub mod index;
 pub mod llm;
+pub mod maintenance;
 pub mod metadata;
 pub mod ml;
 pub mod text_norm;

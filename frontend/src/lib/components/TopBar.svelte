@@ -35,11 +35,16 @@
     mlDownloadProgress: DownloadProgressEvent | null;
     presets: ExternalReaderPreset[];
     inspectorOpen: boolean;
+    notesScopeActive?: boolean;
+    hasNotes?: boolean;
+    updateAvailableVersion?: string | null;
     onSearch: (q: string) => void;
     onClearSearch: () => void;
     onSearchModeChange: (mode: 'content' | 'metadata') => void;
     onMetaFilterChange: (next: MetadataSearchFilter) => void;
     onWorkCategoryChange?: (cat: WorkCategory) => void;
+    onToggleNotesScope?: (active: boolean) => void;
+    onOpenClassics?: () => void;
     onVerifiedFilterChange?: (vf: VerifiedFilter) => void;
     onSortByChange?: (sortBy: SortField) => void;
     onToggleSortDir?: () => void;
@@ -80,11 +85,16 @@
     mlDownloadProgress,
     presets,
     inspectorOpen,
+    notesScopeActive = false,
+    hasNotes = false,
+    updateAvailableVersion = null,
     onSearch,
     onClearSearch,
     onSearchModeChange,
     onMetaFilterChange,
     onWorkCategoryChange,
+    onToggleNotesScope,
+    onOpenClassics,
     onVerifiedFilterChange,
     onSortByChange,
     onToggleSortDir,
@@ -253,32 +263,45 @@
     </select>
     <select
       class="search-scope-select"
-      class:filtered={effectiveWorkCat !== 'all'}
-      aria-label={lang === 'en' ? 'Filter by Paper or Book' : 'Filtra tra Paper e Libri'}
+      class:filtered={notesScopeActive || effectiveWorkCat !== 'all'}
+      aria-label={lang === 'en' ? 'Filter scope' : 'Ambito ricerca'}
       title={lang === 'en'
-        ? 'Contextual filter: All, Papers only, or Books only'
-        : 'Ambito ricerca: Tutti, solo Paper o solo Libri'}
-      value={effectiveWorkCat}
+        ? 'Contextual scope: All, Papers, Books' + (hasNotes ? ', or Notes' : '')
+        : 'Ambito ricerca: Tutti, solo Paper, solo Libri' + (hasNotes ? ' o solo Note' : '')}
+      value={notesScopeActive && hasNotes ? 'notes' : effectiveWorkCat}
       onchange={(e) => {
-        const val = (e.currentTarget as HTMLSelectElement).value as WorkCategory;
-        if (onWorkCategoryChange) onWorkCategoryChange(val);
-        else onMetaFilterChange({ ...metaFilter, work_category: val });
+        const raw = (e.currentTarget as HTMLSelectElement).value;
+        if (raw === 'notes') {
+          onToggleNotesScope?.(true);
+        } else {
+          if (notesScopeActive) onToggleNotesScope?.(false);
+          const val = raw as WorkCategory;
+          if (onWorkCategoryChange) onWorkCategoryChange(val);
+          else onMetaFilterChange({ ...metaFilter, work_category: val });
+        }
       }}
     >
       <option value="all">{tr(lang, 'filterAll')}</option>
       <option value="paper">{tr(lang, 'filterPapers')}</option>
       <option value="book">{tr(lang, 'filterBooks')}</option>
+      {#if hasNotes}
+        <option value="notes">{tr(lang, 'filterNotes')}</option>
+      {/if}
     </select>
     <input
       class="search-input"
       bind:this={searchInputEl}
       type="search"
-      placeholder={searchMode === 'content'
-        ? tr(lang, 'searchContentPlaceholder')
-        : tr(lang, 'searchMetadataPlaceholder')}
+      placeholder={notesScopeActive
+        ? lang === 'en'
+          ? 'Search your personal notes, highlights & bookmarks…'
+          : 'Cerca nelle tue note, evidenziazioni e segnalibri…'
+        : searchMode === 'content'
+          ? tr(lang, 'searchContentPlaceholder')
+          : tr(lang, 'searchMetadataPlaceholder')}
       bind:value={query}
       oninput={() => {
-        if (searchMode === 'metadata') scheduleMetadataSearch(query);
+        if (notesScopeActive || searchMode === 'metadata') scheduleMetadataSearch(query);
       }}
     />
     {#if query.trim()}
@@ -565,10 +588,34 @@
         </svg>
       </button>
 
+      {#if onOpenClassics}
+        <button
+          type="button"
+          class="icon-btn tip-end"
+          data-tip={lang === 'en'
+            ? 'Suggested Classics (most-cited missing papers & books)'
+            : 'Classici suggeriti (paper e libri più citati che mancano)'}
+          aria-label={tr(lang, 'suggestedClassicsTitle')}
+          onclick={onOpenClassics}
+        >
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+            <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+            <path d="m12 6.5 1 2.2 2.2 1-2.2 1-1 2.2-1-2.2-2.2-1 2.2-1z" />
+          </svg>
+        </button>
+      {/if}
+
       <button
         type="button"
         class="icon-btn tip-end"
-        data-tip={lang === 'en' ? 'Settings (⌘,)' : 'Impostazioni (⌘,)'}
+        data-tip={updateAvailableVersion
+          ? lang === 'en'
+            ? `Settings (⌘,) · Update v${updateAvailableVersion} available`
+            : `Impostazioni (⌘,) · Aggiornamento v${updateAvailableVersion} disponibile`
+          : lang === 'en'
+            ? 'Settings (⌘,)'
+            : 'Impostazioni (⌘,)'}
         aria-label={tr(lang, 'settings')}
         onclick={() => (onOpenSettings ? onOpenSettings() : (showSettingsPopover = !showSettingsPopover))}
       >
@@ -576,6 +623,9 @@
           <circle cx="12" cy="12" r="3" />
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
         </svg>
+        {#if updateAvailableVersion}
+          <span class="update-dot" aria-hidden="true"></span>
+        {/if}
       </button>
     </div>
   </div>
@@ -1541,5 +1591,15 @@
   .ml-error {
     color: #c62828;
     font-size: 12px;
+  }
+  .update-dot {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: #16a34a;
+    box-shadow: 0 0 0 1.5px var(--bg-panel);
   }
 </style>

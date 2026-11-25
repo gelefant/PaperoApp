@@ -8,6 +8,10 @@ pub struct CollectionView {
     pub name: String,
     pub color_hex: Option<String>,
     pub sort_order: i64,
+    #[serde(default)]
+    pub bib_sync_path: Option<String>,
+    #[serde(default)]
+    pub bib_sync_enabled: bool,
     pub document_count: usize,
     pub document_ids: Vec<i64>,
 }
@@ -25,7 +29,7 @@ pub struct SavedSearchView {
 
 pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionView>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, color_hex, sort_order
+        "SELECT id, name, color_hex, sort_order, bib_sync_path, bib_sync_enabled
          FROM collections
          ORDER BY sort_order ASC, id ASC",
     )?;
@@ -35,6 +39,8 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionView>> {
             name: r.get(1)?,
             color_hex: r.get(2)?,
             sort_order: r.get(3)?,
+            bib_sync_path: r.get(4)?,
+            bib_sync_enabled: r.get::<_, i64>(5).unwrap_or(0) != 0,
             document_count: 0,
             document_ids: Vec::new(),
         })
@@ -95,9 +101,51 @@ pub fn create_collection(
         name: trimmed.to_string(),
         color_hex: color_hex.map(ToOwned::to_owned),
         sort_order: next_order,
+        bib_sync_path: None,
+        bib_sync_enabled: false,
         document_count: 0,
         document_ids: Vec::new(),
     })
+}
+
+pub fn set_collection_bib_sync(
+    conn: &Connection,
+    collection_id: i64,
+    bib_sync_path: Option<&str>,
+    bib_sync_enabled: bool,
+) -> Result<CollectionView> {
+    let clean_path = bib_sync_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let enabled_flag = bib_sync_enabled && clean_path.is_some();
+    let now = chrono::Utc::now().timestamp();
+    let updated = conn.execute(
+        "UPDATE collections
+         SET bib_sync_path = ?1, bib_sync_enabled = ?2, updated_at = ?3
+         WHERE id = ?4",
+        params![clean_path, enabled_flag as i64, now, collection_id],
+    )?;
+    if updated == 0 {
+        return Err(CoreError::NotFound(format!("collection {collection_id}")));
+    }
+    list_collections(conn)?
+        .into_iter()
+        .find(|c| c.id == collection_id)
+        .ok_or_else(|| CoreError::NotFound(format!("collection {collection_id}")))
+}
+
+pub fn list_bib_synced_collections(conn: &Connection) -> Result<Vec<CollectionView>> {
+    Ok(list_collections(conn)?
+        .into_iter()
+        .filter(|c| {
+            c.bib_sync_enabled
+                && c.bib_sync_path
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+        })
+        .collect())
 }
 
 pub fn rename_collection(conn: &Connection, collection_id: i64, name: &str) -> Result<()> {
@@ -299,6 +347,15 @@ mod tests {
 
         assert_eq!(remove_documents_from_collection(&w, c1.id, &[d2]).unwrap(), 1);
         assert_eq!(list_collections(&w).unwrap()[1].document_count, 1);
+
+        let synced = set_collection_bib_sync(&w, c1.id, Some("/tmp/paper_x.bib"), true).unwrap();
+        assert!(synced.bib_sync_enabled);
+        assert_eq!(synced.bib_sync_path.as_deref(), Some("/tmp/paper_x.bib"));
+        assert_eq!(list_bib_synced_collections(&w).unwrap().len(), 1);
+
+        let unsynced = set_collection_bib_sync(&w, c1.id, None, false).unwrap();
+        assert!(!unsynced.bib_sync_enabled);
+        assert!(list_bib_synced_collections(&w).unwrap().is_empty());
 
         let ss = create_saved_search(&w, "PDE 2020+", "metadata", "", r#"{"year_from":2020}"#).unwrap();
         assert_eq!(list_saved_searches(&w).unwrap().len(), 1);

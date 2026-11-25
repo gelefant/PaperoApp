@@ -316,12 +316,14 @@ CREATE INDEX IF NOT EXISTS idx_file_reading_state_opened ON file_reading_state(l
 
 -- 17. User collections ("Projects / Reading Lists")
 CREATE TABLE IF NOT EXISTS collections (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL,
-    color_hex   TEXT,
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    name             TEXT NOT NULL,
+    color_hex        TEXT,
+    sort_order       INTEGER NOT NULL DEFAULT 0,
+    bib_sync_path    TEXT,
+    bib_sync_enabled INTEGER NOT NULL DEFAULT 0,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS collection_documents (
     collection_id   INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,

@@ -313,7 +313,14 @@ pub fn toggle_page_bookmark(
     Ok(Some(created))
 }
 
+/// Returns the total count of persisted annotations (highlights, bookmarks, notes).
+pub fn count_total_annotations(conn: &Connection) -> Result<usize> {
+    let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM file_annotations", [], |r| r.get(0))?;
+    Ok(cnt.max(0) as usize)
+}
+
 /// Accent/diacritic-tolerant search over highlights, bookmarks, and Markdown/LaTeX notes.
+/// When `query` is empty, returns the most recently updated annotations (up to 200).
 pub fn search_annotations(
     conn: &Connection,
     query: &str,
@@ -324,9 +331,6 @@ pub fn search_annotations(
         .split_whitespace()
         .filter(|t| !t.is_empty())
         .collect();
-    if tokens.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let hash_filter = match file_id {
         Some(fid) => Some(lookup_file_hash(conn, fid)?),
@@ -361,9 +365,15 @@ pub fn search_annotations(
 
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
-        let search_norm: String = r.get(10)?;
-        if !tokens.iter().all(|t| search_norm.contains(t)) {
-            continue;
+        if !tokens.is_empty() {
+            let search_norm: String = r.get(10)?;
+            let doc_title_norm = normalize_math_text(r.get_ref(13)?.as_str().unwrap_or(""));
+            if !tokens
+                .iter()
+                .all(|t| search_norm.contains(t) || doc_title_norm.contains(t))
+            {
+                continue;
+            }
         }
         let ann = row_to_annotation(r)?;
         out.push(AnnotationSearchHit {
@@ -372,6 +382,9 @@ pub fn search_annotations(
             file_id: r.get(12)?,
             doc_title: r.get(13)?,
         });
+        if out.len() >= 200 {
+            break;
+        }
     }
     Ok(out)
 }

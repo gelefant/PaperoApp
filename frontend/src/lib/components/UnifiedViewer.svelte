@@ -95,6 +95,8 @@
     width: number;
     height: number;
     onInternalLink: (dest: unknown) => void;
+    onInternalLinkHover: (dest: unknown, anchorRect: DOMRect) => void;
+    onInternalLinkLeave: () => void;
   }
 
   function pdfPageAction(surfaceEl: HTMLDivElement, initial: PdfPageParams) {
@@ -231,7 +233,14 @@
               btn.addEventListener('click', (ev) => {
                 ev.preventDefault();
                 ev.stopPropagation();
+                current.onInternalLinkLeave();
                 current.onInternalLink(lnk.dest);
+              });
+              btn.addEventListener('mouseenter', () => {
+                current.onInternalLinkHover(lnk.dest, btn.getBoundingClientRect());
+              });
+              btn.addEventListener('mouseleave', () => {
+                current.onInternalLinkLeave();
               });
               linkDiv.appendChild(btn);
             }
@@ -314,6 +323,7 @@
     onSelectMatchIndex?: (idx: number) => void;
     onOpenExternal?: (fileId: number, pageOrd: number) => void;
     onConsentAccepted?: (provider: LlmProvider) => void;
+    onAnnotationsChanged?: () => void;
     onStatusMessage?: (msg: string) => void;
   }
 
@@ -328,6 +338,7 @@
     onSelectMatchIndex,
     onOpenExternal,
     onConsentAccepted,
+    onAnnotationsChanged,
     onStatusMessage,
   }: Props = $props();
 
@@ -372,6 +383,23 @@
     noteDraft: string;
     noteColor: 'yellow' | 'green' | 'blue' | 'pink';
   } | null>(null);
+
+  // Hover micro-preview for internal PDF links (\ref, \cite, equations, TOC)
+  let linkPreview = $state<{
+    pageOrd: number;
+    printedLabel: string | null;
+    dest: unknown;
+    imageUrl: string | null;
+    loading: boolean;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
+  let linkHoverShowTimer: ReturnType<typeof setTimeout> | null = null;
+  let linkHoverHideTimer: ReturnType<typeof setTimeout> | null = null;
+  let linkPreviewSeq = 0;
+  const linkPreviewCache = new Map<string, { url: string; w: number; h: number }>();
 
   // Ask this document slide-over (visible ONLY when llmProvider !== 'disabled')
   let askOpen = $state(false);
@@ -678,6 +706,8 @@
 
   function handleViewportScroll() {
     selectionPopover = null;
+    clearLinkPreviewTimers();
+    linkPreview = null;
     if (scrollRafId !== null) return;
     scrollRafId = requestAnimationFrame(() => {
       scrollRafId = null;
@@ -752,11 +782,24 @@
     void scrollToPage(target);
   }
 
-  async function handleInternalPdfLink(dest: unknown) {
-    if (!pdfDoc) return;
+  function clearLinkPreviewTimers() {
+    if (linkHoverShowTimer) {
+      clearTimeout(linkHoverShowTimer);
+      linkHoverShowTimer = null;
+    }
+    if (linkHoverHideTimer) {
+      clearTimeout(linkHoverHideTimer);
+      linkHoverHideTimer = null;
+    }
+  }
+
+  async function resolvePdfDestination(
+    dest: unknown
+  ): Promise<{ pageOrd: number; pdfTopY: number | null } | null> {
+    if (!pdfDoc) return null;
     try {
       const resolved = typeof dest === 'string' ? await pdfDoc.getDestination(dest) : dest;
-      if (!Array.isArray(resolved) || resolved.length === 0) return;
+      if (!Array.isArray(resolved) || resolved.length === 0) return null;
       const ref = resolved[0];
       let pageIndex: number | null = null;
       if (typeof ref === 'number') {
@@ -764,11 +807,195 @@
       } else if (ref && typeof ref === 'object') {
         pageIndex = await pdfDoc.getPageIndex(ref as Parameters<PDFDocumentProxy['getPageIndex']>[0]);
       }
-      if (pageIndex !== null && pageIndex >= 0) {
-        jumpToPage(pageIndex + 1, [], true);
+      if (pageIndex === null || pageIndex < 0) return null;
+      const fitObj = resolved[1] as { name?: string } | string | undefined;
+      const fitName = typeof fitObj === 'string' ? fitObj : fitObj?.name ?? '';
+      let pdfTopY: number | null = null;
+      if (fitName === 'XYZ' && typeof resolved[3] === 'number' && Number.isFinite(resolved[3])) {
+        pdfTopY = resolved[3];
+      } else if (
+        (fitName === 'FitH' || fitName === 'FitBH') &&
+        typeof resolved[2] === 'number' &&
+        Number.isFinite(resolved[2])
+      ) {
+        pdfTopY = resolved[2];
+      } else if (
+        fitName === 'FitR' &&
+        typeof resolved[5] === 'number' &&
+        Number.isFinite(resolved[5])
+      ) {
+        pdfTopY = resolved[5];
       }
+      return { pageOrd: pageIndex + 1, pdfTopY };
     } catch {
-      // Ignore unresolvable PDF destination
+      return null;
+    }
+  }
+
+  async function handleInternalPdfLink(dest: unknown) {
+    const resolved = await resolvePdfDestination(dest);
+    if (!resolved) return;
+    let targetRects: NormalizedRect[] = [];
+    if (resolved.pdfTopY !== null && pdfDoc) {
+      try {
+        const page = await pdfDoc.getPage(resolved.pageOrd);
+        const vp = page.getViewport({ scale: 1, rotation: (page.rotate + rotationDeg) % 360 });
+        const [, vy] = vp.convertToViewportPoint(0, resolved.pdfTopY);
+        const fracY = Math.max(0, Math.min(0.95, vy / Math.max(1, vp.height)));
+        targetRects = [{ x: 0.05, y: fracY, w: 0.9, h: 0.05 }];
+      } catch {
+        // Fallback to top of destination page
+      }
+    }
+    jumpToPage(resolved.pageOrd, targetRects, true);
+  }
+
+  function handleInternalLinkLeave() {
+    if (linkHoverShowTimer) {
+      clearTimeout(linkHoverShowTimer);
+      linkHoverShowTimer = null;
+    }
+    if (linkHoverHideTimer) clearTimeout(linkHoverHideTimer);
+    linkHoverHideTimer = setTimeout(() => {
+      linkHoverHideTimer = null;
+      linkPreview = null;
+      linkPreviewSeq++;
+    }, 180);
+  }
+
+  function cancelLinkPreviewHide() {
+    if (linkHoverHideTimer) {
+      clearTimeout(linkHoverHideTimer);
+      linkHoverHideTimer = null;
+    }
+  }
+
+  function handleInternalLinkHover(dest: unknown, anchorRect: DOMRect) {
+    if (!pdfDoc || !shellEl || destroyed) return;
+    cancelLinkPreviewHide();
+    if (linkHoverShowTimer) clearTimeout(linkHoverShowTimer);
+    const activeDoc = pdfDoc;
+    const activeFid = fileId;
+    const activeRot = rotationDeg;
+    linkHoverShowTimer = setTimeout(() => {
+      linkHoverShowTimer = null;
+      void showInternalLinkPreview(activeDoc, activeFid, activeRot, dest, anchorRect);
+    }, 220);
+  }
+
+  async function showInternalLinkPreview(
+    doc: PDFDocumentProxy,
+    activeFid: number,
+    activeRot: number,
+    dest: unknown,
+    anchorRect: DOMRect
+  ) {
+    const seq = ++linkPreviewSeq;
+    const resolved = await resolvePdfDestination(dest);
+    if (!resolved || destroyed || seq !== linkPreviewSeq || pdfDoc !== doc || !shellEl) return;
+
+    const previewW = 460;
+    const previewH = 205;
+    const shellRect = shellEl.getBoundingClientRect();
+    const x = Math.max(
+      12,
+      Math.min(shellRect.width - previewW - 14, anchorRect.left - shellRect.left - 24)
+    );
+    const spaceBelow = shellRect.bottom - anchorRect.bottom;
+    const y =
+      spaceBelow >= previewH + 46
+        ? anchorRect.bottom - shellRect.top + 8
+        : Math.max(44, anchorRect.top - shellRect.top - previewH - 36);
+
+    const printedLabel =
+      info?.pages.find((p) => p.page_ord === resolved.pageOrd)?.printed_label ?? null;
+    const yBucket = resolved.pdfTopY !== null ? Math.round(resolved.pdfTopY / 4) * 4 : 'top';
+    const cacheKey = `${activeFid}:${resolved.pageOrd}:${yBucket}:${activeRot}`;
+    const cached = linkPreviewCache.get(cacheKey);
+    if (cached) {
+      linkPreview = {
+        pageOrd: resolved.pageOrd,
+        printedLabel,
+        dest,
+        imageUrl: cached.url,
+        loading: false,
+        x,
+        y,
+        width: cached.w,
+        height: cached.h,
+      };
+      return;
+    }
+
+    linkPreview = {
+      pageOrd: resolved.pageOrd,
+      printedLabel,
+      dest,
+      imageUrl: null,
+      loading: true,
+      x,
+      y,
+      width: previewW,
+      height: previewH,
+    };
+
+    try {
+      const page = await doc.getPage(resolved.pageOrd);
+      if (destroyed || seq !== linkPreviewSeq || pdfDoc !== doc) return;
+      const effRot = (page.rotate + activeRot) % 360;
+      const baseVp = page.getViewport({ scale: 1, rotation: effRot });
+      const targetScale = Math.max(0.7, Math.min(1.6, previewW / Math.max(1, baseVp.width)));
+      const vp = page.getViewport({ scale: targetScale, rotation: effRot });
+
+      let cropTopCss = 0;
+      if (resolved.pdfTopY !== null) {
+        const [, vy] = vp.convertToViewportPoint(0, resolved.pdfTopY);
+        // Position destination slightly below top edge so theorem/equation header has breathing room
+        cropTopCss = Math.max(0, Math.min(Math.max(0, vp.height - previewH), vy - 24));
+      }
+      const cssW = Math.min(previewW, Math.round(vp.width));
+      const cssH = Math.min(previewH, Math.max(80, Math.round(vp.height - cropTopCss)));
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+
+      const off = document.createElement('canvas');
+      off.width = Math.max(1, Math.floor(cssW * dpr));
+      off.height = Math.max(1, Math.floor(cssH * dpr));
+      const ctx = off.getContext('2d');
+      if (!ctx) return;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, off.width, off.height);
+
+      const task = page.render({
+        canvasContext: ctx,
+        viewport: vp,
+        transform: [dpr, 0, 0, dpr, 0, -cropTopCss * dpr],
+      });
+      await task.promise;
+      if (destroyed || seq !== linkPreviewSeq || pdfDoc !== doc) return;
+
+      const url = off.toDataURL('image/png');
+      off.width = 0;
+      off.height = 0;
+      if (linkPreviewCache.size >= 12) {
+        const oldest = linkPreviewCache.keys().next().value;
+        if (oldest) linkPreviewCache.delete(oldest);
+      }
+      linkPreviewCache.set(cacheKey, { url, w: cssW, h: cssH });
+      linkPreview = {
+        pageOrd: resolved.pageOrd,
+        printedLabel,
+        dest,
+        imageUrl: url,
+        loading: false,
+        x,
+        y,
+        width: cssW,
+        height: cssH,
+      };
+    } catch {
+      if (!destroyed && seq === linkPreviewSeq) {
+        linkPreview = null;
+      }
     }
   }
 
@@ -794,6 +1021,7 @@
     try {
       await api.togglePageBookmark(fileId, currentPage, null);
       await refreshAnnotations(fileId);
+      onAnnotationsChanged?.();
     } catch (e) {
       onStatusMessage?.(`Errore segnalibro: ${String(e)}`);
     }
@@ -875,6 +1103,7 @@
       selectionPopover = null;
       window.getSelection()?.removeAllRanges();
       await refreshAnnotations(fileId);
+      onAnnotationsChanged?.();
       if (kind === 'note') {
         sidebarMode = 'annotations';
       }
@@ -903,6 +1132,7 @@
   async function handleDeleteAnnotation(id: number) {
     await api.deleteFileAnnotation(id);
     await refreshAnnotations(fileId);
+    onAnnotationsChanged?.();
   }
 
   async function handleExportAnnotationsMarkdown() {
@@ -933,6 +1163,9 @@
     jumpBackStack = [];
     jumpForwardStack = [];
     selectionPopover = null;
+    clearLinkPreviewTimers();
+    linkPreview = null;
+    linkPreviewCache.clear();
     readingStateInitialized = false;
     loading = true;
     loadError = null;
@@ -1432,6 +1665,8 @@
       clearTimeout(readingStateSaveTimer);
       readingStateSaveTimer = null;
     }
+    clearLinkPreviewTimers();
+    linkPreviewCache.clear();
     resizeObserver?.disconnect();
     pdfSearchItemsCache.clear();
     revokeAllDjvuUrls();
@@ -1821,6 +2056,58 @@
     </form>
   {/if}
 
+  <!-- Floating hover preview popover for internal PDF links (\ref, \cite, equations, TOC) -->
+  {#if linkPreview}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="link-preview-popover mode-{colorMode}"
+      style="left: {linkPreview.x}px; top: {linkPreview.y}px; width: {linkPreview.width + 12}px;"
+      onmouseenter={cancelLinkPreviewHide}
+      onmouseleave={handleInternalLinkLeave}
+    >
+      <div class="lp-head">
+        <span>
+          Anteprima p. {linkPreview.printedLabel ?? linkPreview.pageOrd}
+        </span>
+        <button
+          type="button"
+          class="lp-jump-btn"
+          onclick={() => {
+            const d = linkPreview?.dest;
+            clearLinkPreviewTimers();
+            linkPreview = null;
+            if (d !== undefined) void handleInternalPdfLink(d);
+          }}
+        >
+          Vai alla pagina ↗
+        </button>
+      </div>
+      <div class="lp-body" style="height: {linkPreview.height}px;">
+        {#if linkPreview.imageUrl}
+          <button
+            type="button"
+            class="lp-img-btn"
+            onclick={() => {
+              const d = linkPreview?.dest;
+              clearLinkPreviewTimers();
+              linkPreview = null;
+              if (d !== undefined) void handleInternalPdfLink(d);
+            }}
+          >
+            <img
+              src={linkPreview.imageUrl}
+              alt={`Anteprima pagina ${linkPreview.pageOrd}`}
+              class="lp-img"
+              style="width: {linkPreview.width}px; height: {linkPreview.height}px;"
+            />
+          </button>
+        {:else}
+          <div class="lp-loading">Caricamento anteprima…</div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   <!-- Floating disappearing Selection Popover for non-destructive highlights, notes & Ask -->
   {#if selectionPopover}
     <div
@@ -2010,6 +2297,8 @@
                     width: slot.width,
                     height: slot.height,
                     onInternalLink: handleInternalPdfLink,
+                    onInternalLinkHover: handleInternalLinkHover,
+                    onInternalLinkLeave: handleInternalLinkLeave,
                   }}
                 >
                   <canvas class="pdf-canvas page-media"></canvas>
@@ -2524,5 +2813,74 @@
   }
   .center-msg.error {
     color: var(--danger);
+  }
+  .link-preview-popover {
+    position: absolute;
+    z-index: 36;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+    overflow: hidden;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    pointer-events: auto;
+  }
+  .lp-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    padding: 0 3px;
+  }
+  .lp-jump-btn {
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 4px;
+    cursor: pointer;
+  }
+  .lp-jump-btn:hover {
+    text-decoration: underline;
+  }
+  .lp-body {
+    overflow: hidden;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .lp-img-btn {
+    border: none;
+    background: transparent;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    display: block;
+    line-height: 0;
+  }
+  .lp-img {
+    display: block;
+    object-fit: cover;
+    object-position: top left;
+  }
+  .link-preview-popover.mode-sepia .lp-img {
+    filter: sepia(0.32) contrast(0.96) brightness(0.96);
+  }
+  .link-preview-popover.mode-night .lp-img {
+    filter: invert(0.9) hue-rotate(180deg) contrast(0.94);
+  }
+  .lp-loading {
+    font-size: 11px;
+    color: #64748b;
   }
 </style>

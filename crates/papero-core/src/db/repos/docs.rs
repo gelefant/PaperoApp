@@ -571,6 +571,10 @@ pub struct ContentSearchPassageHit {
     pub bboxes: Vec<NormalizedRect>,
     #[serde(default)]
     pub is_alt_formula: bool,
+    #[serde(default)]
+    pub statement_label: Option<String>,
+    #[serde(default)]
+    pub statement_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -918,6 +922,7 @@ pub fn hydrate_bm25_results_filtered(
         if score > entry.max_score {
             entry.max_score = score;
         }
+        let detected_stmt = crate::extract::statements::detect_math_statement(&text_content);
         entry.passages.push(ContentSearchPassageHit {
             passage_id: pid,
             file_id,
@@ -927,6 +932,8 @@ pub fn hydrate_bm25_results_filtered(
             text_content,
             bboxes: unpack_bboxes(&blob),
             is_alt_formula,
+            statement_label: detected_stmt.as_ref().map(|s| s.label.clone()),
+            statement_kind: detected_stmt.map(|s| s.kind.to_string()),
         });
     }
 

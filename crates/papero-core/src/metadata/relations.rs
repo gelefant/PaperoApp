@@ -3,6 +3,7 @@ use crate::index::vector::VectorIndex;
 use crate::metadata::extract::extract_doi_from_text;
 use crate::metadata::models::{normalize_arxiv_base_id, normalize_doi, normalize_mr_digits};
 use crate::ml::embedder::l2_normalize;
+use crate::text_norm::normalize_math_text;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -821,6 +822,526 @@ fn hydrate_brief_docs(
     Ok(out)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingClassicCiter {
+    pub document_id: i64,
+    pub title: String,
+    pub year: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingClassicItem {
+    pub title: String,
+    pub authors: String,
+    pub year: Option<i64>,
+    pub venue: Option<String>,
+    /// `"paper"` | `"book"`
+    pub work_category: String,
+    pub doi: Option<String>,
+    pub arxiv_id: Option<String>,
+    pub isbn: Option<String>,
+    pub cited_by_count: usize,
+    pub citing_docs: Vec<MissingClassicCiter>,
+}
+
+#[derive(Default)]
+struct MissingRefAgg {
+    title: String,
+    authors: String,
+    year: Option<i64>,
+    venue: Option<String>,
+    is_book_votes: usize,
+    is_paper_votes: usize,
+    doi: Option<String>,
+    arxiv_id: Option<String>,
+    isbn: Option<String>,
+    citers: HashSet<i64>,
+}
+
+fn looks_like_book_reference(
+    has_isbn: bool,
+    has_article_title: bool,
+    volume_title: Option<&str>,
+    journal_title: Option<&str>,
+    venue: Option<&str>,
+    title: &str,
+) -> bool {
+    if has_isbn {
+        return true;
+    }
+    if !has_article_title && volume_title.is_some_and(|s| !s.trim().is_empty()) && journal_title.is_none() {
+        return true;
+    }
+    let combined = format!(
+        "{} {}",
+        title.to_ascii_lowercase(),
+        venue.unwrap_or("").to_ascii_lowercase()
+    );
+    const BOOK_MARKERS: &[&str] = &[
+        "graduate texts in mathematics",
+        "lecture notes in mathematics",
+        "grundlehren der mathematischen",
+        "cambridge university press",
+        "oxford university press",
+        "princeton university press",
+        "american mathematical society",
+        "springer-verlag",
+        "springer verlag",
+        "academic press",
+        "birkhäuser",
+        "birkhauser",
+        "wiley",
+        "addison-wesley",
+        "mcgraw-hill",
+        "chelsea publishing",
+        "dover publications",
+        "monograph",
+        "textbook",
+        "2nd ed",
+        "3rd ed",
+        "second edition",
+        "third edition",
+    ];
+    BOOK_MARKERS.iter().any(|m| combined.contains(m))
+}
+
+fn clean_ref_title(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ").trim_matches(['.', ',', ';', '"', '\'']).to_string()
+}
+
+fn extract_year_from_str(raw: &str) -> Option<i64> {
+    let bytes = raw.as_bytes();
+    for win in bytes.windows(4) {
+        if win.iter().all(|b| b.is_ascii_digit()) {
+            if let Ok(s) = std::str::from_utf8(win) {
+                if let Ok(y) = s.parse::<i64>() {
+                    if (1700..=2100).contains(&y) {
+                        return Some(y);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_isbn_digits(raw: &str) -> Option<String> {
+    let digits: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == 'X' || *c == 'x')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if digits.len() == 10 || digits.len() == 13 {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+/// Aggregates the most-cited works referenced by documents in the user's library (via already-cached
+/// Crossref and Semantic Scholar payloads, zero extra network calls) that are NOT yet owned locally.
+/// `category`: `None` / `"all"` | `"paper"` | `"book"`.
+pub fn find_missing_cited_classics(
+    conn: &Connection,
+    category: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MissingClassicItem>> {
+    let cap = limit.clamp(1, 100);
+    let cat_filter = match category.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("paper") => Some("paper"),
+        Some("book") => Some("book"),
+        _ => None,
+    };
+
+    // Build lookup of already-owned library works + citer brief info.
+    let mut owned_dois: HashSet<String> = HashSet::new();
+    let mut owned_arxiv: HashSet<String> = HashSet::new();
+    let mut owned_isbns: HashSet<String> = HashSet::new();
+    let mut owned_titles: HashSet<String> = HashSet::new();
+    let mut doc_by_doi: HashMap<String, i64> = HashMap::new();
+    let mut doc_by_arxiv: HashMap<String, i64> = HashMap::new();
+    let mut citer_meta: HashMap<i64, (String, Option<i64>)> = HashMap::new();
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, title_norm, year, doi, arxiv_id, isbn
+             FROM documents",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, title, title_norm, year, doi, arxiv, isbn) = row?;
+            citer_meta.insert(id, (title, year));
+            let tn = title_norm.trim().to_string();
+            if tn.len() >= 8 {
+                owned_titles.insert(tn);
+            }
+            if let Some(d) = doi.as_deref().and_then(normalize_doi) {
+                owned_dois.insert(d.clone());
+                doc_by_doi.entry(d).or_insert(id);
+            }
+            if let Some(ax) = arxiv.as_deref().and_then(normalize_arxiv_base_id) {
+                owned_arxiv.insert(ax.clone());
+                doc_by_arxiv.entry(ax).or_insert(id);
+            }
+            if let Some(ib) = isbn.as_deref().and_then(normalize_isbn_digits) {
+                owned_isbns.insert(ib);
+            }
+        }
+    }
+
+    if doc_by_doi.is_empty() && doc_by_arxiv.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut agg_map: HashMap<String, MissingRefAgg> = HashMap::new();
+
+    let mut record_ref = |citing_doc_id: i64,
+                          title_raw: &str,
+                          authors_raw: &str,
+                          year: Option<i64>,
+                          venue: Option<String>,
+                          doi: Option<String>,
+                          arxiv_id: Option<String>,
+                          isbn: Option<String>,
+                          is_book: bool| {
+        if let Some(ref d) = doi {
+            if owned_dois.contains(d) {
+                return;
+            }
+        }
+        if let Some(ref ax) = arxiv_id {
+            if owned_arxiv.contains(ax) {
+                return;
+            }
+        }
+        if let Some(ref ib) = isbn {
+            if owned_isbns.contains(ib) {
+                return;
+            }
+        }
+        let title = clean_ref_title(title_raw);
+        if title.len() < 4 {
+            return;
+        }
+        let title_norm = normalize_math_text(&title);
+        if title_norm.len() < 4 || owned_titles.contains(&title_norm) {
+            return;
+        }
+
+        let key = if let Some(ref d) = doi {
+            format!("doi:{d}")
+        } else if let Some(ref ib) = isbn {
+            format!("isbn:{ib}")
+        } else if let Some(ref ax) = arxiv_id {
+            format!("arxiv:{ax}")
+        } else {
+            let short: String = title_norm.chars().take(72).collect();
+            format!("t:{short}:{}", year.unwrap_or(0))
+        };
+
+        let entry = agg_map.entry(key).or_default();
+        if entry.title.len() < title.len() {
+            entry.title = title;
+        }
+        let au = authors_raw.trim();
+        if entry.authors.len() < au.len() {
+            entry.authors = au.to_string();
+        }
+        if entry.year.is_none() {
+            entry.year = year;
+        }
+        if entry.venue.is_none() {
+            entry.venue = venue;
+        }
+        if entry.doi.is_none() {
+            entry.doi = doi;
+        }
+        if entry.arxiv_id.is_none() {
+            entry.arxiv_id = arxiv_id;
+        }
+        if entry.isbn.is_none() {
+            entry.isbn = isbn;
+        }
+        if is_book {
+            entry.is_book_votes += 1;
+        } else {
+            entry.is_paper_votes += 1;
+        }
+        entry.citers.insert(citing_doc_id);
+    };
+
+    // Scan cached Crossref & Semantic Scholar payloads matching library docs.
+    let mut stmt = conn.prepare(
+        "SELECT source, lookup_key, response_body
+         FROM metadata_http_cache
+         WHERE source IN ('crossref', 'semanticscholar')
+           AND status_code < 400",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+
+    for row in rows.flatten() {
+        let (source, lookup_key, body) = row;
+        let Ok(v) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
+
+        if source == "crossref" {
+            // Collect `(citing_doc_id, reference_array)` from BOTH direct `doi:` payloads (`message.reference`)
+            // and title-search list payloads (`message.items[].reference` matched by item DOI).
+            let mut cr_batches: Vec<(i64, &[Value])> = Vec::new();
+            if let Some(d) = lookup_key.strip_prefix("doi:").and_then(normalize_doi) {
+                if let Some(&cid) = doc_by_doi.get(&d) {
+                    if let Some(refs) = v
+                        .get("message")
+                        .and_then(|m| m.get("reference"))
+                        .and_then(Value::as_array)
+                    {
+                        cr_batches.push((cid, refs.as_slice()));
+                    }
+                }
+            }
+            if let Some(items) = v
+                .get("message")
+                .and_then(|m| m.get("items"))
+                .and_then(Value::as_array)
+            {
+                for item in items {
+                    let Some(d) = item.get("DOI").and_then(Value::as_str).and_then(normalize_doi) else {
+                        continue;
+                    };
+                    let Some(&cid) = doc_by_doi.get(&d) else {
+                        continue;
+                    };
+                    if let Some(refs) = item.get("reference").and_then(Value::as_array) {
+                        cr_batches.push((cid, refs.as_slice()));
+                    }
+                }
+            }
+
+            for (citing_id, refs) in cr_batches {
+                for r in refs {
+                    let doi = r.get("DOI").and_then(Value::as_str).and_then(normalize_doi);
+                    let isbn = r
+                        .get("ISBN")
+                        .and_then(Value::as_str)
+                        .and_then(normalize_isbn_digits);
+                    let article_title = r
+                        .get("article-title")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let volume_title = r
+                        .get("volume-title")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let journal_title = r
+                        .get("journal-title")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let author = r.get("author").and_then(Value::as_str).unwrap_or("").trim();
+                    let year = r
+                        .get("year")
+                        .and_then(Value::as_str)
+                        .and_then(extract_year_from_str)
+                        .or_else(|| r.get("year").and_then(Value::as_i64));
+                    let unstructured = r
+                        .get("unstructured")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+
+                    let title_owned: String = if let Some(t) = article_title.or(volume_title) {
+                        t.to_string()
+                    } else if let Some(u) = unstructured {
+                        u.chars().take(140).collect()
+                    } else {
+                        continue;
+                    };
+                    let venue = journal_title
+                        .or(if article_title.is_some() { volume_title } else { None })
+                        .or_else(|| r.get("series-title").and_then(Value::as_str))
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned);
+                    let is_book = looks_like_book_reference(
+                        isbn.is_some(),
+                        article_title.is_some(),
+                        volume_title,
+                        journal_title,
+                        venue.as_deref(),
+                        &title_owned,
+                    );
+                    let eff_year = year.or_else(|| unstructured.and_then(extract_year_from_str));
+                    record_ref(
+                        citing_id,
+                        &title_owned,
+                        author,
+                        eff_year,
+                        venue,
+                        doi,
+                        None,
+                        isbn,
+                        is_book,
+                    );
+                }
+            }
+        } else if source == "semanticscholar" {
+            let citing_doc_id = if let Some(d) = lookup_key.strip_prefix("doi:").and_then(normalize_doi) {
+                doc_by_doi.get(&d).copied()
+            } else if let Some(ax) = lookup_key
+                .strip_prefix("arxiv:")
+                .and_then(normalize_arxiv_base_id)
+            {
+                doc_by_arxiv.get(&ax).copied()
+            } else {
+                None
+            };
+            let Some(citing_id) = citing_doc_id else {
+                continue;
+            };
+            let Some(refs) = v.get("references").and_then(Value::as_array) else {
+                continue;
+            };
+            for r in refs {
+                let Some(title) = r
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let ext = r.get("externalIds");
+                let doi = ext
+                    .and_then(|e| e.get("DOI"))
+                    .and_then(Value::as_str)
+                    .and_then(normalize_doi);
+                let arxiv_id = ext
+                    .and_then(|e| e.get("ArXiv"))
+                    .and_then(Value::as_str)
+                    .and_then(normalize_arxiv_base_id);
+                let year = r.get("year").and_then(Value::as_i64);
+                let venue = r
+                    .get("venue")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned);
+                let authors = r
+                    .get("authors")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|a| a.get("name").and_then(Value::as_str))
+                            .take(4)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let pub_types_book = r
+                    .get("publicationTypes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .any(|t| t.eq_ignore_ascii_case("Book"))
+                    });
+                let is_book = pub_types_book
+                    || looks_like_book_reference(
+                        false,
+                        true,
+                        None,
+                        venue.as_deref(),
+                        venue.as_deref(),
+                        title,
+                    );
+                record_ref(
+                    citing_id,
+                    title,
+                    &authors,
+                    year,
+                    venue,
+                    doi,
+                    arxiv_id,
+                    None,
+                    is_book,
+                );
+            }
+        }
+    }
+
+    let mut items: Vec<MissingClassicItem> = agg_map
+        .into_values()
+        .filter_map(|agg| {
+            let work_category = if agg.is_book_votes > agg.is_paper_votes {
+                "book"
+            } else {
+                "paper"
+            };
+            if let Some(want) = cat_filter {
+                if work_category != want {
+                    return None;
+                }
+            }
+            let mut citing_docs: Vec<MissingClassicCiter> = agg
+                .citers
+                .iter()
+                .filter_map(|did| {
+                    citer_meta.get(did).map(|(title, year)| MissingClassicCiter {
+                        document_id: *did,
+                        title: title.clone(),
+                        year: *year,
+                    })
+                })
+                .collect();
+            citing_docs.sort_by(|a, b| a.title.cmp(&b.title));
+            let cited_by_count = citing_docs.len();
+            if cited_by_count == 0 {
+                return None;
+            }
+            Some(MissingClassicItem {
+                title: agg.title,
+                authors: agg.authors,
+                year: agg.year,
+                venue: agg.venue,
+                work_category: work_category.to_string(),
+                doi: agg.doi,
+                arxiv_id: agg.arxiv_id,
+                isbn: agg.isbn,
+                cited_by_count,
+                citing_docs,
+            })
+        })
+        .collect();
+
+    items.sort_by(|a, b| {
+        b.cited_by_count
+            .cmp(&a.cited_by_count)
+            .then_with(|| a.year.unwrap_or(9999).cmp(&b.year.unwrap_or(9999)))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    items.truncate(cap);
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,5 +1498,66 @@ mod tests {
         let rel2 = get_document_relations(&w, Some(&vindex), d2, 5).unwrap();
         assert_eq!(rel2.cited_by.len(), 1);
         assert_eq!(rel2.cited_by[0].document_id, d1);
+    }
+
+    #[test]
+    fn finds_missing_cited_classics_filtered_by_paper_and_book() {
+        let db = Database::in_memory().unwrap();
+        let w = db.writer();
+        let d1 = create_heuristic_document(&w, "My Paper A").unwrap();
+        let d2 = create_heuristic_document(&w, "My Paper B").unwrap();
+        let owned = create_heuristic_document(&w, "Already Owned Classic").unwrap();
+        w.execute(
+            "UPDATE documents SET doi = '10.1000/paper-a' WHERE id = ?1",
+            params![d1],
+        )
+        .unwrap();
+        w.execute(
+            "UPDATE documents SET doi = '10.1000/paper-b' WHERE id = ?1",
+            params![d2],
+        )
+        .unwrap();
+        w.execute(
+            "UPDATE documents SET doi = '10.1000/owned' WHERE id = ?1",
+            params![owned],
+        )
+        .unwrap();
+
+        let cr_body = r#"{
+            "message": {
+                "reference": [
+                    {"DOI": "10.1000/owned", "article-title": "Already Owned Classic", "year": "1990"},
+                    {"DOI": "10.1000/classic-paper", "article-title": "On Spectral Operators", "author": "Kato", "journal-title": "Ann. of Math.", "year": "1966"},
+                    {"ISBN": "9780387900513", "volume-title": "Functional Analysis", "author": "Rudin", "year": "1973"}
+                ]
+            }
+        }"#;
+        w.execute(
+            "INSERT INTO metadata_http_cache (source, lookup_key, response_body, status_code, fetched_at)
+             VALUES ('crossref', 'doi:10.1000/paper-a', ?1, 200, 1)",
+            params![cr_body],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO metadata_http_cache (source, lookup_key, response_body, status_code, fetched_at)
+             VALUES ('crossref', 'doi:10.1000/paper-b', ?1, 200, 1)",
+            params![cr_body],
+        )
+        .unwrap();
+
+        let all = find_missing_cited_classics(&w, Some("all"), 20).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|c| c.cited_by_count == 2));
+        assert!(all.iter().all(|c| c.doi.as_deref() != Some("10.1000/owned")));
+
+        let books = find_missing_cited_classics(&w, Some("book"), 20).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Functional Analysis");
+        assert_eq!(books[0].work_category, "book");
+
+        let papers = find_missing_cited_classics(&w, Some("paper"), 20).unwrap();
+        assert_eq!(papers.len(), 1);
+        assert_eq!(papers[0].title, "On Spectral Operators");
+        assert_eq!(papers[0].work_category, "paper");
     }
 }

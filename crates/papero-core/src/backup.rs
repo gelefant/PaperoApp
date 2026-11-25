@@ -303,12 +303,23 @@ pub fn create_backup_bundle_with_bm25(
         let mut dst_conn = Connection::open(&snap_db_path)?;
         let backup = Backup::new(&src_conn, &mut dst_conn)?;
         backup.run_to_completion(4096, Duration::ZERO, None)?;
+        drop(backup);
+        // Strip machine-specific collection `.bib` sync paths from portable backup DB snapshots.
+        let _ = dst_conn.execute(
+            "UPDATE collections SET bib_sync_path = NULL, bib_sync_enabled = 0",
+            [],
+        );
     } else {
         let src_conn = db.reader();
         let _ = src_conn.busy_timeout(Duration::from_secs(10));
         let mut dst_conn = Connection::open(&snap_db_path)?;
         let backup = Backup::new(&src_conn, &mut dst_conn)?;
         backup.run_to_completion(4096, Duration::ZERO, None)?;
+        drop(backup);
+        let _ = dst_conn.execute(
+            "UPDATE collections SET bib_sync_path = NULL, bib_sync_enabled = 0",
+            [],
+        );
     }
 
     let mut cfg = AppConfig::load_or_default(&paths.config_path)?;
@@ -517,6 +528,10 @@ fn prepare_staged_restore_artifacts(paths: &AppPaths, staging: &Path) -> Result<
             if has_roots_table {
                 reconcile_source_roots_with_local_map(&conn, &paths.local_roots_path())?;
             }
+            let _ = conn.execute(
+                "UPDATE collections SET bib_sync_path = NULL, bib_sync_enabled = 0",
+                [],
+            );
         }
         for sidecar in ["papero.db-wal", "papero.db-shm"] {
             let p = staging.join(sidecar);

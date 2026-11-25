@@ -254,6 +254,12 @@ pub struct AppConfig {
     pub ocr_languages: Option<String>,
     /// Rasterization DPI for OCR page rendering (`150..=350`, default `250`).
     pub ocr_dpi: u32,
+    /// When enabled, OCR processes only the first `ocr_front_pages_count` pages (fast metadata/TOC capture for long scans).
+    pub ocr_front_pages_only: bool,
+    /// Number of leading pages OCR'd when `ocr_front_pages_only` is true (`1..=50`, default `8`).
+    pub ocr_front_pages_count: u32,
+    /// Whether Papero checks GitHub Releases discretely on startup for newer versions.
+    pub check_updates_on_startup: bool,
     /// Optional generative LLM provider (`disabled`, `ollama`, `anthropic`, `openai`, `gemini`).
     pub llm_provider: crate::llm::LlmProvider,
     /// Selected model ID fetched from the active LLM provider endpoint.
@@ -345,6 +351,9 @@ impl Default for AppConfig {
             tesseract_bin: None,
             ocr_languages: None,
             ocr_dpi: 250,
+            ocr_front_pages_only: false,
+            ocr_front_pages_count: 8,
+            check_updates_on_startup: true,
             llm_provider: crate::llm::LlmProvider::Disabled,
             llm_model: None,
             llm_ollama_url: "http://127.0.0.1:11434".to_string(),

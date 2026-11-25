@@ -191,6 +191,8 @@ fn sample_results() -> Vec<ContentSearchDocResult> {
                 text_content: "TOP_SECRET_DOC_TOKEN_DO_NOT_SEND".to_string(),
                 bboxes: vec![],
                 is_alt_formula: false,
+                statement_label: None,
+                statement_kind: None,
             }],
         },
         ContentSearchDocResult {
@@ -211,6 +213,8 @@ fn sample_results() -> Vec<ContentSearchDocResult> {
                 text_content: "TOP_SECRET_FOLDER_TOKEN_DO_NOT_SEND".to_string(),
                 bboxes: vec![],
                 is_alt_formula: false,
+                statement_label: None,
+                statement_kind: None,
             }],
         },
         ContentSearchDocResult {
@@ -236,6 +240,8 @@ fn sample_results() -> Vec<ContentSearchDocResult> {
                     h: 0.05,
                 }],
                 is_alt_formula: false,
+                statement_label: None,
+                statement_kind: None,
             }],
         },
     ]

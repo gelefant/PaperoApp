@@ -20,11 +20,13 @@
     results: ContentSearchDocResult[];
     searchStats?: HybridSearchStats | null;
     workCategory?: WorkCategory;
+    statementsOnly?: boolean;
     activeFilterChips?: string[];
     authorFilter?: string;
     yearFromFilter?: number | null;
     yearToFilter?: number | null;
     onChangeWorkCategory?: (cat: WorkCategory) => void;
+    onToggleStatementsOnly?: (active: boolean) => void;
     onChangeContentMetaFilters?: (patch: {
       author?: string | null;
       year_from?: number | null;
@@ -50,11 +52,13 @@
     results,
     searchStats = null,
     workCategory = 'all',
+    statementsOnly = false,
     activeFilterChips = [],
     authorFilter = '',
     yearFromFilter = null,
     yearToFilter = null,
     onChangeWorkCategory,
+    onToggleStatementsOnly,
     onChangeContentMetaFilters,
     onClearContentFilters,
     llmProvider = 'disabled',
@@ -186,6 +190,19 @@
             {tr(lang, 'filterBooks')}
           </button>
         </div>
+      {/if}
+      {#if onToggleStatementsOnly}
+        <button
+          type="button"
+          class="adv-filter-toggle"
+          class:active={statementsOnly}
+          title={lang === 'en'
+            ? 'Show only mathematical statements (Theorems, Lemmas, Propositions, Corollaries, Definitions)'
+            : 'Mostra solo enunciati matematici (Teoremi, Lemmi, Proposizioni, Corollari, Definizioni)'}
+          onclick={() => onToggleStatementsOnly(!statementsOnly)}
+        >
+          {tr(lang, 'statementsOnlyLabel')}
+        </button>
       {/if}
       {#if onChangeContentMetaFilters}
         <button
@@ -371,9 +388,14 @@
                   }}
                 >
                   <div class="passage-head">
-                    <span class="page-chip">
-                      p. {pass.page_ord}{pass.printed_label ? ` (${pass.printed_label})` : ''}
-                    </span>
+                    <div class="pass-head-left">
+                      <span class="page-chip">
+                        p. {pass.page_ord}{pass.printed_label ? ` (${pass.printed_label})` : ''}
+                      </span>
+                      {#if pass.statement_label}
+                        <span class="stmt-badge">{pass.statement_label}</span>
+                      {/if}
+                    </div>
                     <span class="pass-score">{pass.score.toFixed(2)}</span>
                   </div>
                   <div class="snippet">
@@ -742,5 +764,20 @@
     to {
       opacity: 0;
     }
+  }
+  .pass-head-left {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
+  }
+  .stmt-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(16, 185, 129, 0.14);
+    color: #047857;
+    border: 1px solid rgba(16, 185, 129, 0.3);
   }
 </style>

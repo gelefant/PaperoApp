@@ -144,6 +144,35 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         migrate_v7_annotations_reading_collections(conn)?;
     }
 
+    if current_version < 8 {
+        migrate_v8_collection_bib_sync(conn)?;
+    }
+
+    Ok(())
+}
+
+fn migrate_v8_collection_bib_sync(conn: &Connection) -> Result<()> {
+    let existing_cols: std::collections::HashSet<String> = {
+        let mut st = conn.prepare("PRAGMA table_info(collections)")?;
+        let iter = st.query_map([], |r| r.get::<_, String>(1))?;
+        iter.filter_map(std::result::Result::ok).collect()
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    if !existing_cols.contains("bib_sync_path") {
+        tx.execute_batch("ALTER TABLE collections ADD COLUMN bib_sync_path TEXT;")?;
+    }
+    if !existing_cols.contains("bib_sync_enabled") {
+        tx.execute_batch(
+            "ALTER TABLE collections ADD COLUMN bib_sync_enabled INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    let now = chrono::Utc::now().timestamp();
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+        rusqlite::params![8i64, now],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

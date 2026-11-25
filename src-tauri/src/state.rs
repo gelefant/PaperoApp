@@ -3,6 +3,7 @@ use papero_core::backup::{
 };
 use papero_core::bibtex::BibtexExportOptions;
 use papero_core::config::{init_logging, AppConfig, AppPaths, WorkerGuard};
+use papero_core::db::repos::collections::{list_bib_synced_collections, list_collections};
 use papero_core::db::repos::docs::{get_file_stream_info, FileStreamInfo};
 use papero_core::db::repos::roots::{
     list_source_roots, prune_orphaned_catalog_entities, reconcile_source_roots_with_local_map,
@@ -567,22 +568,98 @@ impl AppState {
         });
     }
 
-    /// Marks the external auto-sync `.bib` file as dirty if enabled and configured.
+    /// Marks external auto-sync `.bib` files (global and per-collection) as dirty.
     pub fn schedule_bibtex_auto_sync(&self) {
-        let should_schedule = self
-            .config
-            .read()
-            .map(|c| {
-                c.bibtex_auto_sync_enabled
-                    && c.bibtex_auto_sync_path
+        self.bibtex_sync_dirty.store(true, Ordering::SeqCst);
+        self.bibtex_sync_notify.notify_one();
+    }
+
+    /// Synchronizes a single collection's dedicated external `.bib` file atomically
+    /// (strictly refusing any destination inside configured `source_roots`).
+    pub async fn run_collection_bibtex_sync_now(
+        state: &Arc<Self>,
+        collection_id: i64,
+    ) -> std::result::Result<(String, usize), String> {
+        let _guard = state.bibtex_sync_mutex.lock().await;
+        let st = Arc::clone(state);
+        let (path_str, count) =
+            tokio::task::spawn_blocking(move || -> std::result::Result<(String, usize), String> {
+                let cfg = st.config.read().expect("config poisoned").clone();
+                let (col_path, doc_ids, roots) = {
+                    let r = st.db.reader();
+                    let col = list_collections(&r)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .find(|c| c.id == collection_id)
+                        .ok_or_else(|| format!("Collezione {collection_id} non trovata."))?;
+                    let target = col
+                        .bib_sync_path
                         .as_deref()
                         .map(str::trim)
-                        .is_some_and(|p| !p.is_empty())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            "Nessun file .bib associato a questa collezione.".to_string()
+                        })?
+                        .to_string();
+                    let roots = list_source_roots(&r).unwrap_or_default();
+                    (target, col.document_ids, roots)
+                };
+                let views = {
+                    let r = st.db.reader();
+                    if doc_ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        get_documents_metadata_for_export(&r, &doc_ids)
+                            .map_err(|e| e.to_string())?
+                    }
+                };
+                let root_paths: Vec<String> =
+                    roots.into_iter().map(|sr| sr.root_path).collect();
+                let opts = BibtexExportOptions {
+                    key_pattern: cfg.bibtex_key_pattern,
+                    format: cfg.bibtex_format,
+                    ..Default::default()
+                };
+                let bibtex = export_documents_bibtex(&views, &opts);
+                write_bibtex_file_atomically(Path::new(&col_path), &bibtex, &root_paths)
+                    .map_err(|e| e.to_string())?;
+                Ok((col_path, views.len()))
             })
-            .unwrap_or(false);
-        if should_schedule {
-            self.bibtex_sync_dirty.store(true, Ordering::SeqCst);
-            self.bibtex_sync_notify.notify_one();
+            .await
+            .map_err(|e| e.to_string())??;
+
+        if let Ok(g) = state.app_handle.lock() {
+            if let Some(app) = g.as_ref() {
+                let _ = app.emit(
+                    "papero://bibtex-synced",
+                    serde_json::json!({
+                        "path": path_str,
+                        "count": count,
+                        "collection_id": collection_id
+                    }),
+                );
+            }
+        }
+        Ok((path_str, count))
+    }
+
+    async fn run_all_collection_bibtex_syncs(state: &Arc<Self>) {
+        let st = Arc::clone(state);
+        let synced_cols = tokio::task::spawn_blocking(move || {
+            let r = st.db.reader();
+            list_bib_synced_collections(&r).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        for col in synced_cols {
+            if let Err(err) = Self::run_collection_bibtex_sync_now(state, col.id).await {
+                tracing::warn!(
+                    collection_id = col.id,
+                    error = %err,
+                    "automatic collection BibTeX sync failed"
+                );
+            }
         }
     }
 
@@ -677,7 +754,7 @@ impl AppState {
                     continue;
                 }
 
-                let enabled = state
+                let global_enabled = state
                     .config
                     .read()
                     .map(|c| {
@@ -688,12 +765,12 @@ impl AppState {
                                 .is_some_and(|p| !p.is_empty())
                     })
                     .unwrap_or(false);
-                if !enabled {
-                    continue;
+                if global_enabled {
+                    if let Err(err) = Self::run_bibtex_auto_sync_now(&state).await {
+                        tracing::warn!(error = %err, "automatic BibTeX sync failed");
+                    }
                 }
-                if let Err(err) = Self::run_bibtex_auto_sync_now(&state).await {
-                    tracing::warn!(error = %err, "automatic BibTeX sync failed");
-                }
+                Self::run_all_collection_bibtex_syncs(&state).await;
             }
         });
     }

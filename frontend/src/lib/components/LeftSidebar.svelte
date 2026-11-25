@@ -40,6 +40,8 @@
     onRenameCollection?: (collectionId: number, name: string) => Promise<void>;
     onDeleteCollection?: (collectionId: number) => Promise<void>;
     onReorderCollections?: (orderedIds: number[]) => Promise<void>;
+    onConfigureCollectionBibSync?: (col: CollectionView) => Promise<void>;
+    onSyncCollectionBibNow?: (col: CollectionView) => Promise<void>;
     onSaveCurrentView?: (name: string) => Promise<void>;
     onApplySavedSearch?: (view: SavedSearchView) => Promise<void>;
     onDeleteSavedSearch?: (id: number) => Promise<void>;
@@ -79,6 +81,8 @@
     onRenameCollection,
     onDeleteCollection,
     onReorderCollections,
+    onConfigureCollectionBibSync,
+    onSyncCollectionBibNow,
     onSaveCurrentView,
     onApplySavedSearch,
     onDeleteSavedSearch,
@@ -377,12 +381,51 @@
                           type="button"
                           class="row-label-btn"
                           onclick={() => onSelectCollection(colSelected ? null : col.id)}
-                          title={col.name}
+                          oncontextmenu={(e) => {
+                            if (onConfigureCollectionBibSync) {
+                              e.preventDefault();
+                              void onConfigureCollectionBibSync(col);
+                            }
+                          }}
+                          title={col.bib_sync_enabled && col.bib_sync_path
+                            ? `${col.name} · Auto-Sync .bib: ${col.bib_sync_path}`
+                            : col.name}
                         >
                           <span class="row-text">{col.name}</span>
                         </button>
+                        {#if col.bib_sync_enabled && col.bib_sync_path}
+                          <button
+                            type="button"
+                            class="col-bib-badge"
+                            title={lang === 'en'
+                              ? `Auto-synced .bib: ${col.bib_sync_path} (click to sync now)`
+                              : `.bib sincronizzato: ${col.bib_sync_path} (clic per sincronizzare ora)`}
+                            onclick={(e) => {
+                              e.stopPropagation();
+                              void onSyncCollectionBibNow?.(col);
+                            }}
+                          >
+                            .bib
+                          </button>
+                        {/if}
                         <span class="cnt confirmed">{col.document_count}</span>
                         <div class="col-hover-acts">
+                          {#if onConfigureCollectionBibSync}
+                            <button
+                              type="button"
+                              class="edit-btn"
+                              title={col.bib_sync_enabled
+                                ? lang === 'en'
+                                  ? 'Change or unlink .bib file'
+                                  : 'Modifica o scollega file .bib dedicato'
+                                : lang === 'en'
+                                  ? 'Link dedicated .bib file (Auto-Sync)'
+                                  : 'Associa file .bib dedicato (Auto-Sync)'}
+                              onclick={() => void onConfigureCollectionBibSync(col)}
+                            >
+                              &#123;&#125;
+                            </button>
+                          {/if}
                           {#if onReorderCollections && idx > 0}
                             <button
                               type="button"
@@ -1146,5 +1189,17 @@
 
   .col-row:hover .col-hover-acts {
     display: inline-flex;
+  }
+  .col-bib-badge {
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-radius: 4px;
+    padding: 0 4px;
+    font-size: 9.5px;
+    font-weight: 700;
+    line-height: 1.4;
+    cursor: pointer;
+    flex-shrink: 0;
   }
 </style>

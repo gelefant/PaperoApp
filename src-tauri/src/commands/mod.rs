@@ -17,16 +17,17 @@ use papero_core::credentials::{
     SecretApiKey,
 };
 use papero_core::db::repos::annotations::{
-    create_annotation_for_file, delete_annotation, export_annotations_markdown,
-    list_annotations_for_file, search_annotations, set_document_reading_status,
-    set_document_starred, toggle_page_bookmark, update_annotation, upsert_reading_state_for_file,
-    AnnotationSearchHit, FileAnnotation, FileReadingState, NewFileAnnotation, ReadingStatePatch,
-    UpdateFileAnnotation,
+    count_total_annotations, create_annotation_for_file, delete_annotation,
+    export_annotations_markdown, list_annotations_for_file, search_annotations,
+    set_document_reading_status, set_document_starred, toggle_page_bookmark, update_annotation,
+    upsert_reading_state_for_file, AnnotationSearchHit, FileAnnotation, FileReadingState,
+    NewFileAnnotation, ReadingStatePatch, UpdateFileAnnotation,
 };
 use papero_core::db::repos::collections::{
     add_documents_to_collection, create_collection, create_saved_search, delete_collection,
     delete_saved_search, list_collections, list_saved_searches, remove_documents_from_collection,
-    rename_collection, reorder_collections, CollectionView, SavedSearchView,
+    rename_collection, reorder_collections, set_collection_bib_sync, CollectionView,
+    SavedSearchView,
 };
 use papero_core::db::repos::docs::{
     get_file_location, get_file_viewer_info, list_documents_for_ui, ContentSearchDocResult,
@@ -64,13 +65,18 @@ use papero_core::llm::{
     send_prepared_prompt_streaming, verify_provider_key, DocLlmScope, LlmAnswerResult,
     LlmKeyVerifyResult, LlmModelInfo, LlmPromptPreview, LlmProvider, LlmStreamEvent,
 };
+use papero_core::maintenance::{
+    check_github_latest_release, clear_render_cache, compact_database, compute_storage_health,
+    CompactionReport, StorageHealthReport, UpdateCheckResult, DEFAULT_GITHUB_REPO_SLUG,
+};
 use papero_core::metadata::io::{
     export_documents_bibtex, export_documents_csv, import_bibtex, import_zotero_csl_json,
     metadata_view_to_record, write_bibtex_file_atomically,
 };
 use papero_core::metadata::models::DocumentMetadataView;
 use papero_core::metadata::relations::{
-    get_document_relations, refresh_local_citations_for_doc, DocumentRelationsView,
+    find_missing_cited_classics, get_document_relations, refresh_local_citations_for_doc,
+    DocumentRelationsView, MissingClassicItem,
 };
 use papero_core::metadata::resolver::{
     apply_manual_metadata_edit_with_locks, clear_metadata_jobs_for_doc,
@@ -90,7 +96,8 @@ use papero_core::ml::{
     ModelProfileStatus, OnnxEmbedder, OnnxReranker,
 };
 use papero_core::viewer::os_actions::{
-    external_reader_presets, open_external, reveal_in_folder, ExternalReaderPreset,
+    external_reader_presets, open_external, open_with_os_default, reveal_in_folder,
+    ExternalReaderPreset,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -111,6 +118,10 @@ pub enum ScanProgressEvent {
 
 fn default_true_setting() -> bool {
     true
+}
+
+fn default_ocr_front_pages_setting() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +170,12 @@ pub struct UiSettingsPayload {
     pub tesseract_bin: Option<String>,
     pub ocr_languages: Option<String>,
     pub ocr_dpi: u32,
+    #[serde(default)]
+    pub ocr_front_pages_only: bool,
+    #[serde(default = "default_ocr_front_pages_setting")]
+    pub ocr_front_pages_count: u32,
+    #[serde(default = "default_true_setting")]
+    pub check_updates_on_startup: bool,
     pub llm_provider: LlmProvider,
     pub llm_model: Option<String>,
     pub llm_ollama_url: String,
@@ -734,6 +751,9 @@ pub async fn get_ui_settings(state: State<'_, Arc<AppState>>) -> Result<UiSettin
             tesseract_bin: cfg.tesseract_bin.clone(),
             ocr_languages: cfg.ocr_languages.clone(),
             ocr_dpi: cfg.ocr_dpi,
+            ocr_front_pages_only: cfg.ocr_front_pages_only,
+            ocr_front_pages_count: cfg.ocr_front_pages_count,
+            check_updates_on_startup: cfg.check_updates_on_startup,
             llm_provider: cfg.llm_provider,
             llm_model: cfg.llm_model.clone(),
             llm_ollama_url: cfg.llm_ollama_url.clone(),
@@ -829,6 +849,9 @@ pub async fn save_ui_settings(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         cfg.ocr_dpi = settings.ocr_dpi.clamp(150, 350);
+        cfg.ocr_front_pages_only = settings.ocr_front_pages_only;
+        cfg.ocr_front_pages_count = settings.ocr_front_pages_count.clamp(1, 50);
+        cfg.check_updates_on_startup = settings.check_updates_on_startup;
         cfg.llm_provider = settings.llm_provider;
         cfg.llm_model = settings
             .llm_model
@@ -2842,6 +2865,7 @@ pub async fn add_docs_to_collection_cmd(
     .map_err(|e| e.to_string())??;
     if n > 0 {
         state.schedule_auto_backup();
+        state.schedule_bibtex_auto_sync();
     }
     Ok(n)
 }
@@ -2862,6 +2886,7 @@ pub async fn remove_docs_from_collection_cmd(
     .map_err(|e| e.to_string())??;
     if n > 0 {
         state.schedule_auto_backup();
+        state.schedule_bibtex_auto_sync();
     }
     Ok(n)
 }
@@ -3196,4 +3221,185 @@ pub async fn apply_smart_paste_cmd(
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.5.1 Commands: Annotation count, Collection .bib sync, Missing Classics,
+// Storage Health & Maintenance, Update Check, External URL
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn count_total_annotations_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let r = db.reader();
+        count_total_annotations(&r).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_collection_bib_sync_cmd(
+    state: State<'_, Arc<AppState>>,
+    collection_id: i64,
+    bib_sync_path: Option<String>,
+    bib_sync_enabled: bool,
+) -> Result<CollectionView, String> {
+    let st = Arc::clone(&state);
+    let clean_path = bib_sync_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    // Pre-validate read-only guard before persisting the path!
+    if bib_sync_enabled {
+        if let Some(ref target) = clean_path {
+            let db_check = Arc::clone(&st.db);
+            let cfg = st.config.read().expect("config poisoned").clone();
+            let target_owned = target.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let (roots, doc_ids) = {
+                    let r = db_check.reader();
+                    let col = list_collections(&r)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .find(|c| c.id == collection_id)
+                        .ok_or_else(|| format!("Collezione {collection_id} non trovata."))?;
+                    let roots = list_source_roots(&r).unwrap_or_default();
+                    (roots, col.document_ids)
+                };
+                let views = {
+                    let r = db_check.reader();
+                    if doc_ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        get_documents_metadata_for_export(&r, &doc_ids)
+                            .map_err(|e| e.to_string())?
+                    }
+                };
+                let root_paths: Vec<String> =
+                    roots.into_iter().map(|sr| sr.root_path).collect();
+                let opts = BibtexExportOptions {
+                    key_pattern: cfg.bibtex_key_pattern,
+                    format: cfg.bibtex_format,
+                    ..Default::default()
+                };
+                let bibtex = export_documents_bibtex(&views, &opts);
+                write_bibtex_file_atomically(Path::new(&target_owned), &bibtex, &root_paths)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        }
+    }
+
+    let db = Arc::clone(&state.db);
+    let updated = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        set_collection_bib_sync(&w, collection_id, clean_path.as_deref(), bib_sync_enabled)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(updated)
+}
+
+#[tauri::command]
+pub async fn sync_collection_bibtex_now_cmd(
+    state: State<'_, Arc<AppState>>,
+    collection_id: i64,
+) -> Result<(String, usize), String> {
+    AppState::run_collection_bibtex_sync_now(state.inner(), collection_id).await
+}
+
+#[tauri::command]
+pub async fn get_missing_classics_cmd(
+    state: State<'_, Arc<AppState>>,
+    category: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<MissingClassicItem>, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let r = db.reader();
+        find_missing_cited_classics(&r, category.as_deref(), limit.unwrap_or(50))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_storage_health_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<StorageHealthReport, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        compute_storage_health(&st.paths, &st.db).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn compact_database_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CompactionReport, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        compact_database(&st.paths, &st.db).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn clear_render_cache_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<u64, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || clear_render_cache(&st.paths).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn check_app_update_cmd(
+    state: State<'_, Arc<AppState>>,
+    manual: Option<bool>,
+) -> Result<UpdateCheckResult, String> {
+    let cfg = state.config.read().expect("config poisoned").clone();
+    let current = env!("CARGO_PKG_VERSION");
+    if !cfg.network_lookups_enabled && !manual.unwrap_or(false) {
+        return Ok(UpdateCheckResult {
+            current_version: current.to_string(),
+            latest_version: current.to_string(),
+            update_available: false,
+            release_url: format!("https://github.com/{DEFAULT_GITHUB_REPO_SLUG}/releases"),
+            release_notes: None,
+            published_at: None,
+        });
+    }
+    check_github_latest_release(current, DEFAULT_GITHUB_REPO_SLUG)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn open_external_url_cmd(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if (!trimmed.starts_with("https://") && !trimmed.starts_with("http://"))
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("Solo link http:// o https:// validi possono essere aperti nel browser.".to_string());
+    }
+    let u = trimmed.to_string();
+    tokio::task::spawn_blocking(move || open_with_os_default(Path::new(&u)).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
