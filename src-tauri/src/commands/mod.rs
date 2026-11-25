@@ -40,7 +40,9 @@ use papero_core::index::hybrid::{
     hybrid_search, DocScoreAggregation, HybridSearchContext, HybridSearchOptions,
     HybridSearchResponse,
 };
-use papero_core::index::worker::{run_embed_queue, run_extract_bm25_queue, WorkerBatchReport};
+use papero_core::index::worker::{
+    count_embed_progress, run_embed_queue_with_progress, run_extract_bm25_queue, WorkerBatchReport,
+};
 use papero_core::llm::{
     accept_cloud_consent, generate_grounded_answer, list_models, prepare_grounded_prompt,
     verify_provider_key, LlmAnswerResult, LlmKeyVerifyResult, LlmModelInfo, LlmPromptPreview,
@@ -1490,6 +1492,84 @@ fn build_ml_status(state: &AppState) -> MlEnvironmentStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedProgressStatus {
+    pub profile: String,
+    pub profile_ready: bool,
+    pub total_files: i64,
+    pub embedded_files: i64,
+    pub pending_files: i64,
+    pub running: bool,
+    pub paused: bool,
+    pub user_paused: bool,
+}
+
+fn compute_embed_progress(state: &AppState) -> EmbedProgressStatus {
+    let cfg = state.config.read().expect("config poisoned").clone();
+    let profile = ModelProfile::from_str_lossy(&cfg.ml_profile);
+    let profile_ready = profile_is_ready(&state.paths.models_dir, profile)
+        && resolved_onnxruntime_path(cfg.onnxruntime_lib_path.as_deref()).is_some();
+    let (total_files, embedded_files) =
+        count_embed_progress(&state.db, profile).unwrap_or((0, 0));
+    let pending_files = (total_files - embedded_files).max(0);
+    let user_paused = state.embed_user_paused.load(Ordering::SeqCst);
+    let paused = state.is_embed_effectively_paused();
+    let running = state.embed_worker_running.load(Ordering::SeqCst);
+    EmbedProgressStatus {
+        profile: profile.as_str().to_string(),
+        profile_ready,
+        total_files,
+        embedded_files,
+        pending_files,
+        running,
+        paused,
+        user_paused,
+    }
+}
+
+fn emit_embed_progress(state: &AppState) {
+    let status = compute_embed_progress(state);
+    if let Ok(guard) = state.app_handle.lock() {
+        if let Some(app) = guard.as_ref() {
+            let _ = app.emit("papero://embed-progress", &status);
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_embed_progress_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<EmbedProgressStatus, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || compute_embed_progress(&st))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_embed_paused_cmd(
+    state: State<'_, Arc<AppState>>,
+    paused: bool,
+) -> Result<EmbedProgressStatus, String> {
+    state.set_embed_user_paused(paused);
+    if !paused {
+        spawn_background_embedder(Arc::clone(&state));
+    }
+    let st = Arc::clone(&state);
+    let status = tokio::task::spawn_blocking(move || {
+        let s = compute_embed_progress(&st);
+        if let Ok(guard) = st.app_handle.lock() {
+            if let Some(app) = guard.as_ref() {
+                let _ = app.emit("papero://embed-progress", &s);
+            }
+        }
+        s
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(status)
+}
+
 fn spawn_background_embedder(state: Arc<AppState>) {
     state.embed_worker_reschedule.store(true, Ordering::SeqCst);
     if state
@@ -1504,9 +1584,11 @@ fn spawn_background_embedder(state: Arc<AppState>) {
         impl Drop for RunningGuard {
             fn drop(&mut self) {
                 self.0.embed_worker_running.store(false, Ordering::SeqCst);
+                emit_embed_progress(&self.0);
             }
         }
         let _guard = RunningGuard(Arc::clone(&state));
+        emit_embed_progress(&state);
 
         while state.embed_worker_reschedule.swap(false, Ordering::SeqCst) {
             let cfg = state.config.read().expect("config poisoned").clone();
@@ -1518,8 +1600,12 @@ fn spawn_background_embedder(state: Arc<AppState>) {
             }
             let ctrl = state.reset_embed_control();
             let vindex = state.vector_index_for(profile);
+            let st_cb = Arc::clone(&state);
+            let on_progress = move || {
+                emit_embed_progress(&st_cb);
+            };
             let embed_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_embed_queue(
+                run_embed_queue_with_progress(
                     &state.db,
                     &vindex,
                     &state.embedder_slot,
@@ -1527,6 +1613,7 @@ fn spawn_background_embedder(state: Arc<AppState>) {
                     profile,
                     &cfg,
                     Some(&ctrl),
+                    Some(&on_progress),
                 )
             }));
             if let Ok(Ok(rep)) = embed_outcome {

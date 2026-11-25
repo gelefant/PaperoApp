@@ -12,8 +12,8 @@ use crate::metadata::datacite::DataCiteClient;
 use crate::metadata::dblp::DblpClient;
 use crate::metadata::europepmc::EuropePmcClient;
 use crate::metadata::extract::{
-    extract_identifiers_and_heuristics_with_front_pages, extract_prose_core_title,
-    looks_like_garbage_title, strip_inline_markup_tags,
+    extract_identifiers_and_heuristics_with_front_pages, extract_isbn_from_filename_stem,
+    extract_prose_core_title, looks_like_garbage_title, strip_inline_markup_tags,
 };
 use crate::metadata::googlebooks::GoogleBooksClient;
 use crate::metadata::harvard::HarvardClient;
@@ -559,7 +559,13 @@ async fn resolve_document_metadata_inner(
                 }
             }
             if let Some(hit) = isbn_hit {
-                if verify_candidate_against_context(&hit, &ctx) {
+                let fn_title_ok = !ctx.isbn_from_filename
+                    || !ctx.locked_title
+                    || ctx.ids.heuristic_title.as_deref().is_none_or(|qt| {
+                        let (full_sim, _, _) = compute_title_similarity(qt, &hit.record.title);
+                        full_sim >= 0.45 || titles_represent_same_work(qt, &hit.record.title)
+                    });
+                if fn_title_ok && verify_candidate_against_context(&hit, &ctx) {
                     enrich_working_ids_from_bridge(&mut working_ids, &hit.record, &ctx);
                     if working_ids.doi.is_none() {
                         working_ids.doi = hit.record.doi.clone();
@@ -567,7 +573,7 @@ async fn resolve_document_metadata_inner(
                     working_ids.looks_like_book = true;
                     bridge_record = Some(hit.record.clone());
                     bridge_hit = Some(hit);
-                } else if !ctx.is_guided {
+                } else if !ctx.is_guided || ctx.isbn_from_filename {
                     working_ids.isbn = None;
                 }
             }
@@ -1422,12 +1428,105 @@ fn word_stem_without_last_char(w: &str) -> Option<&str> {
     w.get(..last_char_idx).filter(|stem| !stem.is_empty())
 }
 
+/// Estimates the page count represented by an article's `pages` field:
+/// - `"84"` or `"888"` (single page number) -> `Some(1)`
+/// - `"84--86"` / `"84-86"` / `"84–86"` -> `Some(3)`
+/// - `"20150202, 16"` or `"e12345, 16 pp."` (electronic ID + page count) -> `Some(16)`
+fn parsed_article_page_count(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Electronic article ID + explicit page count (e.g. "20150202, 16" or "Paper No. 12, 14 pp.")
+    if let Some((_, tail)) = trimmed.rsplit_once(',') {
+        let count_digits: String = tail
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = count_digits.parse::<u32>() {
+            if n > 0 && n <= 2000 {
+                return Some(n);
+            }
+        }
+    }
+    // Normalize unicode dashes to ASCII hyphen and parse "start-end" or single page "888"
+    let normalized = trimmed.replace(['–', '—', '−'], "-");
+    let parts: Vec<&str> = normalized
+        .split('-')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() == 1 && parts[0].chars().all(|c| c.is_ascii_digit()) {
+        return Some(1);
+    }
+    if parts.len() == 2 {
+        let a_str: String = parts[0].chars().filter(|c| c.is_ascii_digit()).collect();
+        let b_str: String = parts[1].chars().filter(|c| c.is_ascii_digit()).collect();
+        if let (Ok(a), Ok(b)) = (a_str.parse::<u32>(), b_str.parse::<u32>()) {
+            if b >= a {
+                return Some(b - a + 1);
+            }
+            // Handle abbreviated end page like "577--85" -> 585
+            if b_str.len() < a_str.len() {
+                let prefix = &a_str[..a_str.len() - b_str.len()];
+                if let Ok(expanded) = format!("{prefix}{b_str}").parse::<u32>() {
+                    if expanded >= a {
+                        return Some(expanded - a + 1);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Penalizes or rejects `@article` candidates (especially 1–3 page book reviews on JSTOR/Crossref
+/// or short survey articles) when the local document is a locked `@book` or a long monograph.
+fn book_vs_article_factor(cand: &CandidateMatch, ctx: &GatheredDocContext) -> f32 {
+    let rec = &cand.record;
+    if rec.work_type != WorkType::Article {
+        return 1.0;
+    }
+    let doc_is_book = ctx.locked_book || ctx.ids.looks_like_book || ctx.page_count >= 80;
+    if !doc_is_book {
+        return 1.0;
+    }
+
+    let span = rec.pages.as_deref().and_then(parsed_article_page_count);
+    let is_short_review = span.is_some_and(|n| n <= 3);
+    let is_jstor_review = rec
+        .publisher
+        .as_deref()
+        .is_some_and(|p| p.eq_ignore_ascii_case("jstor"))
+        && span.is_some_and(|n| n <= 6);
+    if is_short_review || is_jstor_review {
+        return 0.25;
+    }
+
+    if ctx.locked_book {
+        return 0.40;
+    }
+
+    let is_much_shorter_than_book =
+        ctx.page_count >= 120 && span.is_some_and(|n| n <= 40 && n.saturating_mul(3) < ctx.page_count);
+    if is_much_shorter_than_book {
+        return 0.40;
+    }
+
+    1.0
+}
+
 fn verify_candidate_against_context(cand: &CandidateMatch, ctx: &GatheredDocContext) -> bool {
     context_verification_factor(cand, ctx) >= 0.99
 }
 
 fn context_verification_factor(cand: &CandidateMatch, ctx: &GatheredDocContext) -> f32 {
     let rec = &cand.record;
+    let book_factor = book_vs_article_factor(cand, ctx);
+    if book_factor < 0.99 {
+        return book_factor;
+    }
 
     // 1. In guided mode, never accept a completely unrelated author when the user locked or explicitly queried by author
     if ctx.is_guided
@@ -1581,6 +1680,9 @@ struct GatheredDocContext {
     locked_authors: bool,
     strict_author_filter: bool,
     locked_year: bool,
+    locked_book: bool,
+    page_count: u32,
+    isbn_from_filename: bool,
 }
 
 fn build_guided_context_from_hints(
@@ -1590,19 +1692,41 @@ fn build_guided_context_from_hints(
 ) -> Result<GatheredDocContext> {
     let conn = db.reader();
     let locked = load_locked_fields(&conn, document_id)?;
-    let (db_work_type, page_count): (String, u32) = conn
+    let (db_work_type, page_count, rel_path): (String, u32, Option<String>) = conn
         .query_row(
             "SELECT d.work_type,
-                    COALESCE((SELECT MAX(f.page_count) FROM files f WHERE f.document_id = d.id), 0)
+                    COALESCE((SELECT MAX(f.page_count) FROM files f WHERE f.document_id = d.id), 0),
+                    (SELECT f.rel_path FROM files f WHERE f.document_id = d.id ORDER BY f.is_available DESC, f.id ASC LIMIT 1)
              FROM documents d WHERE d.id = ?1",
             params![document_id],
-            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32)),
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?)),
         )
         .optional()?
-        .unwrap_or_else(|| ("article".to_string(), 0));
+        .unwrap_or_else(|| ("article".to_string(), 0, None));
 
     let effective_work_type = hints.work_type.as_deref().unwrap_or(db_work_type.as_str());
-    let looks_like_book = effective_work_type == "book" || page_count >= 90;
+    let looks_like_book = effective_work_type == "book" || page_count >= 80;
+    let locked_book = locked.contains("work_type") && effective_work_type == "book";
+
+    let explicit_isbn = hints
+        .isbn
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let (effective_isbn, isbn_from_filename) = if explicit_isbn.is_some() {
+        (explicit_isbn, false)
+    } else if looks_like_book {
+        let fn_isbn = rel_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .and_then(|s| s.to_str())
+            .and_then(extract_isbn_from_filename_stem);
+        let from_fn = fn_isbn.is_some();
+        (fn_isbn, from_fn)
+    } else {
+        (None, false)
+    };
 
     let clean_title = hints
         .title
@@ -1646,7 +1770,7 @@ fn build_guided_context_from_hints(
             pii: None,
             arxiv_id: hints.arxiv_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
             arxiv_version: None,
-            isbn: hints.isbn.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
+            isbn: effective_isbn,
             mr_number: hints.mr_number.as_deref().and_then(normalize_mr_digits),
             zbl_number: hints.zbl_number.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned),
             heuristic_title: clean_title.clone(),
@@ -1665,6 +1789,9 @@ fn build_guided_context_from_hints(
         locked_authors: locked_authors_flag,
         strict_author_filter: hints.strict_author_filter || locked_authors_flag,
         locked_year: locked_year_flag,
+        locked_book,
+        page_count,
+        isbn_from_filename,
     })
 }
 
@@ -1924,7 +2051,21 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
         let looks_like_book = if locked.contains("work_type") {
             work_type == "book"
         } else {
-            work_type == "book" || page_count >= 90
+            work_type == "book" || page_count >= 80
+        };
+        let locked_book = locked.contains("work_type") && work_type == "book";
+        let (effective_isbn, isbn_from_filename) = if locked.contains("isbn") {
+            (isbn, false)
+        } else if looks_like_book {
+            let fn_isbn = rel_path
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_stem())
+                .and_then(|s| s.to_str())
+                .and_then(extract_isbn_from_filename_stem);
+            let from_fn = fn_isbn.is_some();
+            (fn_isbn, from_fn)
+        } else {
+            (None, false)
         };
         let guided_alt_titles = locked_title
             .as_deref()
@@ -1949,7 +2090,7 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
                 } else {
                     None
                 },
-                isbn: if locked.contains("isbn") { isbn } else { None },
+                isbn: effective_isbn,
                 mr_number: if locked.contains("mr_number") {
                     mr_num.as_deref().and_then(normalize_mr_digits)
                 } else {
@@ -1976,6 +2117,9 @@ fn prepare_doc_context(db: &Database, document_id: i64) -> Result<DocContextPrep
             locked_authors: locked_authors_flag,
             strict_author_filter: locked_authors_flag,
             locked_year: locked_year_flag,
+            locked_book,
+            page_count,
+            isbn_from_filename,
         })));
     }
 
@@ -2233,6 +2377,9 @@ fn finalize_doc_context(
         locked_authors: locked_authors_flag,
         strict_author_filter: locked_authors_flag,
         locked_year: locked_year_flag,
+        locked_book: locked.contains("work_type") && work_type == "book",
+        page_count: effective_page_count,
+        isbn_from_filename: false,
     }
 }
 
@@ -2306,6 +2453,39 @@ pub fn apply_record_respecting_locks(
 
     // Update scalar fields respecting per-field locks; unlocked fields reflect the newly matched record
     // directly so stale values from a previously misidentified paper never persist.
+    let current_work_type: String = tx
+        .query_row(
+            "SELECT work_type FROM documents WHERE id = ?1",
+            params![document_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "article".to_string());
+    let strip_journal_for_book = (!ignore_locks
+        && locked.contains("work_type")
+        && current_work_type == "book")
+        || rec.work_type == WorkType::Book;
+    let effective_journal_abbrev = if strip_journal_for_book {
+        None
+    } else {
+        rec.journal_abbrev.as_deref()
+    };
+    let effective_journal_full = if strip_journal_for_book {
+        None
+    } else {
+        rec.journal_full.as_deref()
+    };
+    let effective_issue_number = if strip_journal_for_book {
+        None
+    } else {
+        rec.issue_number.as_deref()
+    };
+    let effective_issn = if strip_journal_for_book {
+        None
+    } else {
+        rec.issn.as_deref()
+    };
+
     let title_norm = normalize_math_text(&rec.title);
     let pages_norm = rec.pages.as_deref().map(normalize_pages);
     let doi_norm = rec.doi.as_deref().and_then(normalize_doi);
@@ -2351,9 +2531,9 @@ pub fn apply_record_respecting_locks(
             rec.title,
             title_norm,
             locked.contains("journal_abbrev") as i64,
-            rec.journal_abbrev,
+            effective_journal_abbrev,
             locked.contains("journal_full") as i64,
-            rec.journal_full,
+            effective_journal_full,
             locked.contains("booktitle") as i64,
             rec.booktitle,
             locked.contains("series") as i64,
@@ -2361,7 +2541,7 @@ pub fn apply_record_respecting_locks(
             locked.contains("volume") as i64,
             rec.volume,
             locked.contains("issue_number") as i64,
-            rec.issue_number,
+            effective_issue_number,
             locked.contains("year") as i64,
             rec.year,
             locked.contains("pages") as i64,
@@ -2375,7 +2555,7 @@ pub fn apply_record_respecting_locks(
             locked.contains("isbn") as i64,
             rec.isbn,
             locked.contains("issn") as i64,
-            rec.issn,
+            effective_issn,
             locked.contains("doi") as i64,
             doi_norm,
             locked.contains("arxiv_id") as i64,
@@ -5385,6 +5565,9 @@ mod tests {
             locked_authors: false,
             strict_author_filter: false,
             locked_year: false,
+            locked_book: false,
+            page_count: 0,
+            isbn_from_filename: false,
         };
 
         assert!(!verify_candidate_against_context(&cand, &ctx));
@@ -6235,6 +6418,9 @@ mod tests {
             locked_authors: false,
             strict_author_filter: false,
             locked_year: false,
+            locked_book: false,
+            page_count: 0,
+            isbn_from_filename: false,
         };
         let mut hits = Vec::new();
         for i in 0..20usize {
@@ -6888,5 +7074,195 @@ mod tests {
         assert!(!bib.contains("3479904"), "stale MRNUMBER must be removed from BibTeX: {bib}");
         assert!(!bib.contains("10.1098/rsta.2015.0202"), "cleared DOI must not remain in BibTeX: {bib}");
         assert!(!bib.contains("2016"), "cleared YEAR must not remain in BibTeX: {bib}");
+    }
+
+    #[test]
+    fn book_vs_article_rejects_reviews_preserves_long_papers_and_uses_filename_isbn_in_guided_mode() {
+        // 1. Page span parsing
+        assert_eq!(parsed_article_page_count("84"), Some(1));
+        assert_eq!(parsed_article_page_count("888"), Some(1));
+        assert_eq!(parsed_article_page_count("84--86"), Some(3));
+        assert_eq!(parsed_article_page_count("577--685"), Some(109));
+        assert_eq!(parsed_article_page_count("20150202, 16"), Some(16));
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("book_guard.db"), 2).unwrap();
+        let cfg = AppConfig::default();
+
+        // 2. Jolliffe book with locked title/authors/work_type and ISBN in filename (518 pages)
+        let jolliffe_id = {
+            let w = db.writer();
+            let id = create_heuristic_document(&w, "Principal Component Analysis").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            w.execute(
+                "INSERT INTO source_roots (id, root_path, label, is_enabled, is_reachable, created_at)
+                 VALUES ('r1', '/tmp/books', 'Books', 1, 1, ?1)",
+                params![now],
+            )
+            .unwrap();
+            w.execute(
+                "INSERT INTO files (document_id, root_id, rel_path, format, size_bytes, mtime_ns, blake3_hash, is_available, page_count, has_text_layer, created_at, updated_at)
+                 VALUES (?1, 'r1', 'Principal Component Analysis (Springer Series in Statistics) -- I_ T_ Jolliffe -- Springer -- 9780387224404 -- Anna.pdf', 'pdf', 3315850, 1, 'hash-jolliffe', 1, 518, 1, ?2, ?2)",
+                params![id, now],
+            )
+            .unwrap();
+            id
+        };
+
+        apply_manual_metadata_edit_with_locks(
+            &db,
+            &ManualMetadataEdit {
+                document_id: jolliffe_id,
+                work_type: "book".into(),
+                title: "Principal Component Analysis".into(),
+                authors: vec![BibliographicAuthor {
+                    family_name: "Jolliffe".into(),
+                    given_name: "I. T.".into(),
+                    role: "author".into(),
+                }],
+                edited_fields: vec!["work_type".into(), "title".into(), "authors".into()],
+                ..Default::default()
+            },
+            Some(&[
+                "work_type".to_string(),
+                "title".to_string(),
+                "authors".to_string(),
+            ]),
+            false,
+        )
+        .unwrap();
+
+        let ids = gather_document_identifiers(&db, &cfg, jolliffe_id).unwrap();
+        assert!(ids.looks_like_book);
+        assert_eq!(
+            ids.isbn.as_deref(),
+            Some("9780387224404"),
+            "guided book lookup must still harvest checksum-valid ISBN from filename"
+        );
+
+        let book_ctx = GatheredDocContext {
+            ids: ids.clone(),
+            db_title: Some("Principal Component Analysis".into()),
+            verify_text: None,
+            is_guided: true,
+            locked_title: true,
+            locked_authors: true,
+            strict_author_filter: true,
+            locked_year: false,
+            locked_book: true,
+            page_count: 518,
+            isbn_from_filename: true,
+        };
+
+        // 2016 16-page survey article must be heavily penalized on a locked book
+        let jolliffe_2016_article = CandidateMatch {
+            source: "mrlookup".into(),
+            score: 0.96,
+            record: BibliographicRecord {
+                work_type: WorkType::Article,
+                title: "Principal component analysis: a review and recent developments".into(),
+                authors: vec![BibliographicAuthor {
+                    family_name: "Jolliffe".into(),
+                    given_name: "Ian T.".into(),
+                    role: "author".into(),
+                }],
+                journal_abbrev: Some("Philos. Trans. Roy. Soc. A".into()),
+                pages: Some("20150202, 16".into()),
+                year: Some(2016),
+                ..Default::default()
+            },
+        };
+        assert!(
+            context_verification_factor(&jolliffe_2016_article, &book_ctx) <= 0.45,
+            "16-page @article must never auto-match a locked 518-page @book"
+        );
+
+        // 1-page JSTOR book review (like Simmons / Jackson) must be discarded (< 0.30)
+        let jstor_review = CandidateMatch {
+            source: "crossref".into(),
+            score: 0.95,
+            record: BibliographicRecord {
+                work_type: WorkType::Article,
+                title: "Calculus with Analytic Geometry".into(),
+                journal_abbrev: Some("Amer. Math. Monthly".into()),
+                publisher: Some("JSTOR".into()),
+                pages: Some("888".into()),
+                year: Some(1988),
+                ..Default::default()
+            },
+        };
+        assert!(
+            context_verification_factor(&jstor_review, &book_ctx) <= 0.26,
+            "1-page JSTOR book review must be rejected for books"
+        );
+
+        // Real book candidate must pass with factor 1.0
+        let jolliffe_book = CandidateMatch {
+            source: "harvard".into(),
+            score: 0.98,
+            record: BibliographicRecord {
+                work_type: WorkType::Book,
+                title: "Principal component analysis".into(),
+                authors: vec![BibliographicAuthor {
+                    family_name: "Jolliffe".into(),
+                    given_name: "I. T.".into(),
+                    role: "author".into(),
+                }],
+                publisher: Some("Springer".into()),
+                address: Some("New York".into()),
+                series: Some("Springer Series in Statistics".into()),
+                isbn: Some("9780387224404".into()),
+                year: Some(2002),
+                ..Default::default()
+            },
+        };
+        assert!((context_verification_factor(&jolliffe_book, &book_ctx) - 1.0).abs() < 1e-6);
+
+        // Long legitimate journal article (109 pages in a 110-page PDF, unlocked work_type) stays accepted
+        let long_paper_ctx = GatheredDocContext {
+            ids: ExtractedIdentifiers {
+                looks_like_book: true,
+                ..Default::default()
+            },
+            db_title: Some("Long Annals Paper".into()),
+            verify_text: None,
+            is_guided: false,
+            locked_title: false,
+            locked_authors: false,
+            strict_author_filter: false,
+            locked_year: false,
+            locked_book: false,
+            page_count: 110,
+            isbn_from_filename: false,
+        };
+        let long_annals_paper = CandidateMatch {
+            source: "mrlookup".into(),
+            score: 0.97,
+            record: BibliographicRecord {
+                work_type: WorkType::Article,
+                title: "Long Annals Paper".into(),
+                journal_abbrev: Some("Ann. of Math. (2)".into()),
+                pages: Some("577--685".into()),
+                year: Some(2005),
+                ..Default::default()
+            },
+        };
+        assert!(
+            (book_vs_article_factor(&long_annals_paper, &long_paper_ctx) - 1.0).abs() < 1e-6,
+            "legitimate 109-page journal paper must not be penalized"
+        );
+
+        // Applying an article record to a locked book must never pollute journal fields
+        {
+            let w = db.writer();
+            apply_record_respecting_locks(&w, jolliffe_id, &jolliffe_2016_article.record, false)
+                .unwrap();
+        }
+        let after = get_document_metadata(&db, jolliffe_id).unwrap();
+        assert_eq!(after.work_type, "book");
+        assert_eq!(after.journal_abbrev, None);
+        assert_eq!(after.journal_full, None);
+        assert_eq!(after.issue_number, None);
+        assert_eq!(after.issn, None);
     }
 }

@@ -75,7 +75,9 @@ pub struct EmbedPauseGuard(Arc<AppState>);
 
 impl Drop for EmbedPauseGuard {
     fn drop(&mut self) {
-        if self.0.embed_pause_depth.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if self.0.embed_pause_depth.fetch_sub(1, Ordering::SeqCst) == 1
+            && !self.0.embed_user_paused.load(Ordering::SeqCst)
+        {
             self.0.current_embed_control().resume();
         }
     }
@@ -111,6 +113,7 @@ pub struct AppState {
     pub metadata_batch_active: Arc<AtomicBool>,
     pub embed_control: Mutex<Arc<ScanControl>>,
     pub embed_pause_depth: AtomicUsize,
+    pub embed_user_paused: AtomicBool,
     pub embed_worker_running: Arc<AtomicBool>,
     pub embed_worker_reschedule: Arc<AtomicBool>,
     pub watcher: Mutex<Option<RootWatcher>>,
@@ -183,6 +186,7 @@ impl AppState {
             metadata_batch_active: Arc::new(AtomicBool::new(false)),
             embed_control: Mutex::new(Arc::new(ScanControl::new())),
             embed_pause_depth: AtomicUsize::new(0),
+            embed_user_paused: AtomicBool::new(false),
             embed_worker_running: Arc::new(AtomicBool::new(false)),
             embed_worker_reschedule: Arc::new(AtomicBool::new(false)),
             watcher: Mutex::new(None),
@@ -202,9 +206,23 @@ impl AppState {
             .clone()
     }
 
+    pub fn is_embed_effectively_paused(&self) -> bool {
+        self.embed_user_paused.load(Ordering::SeqCst)
+            || self.embed_pause_depth.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn set_embed_user_paused(&self, paused: bool) {
+        self.embed_user_paused.store(paused, Ordering::SeqCst);
+        if paused {
+            self.current_embed_control().pause();
+        } else if self.embed_pause_depth.load(Ordering::SeqCst) == 0 {
+            self.current_embed_control().resume();
+        }
+    }
+
     pub fn reset_embed_control(&self) -> Arc<ScanControl> {
         let next = Arc::new(ScanControl::new());
-        if self.embed_pause_depth.load(Ordering::SeqCst) > 0 {
+        if self.is_embed_effectively_paused() {
             next.pause();
         }
         let mut slot = self.embed_control.lock().expect("embed_control poisoned");
@@ -217,7 +235,7 @@ impl AppState {
         let mut slot = self.embed_control.lock().expect("embed_control poisoned");
         slot.cancel();
         let next = Arc::new(ScanControl::new());
-        if self.embed_pause_depth.load(Ordering::SeqCst) > 0 {
+        if self.is_embed_effectively_paused() {
             next.pause();
         }
         *slot = next;
@@ -602,6 +620,7 @@ impl AppState {
             metadata_batch_active: Arc::new(AtomicBool::new(false)),
             embed_control: Mutex::new(Arc::new(ScanControl::new())),
             embed_pause_depth: AtomicUsize::new(0),
+            embed_user_paused: AtomicBool::new(false),
             embed_worker_running: Arc::new(AtomicBool::new(false)),
             embed_worker_reschedule: Arc::new(AtomicBool::new(false)),
             watcher: Mutex::new(None),

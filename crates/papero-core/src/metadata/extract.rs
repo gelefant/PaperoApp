@@ -2589,6 +2589,22 @@ fn strip_browser_copy_suffix(stem: &str) -> &str {
     }
 }
 
+/// Extracts a checksum-valid ISBN-13 from a document filename stem when present
+/// (e.g. `Principal Component Analysis -- Jolliffe -- 9780387224404 -- Anna's Archive`).
+pub fn extract_isbn_from_filename_stem(stem: &str) -> Option<String> {
+    static FN_ISBN13_RE: StdOnceLock<Regex> = StdOnceLock::new();
+    let fn_isbn13 = FN_ISBN13_RE
+        .get_or_init(|| Regex::new(r"(97[89][-\s]?(?:\d[-\s]?){9}\d)").unwrap());
+    for cap in fn_isbn13.captures_iter(stem) {
+        if let Some(m) = cap.get(1) {
+            if let Some(norm) = normalize_isbn(m.as_str()) {
+                return Some(norm);
+            }
+        }
+    }
+    None
+}
+
 fn parse_filename_metadata(stem: &str) -> FilenameParsed {
     let mut out = FilenameParsed::default();
     let trimmed = strip_browser_copy_suffix(stem.trim());
@@ -2644,14 +2660,7 @@ fn parse_filename_metadata(stem: &str) -> FilenameParsed {
     }
 
     // 2. Check ISBN-13 in filename (e.g. "978-0-387-90244-9_Gilbarg_Trudinger")
-    static FN_ISBN13_RE: StdOnceLock<Regex> = StdOnceLock::new();
-    let fn_isbn13 = FN_ISBN13_RE
-        .get_or_init(|| Regex::new(r"(97[89][-\s]?(?:\d[-\s]?){9}\d)").unwrap());
-    if let Some(c) = fn_isbn13.captures(trimmed) {
-        if let Some(m) = c.get(1) {
-            out.isbn = normalize_isbn(m.as_str());
-        }
-    }
+    out.isbn = extract_isbn_from_filename_stem(trimmed);
 
     // 3. Check compact "SurnameYYYY" / "Surname_YYYY" / "Surname_YYYY_Title_Words" / "YYYY - Surname - Title"
     static SURNAME_YEAR_RE: StdOnceLock<Regex> = StdOnceLock::new();

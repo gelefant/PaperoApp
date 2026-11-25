@@ -7,9 +7,13 @@
   } from '../types';
   import {
     buildManualMetadataEditPayload,
+    clearUnlockedFields,
     computeNextLocksOnTouch,
     formatAuthorsForInput,
+    hasInspectorFormDiff,
+    hasNonEmptyUnlockedFields,
     normalizeInputText,
+    type InspectorFormFields,
   } from '../inspectorUtils';
 
   interface Props {
@@ -273,42 +277,78 @@
     locksModified = true;
   }
 
+  function getFormFields(): InspectorFormFields {
+    return {
+      workType,
+      title,
+      authorsText,
+      yearStr,
+      journalAbbrev,
+      journalFull,
+      booktitle,
+      series,
+      volume,
+      issueNumber,
+      pages,
+      edition,
+      publisher,
+      address,
+      doi,
+      arxivId,
+      mrNumber,
+      mrReviewer,
+      zblNumber,
+      isbn,
+      issn,
+      url,
+      mscPrimary,
+      mscSecondaryText,
+      abstractText,
+      tagsText,
+      excludeFromCloud,
+      touched,
+    };
+  }
+
+  const hasClearableUnlocked = $derived(
+    meta !== null && hasNonEmptyUnlockedFields(getFormFields(), lockedFields)
+  );
+
+  function handleClearUnlockedFields() {
+    if (!meta) return;
+    const { next, clearedFields } = clearUnlockedFields(getFormFields(), lockedFields);
+    if (clearedFields.length === 0) return;
+    authorsText = next.authorsText;
+    yearStr = String(next.yearStr ?? '');
+    journalAbbrev = next.journalAbbrev;
+    journalFull = next.journalFull;
+    booktitle = next.booktitle;
+    series = next.series;
+    volume = next.volume;
+    issueNumber = next.issueNumber;
+    pages = next.pages;
+    edition = next.edition;
+    publisher = next.publisher;
+    address = next.address;
+    doi = next.doi;
+    arxivId = next.arxivId;
+    mrNumber = next.mrNumber;
+    mrReviewer = next.mrReviewer;
+    zblNumber = next.zblNumber;
+    isbn = next.isbn;
+    issn = next.issn;
+    url = next.url;
+    mscPrimary = next.mscPrimary;
+    mscSecondaryText = next.mscSecondaryText;
+    abstractText = next.abstractText;
+    touched = next.touched;
+    saveError = '';
+    saveFeedback = `Svuotati ${clearedFields.length} campi non bloccati: premi Salva (⌘S) o ✓ per confermare.`;
+  }
+
   function buildEditPayload(allowEmptyTitle = false): ManualMetadataEdit | null {
     if (!meta) return null;
-    const res = buildManualMetadataEditPayload(
-      meta,
-      {
-        workType,
-        title,
-        authorsText,
-        yearStr,
-        journalAbbrev,
-        journalFull,
-        booktitle,
-        series,
-        volume,
-        issueNumber,
-        pages,
-        edition,
-        publisher,
-        address,
-        doi,
-        arxivId,
-        mrNumber,
-        mrReviewer,
-        zblNumber,
-        isbn,
-        issn,
-        url,
-        mscPrimary,
-        mscSecondaryText,
-        abstractText,
-        tagsText,
-        excludeFromCloud,
-        touched,
-      },
-      allowEmptyTitle
-    );
+    const res = buildManualMetadataEditPayload(meta, getFormFields(), allowEmptyTitle);
     if (!res.ok) {
       saveError = res.error;
       return null;
@@ -318,12 +358,11 @@
 
   function hasUnsavedFormDiff(): boolean {
     if (!meta) return false;
-    if (touched.length > 0 || locksModified) return true;
-    if (title.trim() !== (meta.title ?? '').trim()) return true;
-    if (authorsText.trim() !== formatAuthorsForInput(meta.authors).trim()) return true;
-    const metaYearStr = meta.year !== null && meta.year !== undefined ? String(meta.year) : '';
-    if (normalizeInputText(yearStr) !== metaYearStr) return true;
-    return false;
+    return hasInspectorFormDiff(meta, getFormFields(), locksModified);
+  }
+
+  export function hasUnsavedChanges(): boolean {
+    return hasUnsavedFormDiff();
   }
 
   function computeEffectiveSaveLocks(): string[] {
@@ -359,12 +398,12 @@
     return true;
   }
 
-  async function handleSave(e: Event) {
-    e.preventDefault();
+  export async function triggerSave(): Promise<boolean> {
+    if (!meta || saving) return false;
     saveError = '';
     saveFeedback = '';
     const payload = buildEditPayload(false);
-    if (!payload) return;
+    if (!payload) return false;
     if (fetchingOnline && onCancelFetch) {
       onCancelFetch();
     }
@@ -379,11 +418,18 @@
       touched = [];
       locksModified = false;
       saveFeedback = 'Metadati salvati.';
+      return true;
     } catch (err) {
       saveError = `Errore salvataggio metadati: ${String(err)}`;
+      return false;
     } finally {
       saving = false;
     }
+  }
+
+  async function handleSave(e: Event) {
+    e.preventDefault();
+    await triggerSave();
   }
 
   async function handleGuidedFetchClick() {
@@ -698,8 +744,8 @@
 
     <div class="source-row">
       <span>Fonte: <strong>{meta.metadata_source ?? 'locale/euristica'}</strong></span>
-      {#if lockedFields.length > 0}
-        <div class="lock-summary">
+      <div class="lock-summary">
+        {#if lockedFields.length > 0}
           <span class="lock-pill" title={lockedFields.join(', ')}>
             🔒 {lockedFields.length} {lockedFields.length === 1 ? 'bloccato' : 'bloccati'}
           </span>
@@ -711,8 +757,18 @@
           >
             Sblocca tutti
           </button>
-        </div>
-      {/if}
+        {/if}
+        {#if hasClearableUnlocked}
+          <button
+            type="button"
+            class="unlock-all-btn clear-unlocked-btn"
+            onclick={handleClearUnlockedFields}
+            title="Svuota tutti i campi non bloccati lasciando intatti i campi bloccati 🔒"
+          >
+            Pulisci non bloccati
+          </button>
+        {/if}
+      </div>
     </div>
 
     {#if meta.metadata_license_note || meta.metadata_source === 'zbmath'}
@@ -898,14 +954,19 @@
         </div>
       </div>
 
+      <div class="field-group">
+        {@render fieldHead('Booktitle', 'booktitle')}
+        <input type="text" bind:value={booktitle} oninput={() => touch('booktitle', booktitle)} />
+      </div>
+
       <div class="two-col">
-        <div class="field-group">
-          {@render fieldHead('Booktitle', 'booktitle')}
-          <input type="text" bind:value={booktitle} oninput={() => touch('booktitle', booktitle)} />
-        </div>
         <div class="field-group">
           {@render fieldHead('Serie', 'series')}
           <input type="text" bind:value={series} oninput={() => touch('series', series)} />
+        </div>
+        <div class="field-group">
+          {@render fieldHead('Edizione', 'edition')}
+          <input type="text" bind:value={edition} oninput={() => touch('edition', edition)} />
         </div>
       </div>
 
@@ -915,8 +976,13 @@
           <input type="text" bind:value={publisher} oninput={() => touch('publisher', publisher)} />
         </div>
         <div class="field-group">
-          {@render fieldHead('Edizione', 'edition')}
-          <input type="text" bind:value={edition} oninput={() => touch('edition', edition)} />
+          {@render fieldHead('Città / Indirizzo', 'address')}
+          <input
+            type="text"
+            placeholder="es. New York"
+            bind:value={address}
+            oninput={() => touch('address', address)}
+          />
         </div>
       </div>
 
@@ -1002,7 +1068,12 @@
       {/if}
 
       <div class="bottom-actions">
-        <button type="submit" class="primary save-btn" disabled={saving}>
+        <button
+          type="submit"
+          class="primary save-btn"
+          disabled={saving}
+          title="Salva metadati (⌘S / Ctrl+S)"
+        >
           {saving ? 'Salvataggio…' : touched.length > 0 || locksModified ? 'Salva modifiche e blocchi' : 'Salva metadati'}
         </button>
         <button
@@ -1166,6 +1237,11 @@
   .unlock-all-btn:hover {
     color: var(--text);
     background: var(--bg-muted);
+  }
+  .clear-unlocked-btn:hover {
+    border-color: rgba(220, 38, 38, 0.5);
+    color: #b91c1c;
+    background: rgba(220, 38, 38, 0.08);
   }
   .notice {
     padding: 5px 8px;

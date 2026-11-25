@@ -10,6 +10,7 @@ import type {
   DownloadProgressEvent,
   DuplicateGroupView,
   DuplicateReport,
+  EmbedProgressStatus,
   ExternalReaderPreset,
   ExtractedSpan,
   FileViewerInfo,
@@ -157,6 +158,9 @@ export const api = {
   },
   cancelMetadataBatch: () => invoke<void>('cancel_metadata_batch_cmd'),
   cancelSingleMetadata: () => invoke<void>('cancel_single_metadata_cmd'),
+  getEmbedProgress: () => invoke<EmbedProgressStatus>('get_embed_progress_cmd'),
+  setEmbedPaused: (paused: boolean) =>
+    invoke<EmbedProgressStatus>('set_embed_paused_cmd', { paused }),
   confirmCandidate: (documentId: number, candidateId: number, overwriteQueryFields = false) =>
     invoke<DocumentMetadataView>('confirm_candidate', {
       documentId,

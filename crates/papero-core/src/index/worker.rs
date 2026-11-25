@@ -328,6 +328,26 @@ struct QueuedEmbedJob {
     file_id: i64,
 }
 
+/// Returns `(total_embeddable_files, embedded_files)` for the given `profile` across all
+/// currently reachable files that have a text layer (matching the exact `run_embed_queue` scope).
+pub fn count_embed_progress(db: &Database, profile: ModelProfile) -> Result<(i64, i64)> {
+    let embedded_col = match profile {
+        ModelProfile::Light => "embedded_light",
+        ModelProfile::Quality => "embedded_quality",
+    };
+    let r = db.reader();
+    let sql = format!(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN f.{embedded_col} != 0 THEN 1 ELSE 0 END), 0)
+         FROM files f
+         JOIN source_roots sr ON sr.id = f.root_id
+         WHERE sr.is_reachable = 1
+           AND f.has_text_layer = 1"
+    );
+    let pair = r.query_row(&sql, [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    Ok(pair)
+}
+
 /// Phase 2 background embedding worker: generates vector embeddings for passages using
 /// the active ONNX profile (`Light` or `Quality`), stores them into `VectorIndex`, and
 /// updates `files.embedded_* = 1` + `index_state = 'ready'`.
@@ -340,6 +360,31 @@ pub fn run_embed_queue(
     profile: ModelProfile,
     config: &AppConfig,
     control: Option<&ScanControl>,
+) -> Result<WorkerBatchReport> {
+    run_embed_queue_with_progress(
+        db,
+        vector_index,
+        embedder_slot,
+        models_dir,
+        profile,
+        config,
+        control,
+        None,
+    )
+}
+
+/// Same as [`run_embed_queue`], invoking `on_progress` whenever completed embeddings are flushed
+/// to disk or when the worker starts/finishes/pauses.
+#[allow(clippy::too_many_arguments)]
+pub fn run_embed_queue_with_progress(
+    db: &Database,
+    vector_index: &VectorIndex,
+    embedder_slot: &LazyModelSlot<OnnxEmbedder>,
+    models_dir: &Path,
+    profile: ModelProfile,
+    config: &AppConfig,
+    control: Option<&ScanControl>,
+    on_progress: Option<&(dyn Fn() + Sync)>,
 ) -> Result<WorkerBatchReport> {
     let _ = set_current_thread_priority(ThreadPriority::Min);
     let mut report = WorkerBatchReport::default();
@@ -358,7 +403,13 @@ pub fn run_embed_queue(
 
     let jobs = load_pending_embed_jobs(db, stage, embedded_col)?;
     if jobs.is_empty() {
+        if let Some(cb) = on_progress {
+            cb();
+        }
         return Ok(report);
+    }
+    if let Some(cb) = on_progress {
+        cb();
     }
 
     let default_ctrl = ScanControl::new();
@@ -380,6 +431,9 @@ pub fn run_embed_queue(
         if ctrl.is_paused() || ctrl.is_cancelled() {
             flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
             buffered_passages = 0;
+            if let Some(cb) = on_progress {
+                cb();
+            }
         }
         if ctrl.wait_if_paused().is_err() || ctrl.is_cancelled() {
             break;
@@ -397,6 +451,9 @@ pub fn run_embed_queue(
             if ctrl.is_paused() || ctrl.is_cancelled() {
                 flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
                 buffered_passages = 0;
+                if let Some(cb) = on_progress {
+                    cb();
+                }
             }
             if ctrl.wait_if_paused().is_err() || ctrl.is_cancelled() {
                 stopped = true;
@@ -452,10 +509,16 @@ pub fn run_embed_queue(
         {
             flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
             buffered_passages = 0;
+            if let Some(cb) = on_progress {
+                cb();
+            }
         }
     }
 
     flush_completed_embed_jobs(db, vector_index, embedded_col, &mut pending_completed)?;
+    if let Some(cb) = on_progress {
+        cb();
+    }
 
     Ok(report)
 }

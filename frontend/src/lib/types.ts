@@ -620,3 +620,14 @@ export interface LlmKeyVerifyResult {
   models: LlmModelInfo[];
   message: string;
 }
+
+export interface EmbedProgressStatus {
+  profile: string;
+  profile_ready: boolean;
+  total_files: number;
+  embedded_files: number;
+  pending_files: number;
+  running: boolean;
+  paused: boolean;
+  user_paused: boolean;
+}

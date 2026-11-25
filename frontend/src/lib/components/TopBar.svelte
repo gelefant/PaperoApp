@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import { APP_VERSION } from '../appVersion';
   import { tr, type Lang } from '../i18n';
   import type {
     DownloadProgressEvent,
+    EmbedProgressStatus,
     ExternalReaderPreset,
     MetadataSearchFilter,
     MlEnvironmentStatus,
@@ -26,6 +28,7 @@
     totalDocsCount?: number;
     unresolvedMetaCount?: number;
     fetchingBulkMeta?: boolean;
+    embedProgress?: EmbedProgressStatus | null;
     roots: SourceRoot[];
     settings: UiSettingsPayload | null;
     mlStatus: MlEnvironmentStatus | null;
@@ -45,6 +48,7 @@
     onAddFolder: () => void;
     onRescan: () => void;
     onControlRescan: (action: 'pause' | 'resume' | 'cancel') => void;
+    onToggleEmbedPaused?: (paused: boolean) => void;
     onFetchAllMetadata?: () => void;
     onCancelBulkMetadata?: () => void;
     onExportBibtex: () => void;
@@ -69,6 +73,7 @@
     totalDocsCount = 0,
     unresolvedMetaCount = 0,
     fetchingBulkMeta = false,
+    embedProgress = null,
     roots,
     settings,
     mlStatus,
@@ -88,6 +93,7 @@
     onAddFolder,
     onRescan,
     onControlRescan,
+    onToggleEmbedPaused,
     onFetchAllMetadata,
     onCancelBulkMetadata,
     onExportBibtex,
@@ -209,8 +215,8 @@
       <polygon points="17,5 22,7 19,8.5" fill="#ea580c" />
       <polygon points="6,15 17,15 13,20 4,18" fill="#fcd34d" />
     </svg>
-    <strong class="brand-name" title="Papero v0.3.5">Papero</strong>
-    <span class="brand-version" title="Papero v0.3.5">0.3.5</span>
+    <strong class="brand-name" title={`Papero v${APP_VERSION}`}>Papero</strong>
+    <span class="brand-version" title={`Papero v${APP_VERSION}`}>{APP_VERSION}</span>
     <span
       class="roots-pill"
       title={roots.length > 0
@@ -308,6 +314,53 @@
   </form>
 
   <div class="actions">
+    {#if embedProgress && embedProgress.profile_ready && (embedProgress.pending_files > 0 || embedProgress.running)}
+      <div
+        class="embed-pill"
+        class:paused={embedProgress.paused}
+        title={lang === 'en'
+          ? `Background ML embedding (${embedProgress.profile}): ${embedProgress.embedded_files}/${embedProgress.total_files} files${embedProgress.paused ? ' (paused)' : ''}`
+          : `Indicizzazione vettoriale ML (${embedProgress.profile}): ${embedProgress.embedded_files}/${embedProgress.total_files} file${embedProgress.paused ? ' (in pausa)' : ''}`}
+      >
+        <span class="embed-dot" class:paused={embedProgress.paused} aria-hidden="true"></span>
+        <span class="embed-label">
+          Embedding {embedProgress.embedded_files}/{embedProgress.total_files}
+        </span>
+        {#if onToggleEmbedPaused}
+          <button
+            type="button"
+            class="embed-ctrl-btn"
+            aria-label={embedProgress.user_paused
+              ? lang === 'en'
+                ? 'Resume ML embedding'
+                : 'Riprendi embedding ML'
+              : lang === 'en'
+                ? 'Pause ML embedding'
+                : 'Metti in pausa embedding ML'}
+            title={embedProgress.user_paused
+              ? lang === 'en'
+                ? 'Resume background ML embedding'
+                : 'Riprendi indicizzazione ML in background'
+              : lang === 'en'
+                ? 'Pause background ML embedding to save CPU/battery'
+                : 'Metti in pausa indicizzazione ML per risparmiare CPU/batteria'}
+            onclick={() => onToggleEmbedPaused(!embedProgress.user_paused)}
+          >
+            {#if embedProgress.user_paused}
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true">
+                <polygon points="6,4 20,12 6,20" />
+              </svg>
+            {:else}
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true">
+                <rect x="6" y="4" width="4" height="16" rx="1" />
+                <rect x="14" y="4" width="4" height="16" rx="1" />
+              </svg>
+            {/if}
+          </button>
+        {/if}
+      </div>
+    {/if}
+
     <!-- Gruppo 1: Cartelle, Scansione & Metadati -->
     <div class="btn-group">
       <button
@@ -1189,6 +1242,63 @@
     gap: 6px;
     flex-shrink: 0;
     white-space: nowrap;
+  }
+  .embed-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 6px 3px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-muted);
+    font-size: 11px;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .embed-pill.paused {
+    border-color: rgba(217, 119, 6, 0.5);
+    background: rgba(245, 158, 11, 0.14);
+  }
+  .embed-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: embed-pulse 1.5s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .embed-dot.paused {
+    background: #d97706;
+    animation: none;
+  }
+  @keyframes embed-pulse {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  .embed-label {
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+  }
+  .embed-ctrl-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .embed-ctrl-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .btn-group {
     display: inline-flex;

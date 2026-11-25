@@ -188,3 +188,130 @@ export function buildManualMetadataEditPayload(
     },
   };
 }
+
+type ClearableStringKey =
+  | 'authorsText'
+  | 'journalAbbrev'
+  | 'journalFull'
+  | 'booktitle'
+  | 'series'
+  | 'volume'
+  | 'issueNumber'
+  | 'pages'
+  | 'edition'
+  | 'publisher'
+  | 'address'
+  | 'doi'
+  | 'arxivId'
+  | 'mrNumber'
+  | 'mrReviewer'
+  | 'zblNumber'
+  | 'isbn'
+  | 'issn'
+  | 'url'
+  | 'mscPrimary'
+  | 'mscSecondaryText'
+  | 'abstractText';
+
+const CLEARABLE_FIELD_MAP: ReadonlyArray<{ lockKey: string; prop: ClearableStringKey | 'yearStr' }> = [
+  { lockKey: 'authors', prop: 'authorsText' },
+  { lockKey: 'year', prop: 'yearStr' },
+  { lockKey: 'pages', prop: 'pages' },
+  { lockKey: 'journal_abbrev', prop: 'journalAbbrev' },
+  { lockKey: 'journal_full', prop: 'journalFull' },
+  { lockKey: 'booktitle', prop: 'booktitle' },
+  { lockKey: 'series', prop: 'series' },
+  { lockKey: 'volume', prop: 'volume' },
+  { lockKey: 'issue_number', prop: 'issueNumber' },
+  { lockKey: 'edition', prop: 'edition' },
+  { lockKey: 'publisher', prop: 'publisher' },
+  { lockKey: 'address', prop: 'address' },
+  { lockKey: 'doi', prop: 'doi' },
+  { lockKey: 'arxiv_id', prop: 'arxivId' },
+  { lockKey: 'mr_number', prop: 'mrNumber' },
+  { lockKey: 'mr_reviewer', prop: 'mrReviewer' },
+  { lockKey: 'zbl_number', prop: 'zblNumber' },
+  { lockKey: 'isbn', prop: 'isbn' },
+  { lockKey: 'issn', prop: 'issn' },
+  { lockKey: 'url', prop: 'url' },
+  { lockKey: 'msc_primary', prop: 'mscPrimary' },
+  { lockKey: 'msc_secondary', prop: 'mscSecondaryText' },
+  { lockKey: 'abstract_text', prop: 'abstractText' },
+];
+
+export function hasNonEmptyUnlockedFields(
+  fields: InspectorFormFields,
+  lockedFields: string[]
+): boolean {
+  for (const { lockKey, prop } of CLEARABLE_FIELD_MAP) {
+    if (lockedFields.includes(lockKey)) continue;
+    if (normalizeInputText(fields[prop]) !== '') {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Empties every unlocked bibliographic field (keeping `work_type`, `title`, locked fields 🔒,
+ * tags, and cloud-exclusion untouched) so wrong fetched metadata can be wiped in one click.
+ */
+export function clearUnlockedFields(
+  fields: InspectorFormFields,
+  lockedFields: string[]
+): { next: InspectorFormFields; clearedFields: string[] } {
+  const next: InspectorFormFields = { ...fields, touched: [...fields.touched] };
+  const clearedFields: string[] = [];
+  for (const { lockKey, prop } of CLEARABLE_FIELD_MAP) {
+    if (lockedFields.includes(lockKey)) continue;
+    if (normalizeInputText(next[prop]) !== '') {
+      next[prop] = '';
+      clearedFields.push(lockKey);
+      if (!next.touched.includes(lockKey)) {
+        next.touched.push(lockKey);
+      }
+    }
+  }
+  return { next, clearedFields };
+}
+
+export function hasInspectorFormDiff(
+  meta: DocumentMetadataView,
+  fields: InspectorFormFields,
+  locksModified: boolean
+): boolean {
+  if (fields.touched.length > 0 || locksModified) return true;
+  if (fields.workType !== (meta.work_type || 'article')) return true;
+  if (normalizeInputText(fields.title) !== (meta.title ?? '').trim()) return true;
+  if (normalizeInputText(fields.authorsText) !== formatAuthorsForInput(meta.authors).trim()) {
+    return true;
+  }
+  const metaYearStr = meta.year !== null && meta.year !== undefined ? String(meta.year) : '';
+  if (normalizeInputText(fields.yearStr) !== metaYearStr) return true;
+  if (normalizeInputText(fields.pages) !== (meta.pages ?? '').trim()) return true;
+  if (normalizeInputText(fields.journalAbbrev) !== (meta.journal_abbrev ?? '').trim()) return true;
+  if (normalizeInputText(fields.journalFull) !== (meta.journal_full ?? '').trim()) return true;
+  if (normalizeInputText(fields.booktitle) !== (meta.booktitle ?? '').trim()) return true;
+  if (normalizeInputText(fields.series) !== (meta.series ?? '').trim()) return true;
+  if (normalizeInputText(fields.volume) !== (meta.volume ?? '').trim()) return true;
+  if (normalizeInputText(fields.issueNumber) !== (meta.issue_number ?? '').trim()) return true;
+  if (normalizeInputText(fields.edition) !== (meta.edition ?? '').trim()) return true;
+  if (normalizeInputText(fields.publisher) !== (meta.publisher ?? '').trim()) return true;
+  if (normalizeInputText(fields.address) !== (meta.address ?? '').trim()) return true;
+  if (normalizeInputText(fields.doi) !== (meta.doi ?? '').trim()) return true;
+  if (normalizeInputText(fields.arxivId) !== (meta.arxiv_id ?? '').trim()) return true;
+  if (normalizeInputText(fields.mrNumber) !== (meta.mr_number ?? '').trim()) return true;
+  if (normalizeInputText(fields.mrReviewer) !== (meta.mr_reviewer ?? '').trim()) return true;
+  if (normalizeInputText(fields.zblNumber) !== (meta.zbl_number ?? '').trim()) return true;
+  if (normalizeInputText(fields.isbn) !== (meta.isbn ?? '').trim()) return true;
+  if (normalizeInputText(fields.issn) !== (meta.issn ?? '').trim()) return true;
+  if (normalizeInputText(fields.url) !== (meta.url ?? '').trim()) return true;
+  if (normalizeInputText(fields.mscPrimary) !== (meta.msc_primary ?? '').trim()) return true;
+  if (normalizeInputText(fields.mscSecondaryText) !== meta.msc_secondary.join(', ').trim()) {
+    return true;
+  }
+  if (normalizeInputText(fields.abstractText) !== (meta.abstract_text ?? '').trim()) return true;
+  if (normalizeInputText(fields.tagsText) !== meta.tags.join(', ').trim()) return true;
+  if (fields.excludeFromCloud !== meta.exclude_from_cloud_llm) return true;
+  return false;
+}

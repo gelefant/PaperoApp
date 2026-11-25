@@ -13,6 +13,7 @@
     DownloadProgressEvent,
     DuplicateFileMember,
     DuplicateGroupView,
+    EmbedProgressStatus,
     ExternalReaderPreset,
     HybridSearchStats,
     LlmAnswerResult,
@@ -82,6 +83,7 @@
   let searchStats = $state<HybridSearchStats | null>(null);
   let mlStatus = $state<MlEnvironmentStatus | null>(null);
   let mlDownloadProgress = $state<DownloadProgressEvent | null>(null);
+  let embedProgress = $state<EmbedProgressStatus | null>(null);
   let activeLeftView = $state<'library' | 'duplicates'>('library');
   let duplicateGroups = $state.raw<DuplicateGroupView[]>([]);
   let scanningDedup = $state(false);
@@ -99,9 +101,12 @@
   let activeTabId = $state<string | null>(null);
   let contextTarget = $state<ContextTarget | null>(null);
   let topBarRef = $state<{ focusSearch?: () => void } | null>(null);
-  let inspectorRef = $state<{ savePendingIfForDoc: (docId: number) => Promise<boolean> } | null>(
-    null
-  );
+  let inspectorRef = $state<{
+    savePendingIfForDoc: (docId: number) => Promise<boolean>;
+    hasUnsavedChanges: () => boolean;
+    triggerSave: () => Promise<boolean>;
+  } | null>(null);
+  let pendingDocSwitch = $state<{ targetDocId: number; afterSwitch?: () => void } | null>(null);
   let settingsOpen = $state(false);
   let settingsInitialTab = $state<SettingsTabId | null>(null);
   let wizardOpen = $state(false);
@@ -121,6 +126,7 @@
   let unlistenFs: UnlistenFn | null = null;
   let unlistenBackup: UnlistenFn | null = null;
   let unlistenDuplicates: UnlistenFn | null = null;
+  let unlistenEmbed: UnlistenFn | null = null;
   let appDestroyed = false;
   let fsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let docsReqSeq = 0;
@@ -320,6 +326,7 @@
     }
 
     await refreshDocuments(true);
+    void refreshEmbedProgress();
     const allLibraryDocs = allDocuments;
 
     // Close viewer tabs pointing to files that were removed
@@ -453,6 +460,55 @@
     }
   }
 
+  function requestSelectDocument(docId: number, afterSwitch?: () => void) {
+    if (
+      inspectorOpen &&
+      selectedDocId !== null &&
+      selectedDocId !== docId &&
+      inspectorRef?.hasUnsavedChanges()
+    ) {
+      pendingDocSwitch = { targetDocId: docId, afterSwitch };
+      return;
+    }
+    void loadInspectorMetadata(docId);
+    afterSwitch?.();
+  }
+
+  async function resolvePendingDocSwitch(action: 'save' | 'discard' | 'cancel') {
+    const pending = pendingDocSwitch;
+    if (!pending) return;
+    if (action === 'cancel') {
+      pendingDocSwitch = null;
+      return;
+    }
+    if (action === 'save') {
+      const ok = await inspectorRef?.triggerSave();
+      if (ok === false) {
+        pendingDocSwitch = null;
+        return;
+      }
+    }
+    pendingDocSwitch = null;
+    await loadInspectorMetadata(pending.targetDocId);
+    pending.afterSwitch?.();
+  }
+
+  async function refreshEmbedProgress() {
+    try {
+      embedProgress = await api.getEmbedProgress();
+    } catch {
+      // Ignore transient startup race
+    }
+  }
+
+  async function handleToggleEmbedPaused(paused: boolean) {
+    try {
+      embedProgress = await api.setEmbedPaused(paused);
+    } catch (e) {
+      scanStatusText = `Errore controllo embedding ML: ${String(e)}`;
+    }
+  }
+
   async function refreshMlStatus() {
     mlStatus = await api.listModelStatuses();
   }
@@ -498,6 +554,7 @@
     mlStatus = updated;
     if (updated.profiles.find((p) => p.profile === profile)?.ready) {
       scanStatusText = `Modelli ${profile} scaricati e verificati (SHA-256). Indicizzazione vettoriale avviata in background.`;
+      void refreshEmbedProgress();
     }
   }
 
@@ -512,16 +569,18 @@
 
   onMount(async () => {
     if (detachedFileId !== null) return;
-    const [cfg, pr, ml, ocr] = await Promise.all([
+    const [cfg, pr, ml, ocr, emb] = await Promise.all([
       api.getUiSettings(),
       api.listExternalPresets(),
       api.listModelStatuses(),
       api.getOcrStatus(),
+      api.getEmbedProgress().catch(() => null),
     ]);
     settings = cfg;
     presets = pr;
     mlStatus = ml;
     ocrStatus = ocr;
+    embedProgress = emb;
     if (!cfg.first_run_completed) {
       wizardOpen = true;
     }
@@ -574,6 +633,17 @@
       return;
     }
     unlistenDuplicates = unDup;
+
+    const unEmb = await listen<EmbedProgressStatus>('papero://embed-progress', (ev) => {
+      if (!appDestroyed) {
+        embedProgress = ev.payload;
+      }
+    });
+    if (appDestroyed) {
+      unEmb();
+      return;
+    }
+    unlistenEmbed = unEmb;
   });
 
   onDestroy(() => {
@@ -585,6 +655,7 @@
     unlistenFs?.();
     unlistenBackup?.();
     unlistenDuplicates?.();
+    unlistenEmbed?.();
   });
 
   async function handleAddFolder() {
@@ -897,7 +968,6 @@
   }
 
   function handleOpenPassage(doc: ContentSearchDocResult, pass: ContentSearchPassageHit) {
-    loadInspectorMetadata(doc.document_id);
     const matches: ViewerTargetPassage[] = doc.passages.map((p) => ({
       page_ord: p.page_ord,
       printed_label: p.printed_label,
@@ -905,19 +975,20 @@
       text_content: p.text_content,
     }));
     const idx = doc.passages.findIndex((p) => p.passage_id === pass.passage_id);
-    openInViewer(
-      pass.file_id,
-      doc.title,
-      doc.format,
-      pass.page_ord,
-      pass.bboxes,
-      matches,
-      Math.max(0, idx)
-    );
+    requestSelectDocument(doc.document_id, () => {
+      openInViewer(
+        pass.file_id,
+        doc.title,
+        doc.format,
+        pass.page_ord,
+        pass.bboxes,
+        matches,
+        Math.max(0, idx)
+      );
+    });
   }
 
   function handleOpenCitation(c: LlmCitation) {
-    loadInspectorMetadata(c.document_id);
     const matchingDoc = searchResults?.find((d) => d.document_id === c.document_id);
     const matches: ViewerTargetPassage[] = matchingDoc
       ? matchingDoc.passages.map((p) => ({
@@ -937,15 +1008,17 @@
     const idx = matches.findIndex(
       (m) => m.page_ord === c.page_ord && m.bboxes.length === c.bboxes.length
     );
-    openInViewer(
-      c.file_id,
-      c.doc_title,
-      matchingDoc?.format ?? 'pdf',
-      c.page_ord,
-      c.bboxes,
-      matches,
-      Math.max(0, idx)
-    );
+    requestSelectDocument(c.document_id, () => {
+      openInViewer(
+        c.file_id,
+        c.doc_title,
+        matchingDoc?.format ?? 'pdf',
+        c.page_ord,
+        c.bboxes,
+        matches,
+        Math.max(0, idx)
+      );
+    });
   }
 
   function handleSelectMatchIndex(tabId: string, idx: number) {
@@ -980,7 +1053,7 @@
   async function handleSaveSettings(next: UiSettingsPayload) {
     settings = next;
     await api.saveUiSettings(next);
-    await refreshLlmPreview();
+    await Promise.all([refreshLlmPreview(), refreshEmbedProgress()]);
   }
 
   async function handleToggleRoot(rootId: string, enabled: boolean) {
@@ -1161,10 +1234,19 @@
         target.isContentEditable);
 
     if (e.key === 'Escape') {
-      if (cloudConsentModal) cloudConsentModal = null;
+      if (pendingDocSwitch) pendingDocSwitch = null;
+      else if (cloudConsentModal) cloudConsentModal = null;
       else if (contextTarget) contextTarget = null;
       else if (settingsOpen) settingsOpen = false;
       else if (wizardOpen) wizardOpen = false;
+      return;
+    }
+
+    if (mod && e.key.toLowerCase() === 's') {
+      if (inspectorOpen && selectedDocId !== null && inspectorRef && !settingsOpen && !wizardOpen) {
+        e.preventDefault();
+        void inspectorRef.triggerSave();
+      }
       return;
     }
 
@@ -1570,6 +1652,7 @@
       totalDocsCount={allDocuments.length}
       {unresolvedMetaCount}
       {fetchingBulkMeta}
+      {embedProgress}
       {roots}
       {settings}
       {mlStatus}
@@ -1596,6 +1679,7 @@
       onAddFolder={handleAddFolder}
       onRescan={handleRescan}
       onControlRescan={(act) => api.controlRescan(act)}
+      onToggleEmbedPaused={handleToggleEmbedPaused}
       onFetchAllMetadata={handleFetchAllMetadata}
       onCancelBulkMetadata={handleCancelBulkMetadata}
       onExportBibtex={handleExportBibtex}
@@ -1685,8 +1769,9 @@
             onResolve={handleResolveDuplicate}
             onOpenSideBySide={handleOpenSideBySide}
             onOpenMember={(m) => {
-              loadInspectorMetadata(m.document_id);
-              openInViewer(m.file_id, m.title, m.format, 1);
+              requestSelectDocument(m.document_id, () => {
+                openInViewer(m.file_id, m.title, m.format, 1);
+              });
             }}
             onRevealFile={(fid) => api.revealFileInFolder(fid)}
           />
@@ -1738,11 +1823,12 @@
             onToggleSortDir={handleToggleSortDir}
             onToggleVerified={(docId, verified) => handleToggleDocVerified(docId, verified, false)}
             onSelectDoc={(doc) => {
-              loadInspectorMetadata(doc.document_id);
+              requestSelectDocument(doc.document_id);
             }}
             onOpenDoc={(doc) => {
-              loadInspectorMetadata(doc.document_id);
-              openInViewer(doc.file_id, doc.title, doc.format, 1);
+              requestSelectDocument(doc.document_id, () => {
+                openInViewer(doc.file_id, doc.title, doc.format, 1);
+              });
             }}
             onConfirmMsc={handleConfirmMsc}
             onRejectMsc={handleRejectMsc}
@@ -1829,7 +1915,7 @@
       onOpenExternal={(fid, page, tpl) => api.openFileExternal(fid, page, tpl)}
       onInspectMetadata={(docId) => {
         inspectorOpen = true;
-        loadInspectorMetadata(docId);
+        requestSelectDocument(docId);
       }}
       onCopyBibtex={(docId) => handleCopyBibtex(docId)}
       onRunOcr={(fid) => handleRunOcrForFile(fid)}
@@ -1944,6 +2030,38 @@
               </button>
               <button type="button" class="primary" onclick={confirmAndRunCloudConsent}>
                 {lang === 'en' ? 'I understand, send query' : 'Ho capito, invia ora'}
+              </button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if pendingDocSwitch}
+        <div
+          class="consent-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label={lang === 'en' ? 'Unsaved Metadata Changes' : 'Modifiche Metadati Non Salvate'}
+        >
+          <div class="consent-dialog">
+            <h3>
+              {lang === 'en'
+                ? 'Unsaved changes in the Metadata Inspector'
+                : 'Modifiche non salvate nell’Ispettore Metadati'}
+            </h3>
+            <p>
+              {lang === 'en'
+                ? 'You have unsaved edits on the current document. Save them before switching, or discard them?'
+                : 'Ci sono modifiche non ancora salvate sul documento corrente. Vuoi salvarle prima di cambiare documento o scartarle?'}
+            </p>
+            <div class="consent-actions">
+              <button type="button" onclick={() => resolvePendingDocSwitch('cancel')}>
+                {lang === 'en' ? 'Cancel' : 'Annulla'}
+              </button>
+              <button type="button" onclick={() => resolvePendingDocSwitch('discard')}>
+                {lang === 'en' ? 'Discard changes' : 'Scarta modifiche'}
+              </button>
+              <button type="button" class="primary" onclick={() => resolvePendingDocSwitch('save')}>
+                {lang === 'en' ? 'Save & switch' : 'Salva e cambia'}
               </button>
             </div>
           </div>

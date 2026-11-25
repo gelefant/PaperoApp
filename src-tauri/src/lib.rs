@@ -243,6 +243,8 @@ pub fn run() {
             commands::fetch_all_metadata_cmd,
             commands::cancel_metadata_batch_cmd,
             commands::cancel_single_metadata_cmd,
+            commands::get_embed_progress_cmd,
+            commands::set_embed_paused_cmd,
             commands::confirm_candidate,
             commands::dismiss_candidate,
             commands::get_document_bibtex,

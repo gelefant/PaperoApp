@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import type { DocumentMetadataView } from './types';
 import {
   buildManualMetadataEditPayload,
+  clearUnlockedFields,
   computeNextLocksOnTouch,
+  hasInspectorFormDiff,
+  hasNonEmptyUnlockedFields,
   normalizeInputText,
   parseYearInput,
   type InspectorFormFields,
@@ -177,5 +180,75 @@ describe('inspectorUtils', () => {
     if (res.ok) {
       expect(res.payload.year).toBe(2002);
     }
+  });
+
+  it('clears all unlocked wrong fetched fields in one step while preserving locked fields', () => {
+    const meta = makeJolliffeMeta();
+    const initial: InspectorFormFields = {
+      workType: 'book',
+      title: 'Principal Component Analysis',
+      authorsText: 'Jolliffe, I. T.',
+      yearStr: '2016',
+      journalAbbrev: 'Philos. Trans. Roy. Soc. A',
+      journalFull:
+        'Philosophical Transactions of the Royal Society A. Mathematical, Physical and Engineering Sciences',
+      booktitle: '',
+      series: '',
+      volume: '374',
+      issueNumber: '2065',
+      pages: '20150202, 16',
+      edition: '',
+      publisher: '',
+      address: '',
+      doi: '10.1098/rsta.2015.0202',
+      arxivId: '',
+      mrNumber: '3479904',
+      mrReviewer: '',
+      zblNumber: '',
+      isbn: '',
+      issn: '1364-503X,1471-2962',
+      url: 'https://doi.org/10.1098/rsta.2015.0202',
+      mscPrimary: '62H25',
+      mscSecondaryText: '62-02',
+      abstractText: '',
+      tagsText: '',
+      excludeFromCloud: false,
+      touched: [],
+    };
+    const locked = ['authors', 'title', 'work_type'];
+    expect(hasInspectorFormDiff(meta, initial, false)).toBe(false);
+    expect(hasNonEmptyUnlockedFields(initial, locked)).toBe(true);
+
+    const { next, clearedFields } = clearUnlockedFields(initial, locked);
+    expect(clearedFields).toContain('year');
+    expect(clearedFields).toContain('journal_abbrev');
+    expect(clearedFields).toContain('doi');
+    expect(clearedFields).toContain('mr_number');
+    expect(next.workType).toBe('book');
+    expect(next.title).toBe('Principal Component Analysis');
+    expect(next.authorsText).toBe('Jolliffe, I. T.');
+    expect(next.yearStr).toBe('');
+    expect(next.journalAbbrev).toBe('');
+    expect(next.doi).toBe('');
+    expect(next.mrNumber).toBe('');
+    expect(hasNonEmptyUnlockedFields(next, locked)).toBe(false);
+    expect(hasInspectorFormDiff(meta, next, false)).toBe(true);
+
+    const payloadRes = buildManualMetadataEditPayload(meta, next, false);
+    expect(payloadRes.ok).toBe(true);
+    if (payloadRes.ok) {
+      expect(payloadRes.payload.year).toBeNull();
+      expect(payloadRes.payload.mr_number).toBeNull();
+      expect(payloadRes.payload.journal_abbrev).toBeNull();
+      expect(payloadRes.payload.title).toBe('Principal Component Analysis');
+    }
+  });
+
+  it('detects unsaved diff when address is edited', () => {
+    const meta = makeJolliffeMeta();
+    const fields = makeClearedJolliffeFields('2016');
+    fields.touched = [];
+    fields.address = 'New York';
+    expect(hasInspectorFormDiff(meta, fields, false)).toBe(true);
   });
 });

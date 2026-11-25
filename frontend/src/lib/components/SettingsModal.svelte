@@ -1,6 +1,8 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { api } from '../api';
+  import { APP_VERSION } from '../appVersion';
+  import { sanitizeUiSettings } from '../settingsUtils';
   import type {
     DownloadProgressEvent,
     ExternalReaderPreset,
@@ -464,10 +466,15 @@
     saving = true;
     statusNotice = '';
     try {
-      await onSaveSettings({
-        ...draft,
-        polite_email: emailInput.trim() || null,
-      });
+      const sanitized = sanitizeUiSettings(
+        {
+          ...draft,
+          polite_email: emailInput.trim() || null,
+        },
+        settings
+      );
+      draft = sanitized;
+      await onSaveSettings(sanitized);
       statusNotice = lang === 'en' ? 'Settings saved.' : 'Impostazioni salvate.';
     } catch (e) {
       statusNotice = String(e);
@@ -493,7 +500,7 @@
   <div class="modal-backdrop" role="dialog" aria-modal="true" aria-label={tr(lang, 'settingsTitle')}>
     <div class="settings-modal">
       <header class="modal-head">
-        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v0.3.5</span></h2>
+        <h2>{tr(lang, 'settingsTitle')} <span class="mono" style="font-weight: 400; font-size: 0.78rem; color: var(--text-muted); margin-left: 0.35rem;">v{APP_VERSION}</span></h2>
         <button type="button" onclick={onClose}>{tr(lang, 'close')}</button>
       </header>
 
