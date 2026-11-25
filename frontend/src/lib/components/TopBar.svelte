@@ -37,6 +37,7 @@
     inspectorOpen: boolean;
     notesScopeActive?: boolean;
     hasNotes?: boolean;
+    statementsOnly?: boolean;
     updateAvailableVersion?: string | null;
     onSearch: (q: string) => void;
     onClearSearch: () => void;
@@ -44,6 +45,7 @@
     onMetaFilterChange: (next: MetadataSearchFilter) => void;
     onWorkCategoryChange?: (cat: WorkCategory) => void;
     onToggleNotesScope?: (active: boolean) => void;
+    onToggleStatementsOnly?: (active: boolean) => void;
     onOpenClassics?: () => void;
     onVerifiedFilterChange?: (vf: VerifiedFilter) => void;
     onSortByChange?: (sortBy: SortField) => void;
@@ -87,6 +89,7 @@
     inspectorOpen,
     notesScopeActive = false,
     hasNotes = false,
+    statementsOnly = false,
     updateAvailableVersion = null,
     onSearch,
     onClearSearch,
@@ -94,6 +97,7 @@
     onMetaFilterChange,
     onWorkCategoryChange,
     onToggleNotesScope,
+    onToggleStatementsOnly,
     onOpenClassics,
     onVerifiedFilterChange,
     onSortByChange,
@@ -297,13 +301,31 @@
           ? 'Search your personal notes, highlights & bookmarks…'
           : 'Cerca nelle tue note, evidenziazioni e segnalibri…'
         : searchMode === 'content'
-          ? tr(lang, 'searchContentPlaceholder')
+          ? statementsOnly
+            ? lang === 'en'
+              ? 'Search Theorems, Lemmas, Propositions, Definitions…'
+              : 'Cerca Teoremi, Lemmi, Proposizioni, Definizioni…'
+            : tr(lang, 'searchContentPlaceholder')
           : tr(lang, 'searchMetadataPlaceholder')}
       bind:value={query}
       oninput={() => {
         if (notesScopeActive || searchMode === 'metadata') scheduleMetadataSearch(query);
       }}
     />
+    {#if searchMode === 'content' && !notesScopeActive && onToggleStatementsOnly}
+      <button
+        type="button"
+        class="stmt-pill-btn"
+        class:active={statementsOnly}
+        aria-pressed={statementsOnly}
+        title={lang === 'en'
+          ? 'Statements only: Theorems, Lemmas, Propositions, Corollaries, Definitions (works immediately with BM25 or hybrid search)'
+          : 'Solo enunciati: Teoremi, Lemmi, Proposizioni, Corollari, Definizioni (funziona subito anche solo con BM25)'}
+        onclick={() => onToggleStatementsOnly(!statementsOnly)}
+      >
+        § {tr(lang, 'statementsShortLabel')}
+      </button>
+    {/if}
     {#if query.trim()}
       <button
         type="button"
@@ -1200,9 +1222,9 @@
     border: 1px solid var(--border);
   }
   .search-form {
-    flex: 1 1 220px;
-    min-width: 180px;
-    max-width: 620px;
+    flex: 1 1 240px;
+    min-width: 200px;
+    max-width: 680px;
     display: flex;
     align-items: center;
     background: var(--bg);
@@ -1257,6 +1279,29 @@
   }
   .search-input:focus {
     outline: none;
+  }
+  .stmt-pill-btn {
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted);
+    border-radius: 6px;
+    padding: 3px 7px;
+    font-size: 11.5px;
+    font-weight: 600;
+    line-height: 1.2;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .stmt-pill-btn:hover {
+    background: var(--bg-muted);
+    color: var(--text);
+  }
+  .stmt-pill-btn.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: var(--accent);
   }
   .search-clear-btn {
     display: inline-flex;

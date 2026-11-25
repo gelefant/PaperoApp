@@ -938,6 +938,677 @@ fn normalize_isbn_digits(raw: &str) -> Option<String> {
     }
 }
 
+/// Extracts the shared 9-digit ISBN core connecting ISBN-10 (`0387900519` -> `038790051`)
+/// and 978-prefixed ISBN-13 (`9780387900513` -> `038790051`).
+fn isbn9_core(normalized_isbn: &str) -> Option<String> {
+    if normalized_isbn.len() == 10 {
+        Some(normalized_isbn[..9].to_string())
+    } else if normalized_isbn.len() == 13 && normalized_isbn.starts_with("978") {
+        Some(normalized_isbn[3..12].to_string())
+    } else {
+        None
+    }
+}
+
+/// Strips common book-chapter DOI suffixes (e.g. `10.1007/978-3-642-66282-9_4` -> `10.1007/978-3-642-66282-9`).
+fn doi_book_stem(doi: &str) -> Option<String> {
+    let (prefix, suffix) = doi.rsplit_once('_')?;
+    if !suffix.is_empty() && suffix.len() <= 4 && suffix.bytes().all(|b| b.is_ascii_digit()) && prefix.contains('/') {
+        Some(prefix.to_string())
+    } else {
+        None
+    }
+}
+
+fn html_tag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<[^>]{1,32}>").unwrap())
+}
+
+fn tex_cmd_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\\[a-zA-Z]+\*?").unwrap())
+}
+
+fn strip_markup(raw: &str) -> String {
+    let no_html = html_tag_re().replace_all(raw, " ");
+    let no_tex = tex_cmd_re().replace_all(&no_html, " ");
+    no_tex.into_owned()
+}
+
+fn tokenize_alnum_words(raw: &str) -> Vec<String> {
+    let stripped = strip_markup(raw);
+    let norm = normalize_math_text(&stripped);
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    for ch in norm.chars() {
+        if ch.is_alphanumeric() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+fn is_leading_article(w: &str) -> bool {
+    matches!(w, "a" | "an" | "the" | "le" | "la" | "les" | "der" | "die" | "das" | "il" | "lo")
+}
+
+fn is_title_stopword(w: &str) -> bool {
+    matches!(
+        w,
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "from"
+            | "that"
+            | "this"
+            | "into"
+            | "over"
+            | "under"
+            | "des"
+            | "les"
+            | "une"
+            | "sur"
+            | "dans"
+            | "pour"
+            | "avec"
+            | "der"
+            | "die"
+            | "das"
+            | "und"
+            | "von"
+            | "zur"
+            | "mit"
+            | "del"
+            | "dei"
+            | "degli"
+            | "della"
+            | "delle"
+            | "con"
+            | "per"
+            | "edition"
+            | "second"
+            | "third"
+            | "fourth"
+            | "revised"
+            | "2nd"
+            | "3rd"
+            | "4th"
+    )
+}
+
+fn clean_canonical_words(raw_words: &[String]) -> Vec<String> {
+    let mut slice = raw_words;
+    if slice.len() >= 3 && is_leading_article(&slice[0]) {
+        slice = &slice[1..];
+    }
+    let mut out: Vec<String> = slice.to_vec();
+    // Strip trailing edition markers like "2nd ed", "second edition", "3rd edition"
+    while out.len() >= 3 {
+        let last = out[out.len() - 1].as_str();
+        let prev = out[out.len() - 2].as_str();
+        if matches!(last, "ed" | "edn" | "edition")
+            && matches!(
+                prev,
+                "1st" | "2nd" | "3rd" | "4th" | "5th" | "first" | "second" | "third" | "fourth" | "fifth" | "revised" | "rev" | "corrected"
+            )
+        {
+            out.truncate(out.len() - 2);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_part_num_token(tok: &str) -> Option<&'static str> {
+    match tok {
+        "1" | "i" => Some("1"),
+        "2" | "ii" => Some("2"),
+        "3" | "iii" => Some("3"),
+        "4" | "iv" => Some("4"),
+        "5" | "v" => Some("5"),
+        "6" | "vi" => Some("6"),
+        "7" | "vii" => Some("7"),
+        "8" | "viii" => Some("8"),
+        _ => None,
+    }
+}
+
+/// Detects explicit multi-part / multi-volume suffixes (e.g. "Part II", "Vol. 2", trailing "II"/"III")
+/// so Part I and Part II of a paper/book by the same author are never conflated.
+fn extract_part_marker(words: &[String]) -> Option<&'static str> {
+    for win in words.windows(2) {
+        if matches!(win[0].as_str(), "part" | "pt" | "vol" | "volume" | "tome" | "band" | "book") {
+            if let Some(n) = parse_part_num_token(&win[1]) {
+                return Some(n);
+            }
+        }
+    }
+    if words.len() >= 3 {
+        if let Some(last) = words.last() {
+            if matches!(last.as_str(), "ii" | "iii" | "iv" | "v" | "vi") {
+                return parse_part_num_token(last);
+            }
+        }
+    }
+    None
+}
+
+fn part_markers_compatible(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        (Some(x), None) | (None, Some(x)) => x == "1",
+        (None, None) => true,
+    }
+}
+
+fn significant_word_set(words: &[String]) -> HashSet<String> {
+    words
+        .iter()
+        .filter(|w| w.len() >= 3 && !is_title_stopword(w) && !w.bytes().all(|b| b.is_ascii_digit()))
+        .cloned()
+        .collect()
+}
+
+fn primary_title_before_colon(raw: &str) -> Option<String> {
+    let head = raw.split(':').next()?.trim();
+    if head.len() == raw.trim().len() {
+        return None;
+    }
+    let words = clean_canonical_words(&tokenize_alnum_words(head));
+    let joined = words.join(" ");
+    if words.len() >= 2 && joined.len() >= 10 {
+        Some(joined)
+    } else {
+        None
+    }
+}
+
+fn contains_contiguous_subslice(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn total_words_chars(words: &[String]) -> usize {
+    words.iter().map(|w| w.len()).sum()
+}
+
+fn extract_surname_tokens(raw: &str) -> HashSet<String> {
+    tokenize_alnum_words(raw)
+        .into_iter()
+        .filter(|w| {
+            w.len() >= 3
+                && !w.bytes().all(|b| b.is_ascii_digit())
+                && !matches!(
+                    w.as_str(),
+                    "and" | "van" | "von" | "der" | "den" | "del" | "della" | "des" | "les" | "eds" | "editor" | "editors" | "etal"
+                )
+        })
+        .collect()
+}
+
+struct OwnedDocEntry {
+    words: Vec<String>,
+    sig_words: HashSet<String>,
+    part_marker: Option<&'static str>,
+    surnames: HashSet<String>,
+    heuristic_words: Vec<String>,
+    heuristic_word_set: HashSet<String>,
+    year: Option<i64>,
+}
+
+#[derive(Default)]
+struct OwnedDocMatcher {
+    dois: HashSet<String>,
+    doi_stems: HashSet<String>,
+    arxivs: HashSet<String>,
+    mrs: HashSet<String>,
+    isbns: HashSet<String>,
+    isbn9_cores: HashSet<String>,
+    docs: Vec<OwnedDocEntry>,
+    by_canon_title: HashMap<String, Vec<usize>>,
+    by_primary_title: HashMap<String, Vec<usize>>,
+    by_surname: HashMap<String, Vec<usize>>,
+    by_word: HashMap<String, Vec<usize>>,
+}
+
+struct RefCheckInput<'a> {
+    title: &'a str,
+    authors: &'a str,
+    unstructured: Option<&'a str>,
+    year: Option<i64>,
+    doi: Option<&'a str>,
+    arxiv_id: Option<&'a str>,
+    isbn: Option<&'a str>,
+    mr: Option<&'a str>,
+}
+
+struct OwnedMatcherBuild {
+    matcher: OwnedDocMatcher,
+    doc_by_doi: HashMap<String, i64>,
+    doc_by_arxiv: HashMap<String, i64>,
+    citer_meta: HashMap<i64, (String, Option<i64>)>,
+}
+
+impl OwnedDocMatcher {
+    fn from_db(conn: &Connection) -> Result<OwnedMatcherBuild> {
+        let mut matcher = Self::default();
+        let mut doc_by_doi: HashMap<String, i64> = HashMap::new();
+        let mut doc_by_arxiv: HashMap<String, i64> = HashMap::new();
+        let mut citer_meta: HashMap<i64, (String, Option<i64>)> = HashMap::new();
+
+        // Load structured surnames per document from `document_authors`.
+        let mut authors_by_doc: HashMap<i64, HashSet<String>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT document_id, family_name FROM document_authors WHERE TRIM(family_name) != ''",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows.flatten() {
+                let (did, fam) = row;
+                let entry = authors_by_doc.entry(did).or_default();
+                for tok in extract_surname_tokens(&fam) {
+                    entry.insert(tok);
+                }
+            }
+        }
+
+        // Load file basenames per document so unenriched heuristic files (`Evans - PDE.pdf`) still match.
+        let mut file_stems_by_doc: HashMap<i64, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT document_id, rel_path FROM files")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows.flatten() {
+                let (did, rel) = row;
+                let fname = rel.rsplit(['/', '\\']).next().unwrap_or(&rel);
+                let stem = fname
+                    .rsplit_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or(fname)
+                    .trim();
+                if !stem.is_empty() {
+                    file_stems_by_doc.entry(did).or_default().push(stem.to_string());
+                }
+            }
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, title, authors_norm_summary, year, doi, arxiv_id, isbn, mr_number
+             FROM documents",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (id, title, authors_summary, year, doi, arxiv, isbn, mr) = row?;
+            citer_meta.insert(id, (title.clone(), year));
+
+            if let Some(d) = doi.as_deref().and_then(normalize_doi) {
+                if let Some(stem) = doi_book_stem(&d) {
+                    matcher.doi_stems.insert(stem);
+                }
+                matcher.dois.insert(d.clone());
+                doc_by_doi.entry(d).or_insert(id);
+            }
+            if let Some(ax) = arxiv.as_deref().and_then(normalize_arxiv_base_id) {
+                matcher.arxivs.insert(ax.clone());
+                doc_by_arxiv.entry(ax).or_insert(id);
+            }
+            if let Some(ib) = isbn.as_deref().and_then(normalize_isbn_digits) {
+                if let Some(core) = isbn9_core(&ib) {
+                    matcher.isbn9_cores.insert(core);
+                }
+                matcher.isbns.insert(ib);
+            }
+            if let Some(m) = mr.as_deref().and_then(normalize_mr_digits) {
+                matcher.mrs.insert(m);
+            }
+
+            let raw_words = tokenize_alnum_words(&title);
+            let words = clean_canonical_words(&raw_words);
+            let canon_title = words.join(" ");
+            let sig_words = significant_word_set(&words);
+            let part_marker = extract_part_marker(&raw_words);
+
+            let mut surnames = authors_by_doc.remove(&id).unwrap_or_default();
+            if surnames.is_empty() && !authors_summary.trim().is_empty() {
+                for seg in authors_summary.split([';', ',']) {
+                    let seg_t = seg.trim();
+                    if !seg_t.is_empty() {
+                        for tok in extract_surname_tokens(seg_t) {
+                            surnames.insert(tok);
+                        }
+                    }
+                }
+            }
+
+            let mut heuristic_words = raw_words.clone();
+            if let Some(stems) = file_stems_by_doc.remove(&id) {
+                for stem in stems {
+                    heuristic_words.extend(tokenize_alnum_words(&stem));
+                }
+            }
+            let heuristic_word_set: HashSet<String> = heuristic_words.iter().cloned().collect();
+
+            let idx = matcher.docs.len();
+            if !canon_title.is_empty() {
+                matcher.by_canon_title.entry(canon_title).or_default().push(idx);
+            }
+            if let Some(prim) = primary_title_before_colon(&title) {
+                matcher.by_primary_title.entry(prim).or_default().push(idx);
+            }
+            for s in &surnames {
+                matcher.by_surname.entry(s.clone()).or_default().push(idx);
+            }
+            for w in &sig_words {
+                if w.len() >= 4 {
+                    matcher.by_word.entry(w.clone()).or_default().push(idx);
+                }
+            }
+            if surnames.is_empty() {
+                for w in &heuristic_word_set {
+                    if w.len() >= 4 && !is_title_stopword(w) {
+                        let list = matcher.by_word.entry(w.clone()).or_default();
+                        if list.last().copied() != Some(idx) {
+                            list.push(idx);
+                        }
+                    }
+                }
+            }
+
+            matcher.docs.push(OwnedDocEntry {
+                words,
+                sig_words,
+                part_marker,
+                surnames,
+                heuristic_words,
+                heuristic_word_set,
+                year,
+            });
+        }
+
+        Ok(OwnedMatcherBuild {
+            matcher,
+            doc_by_doi,
+            doc_by_arxiv,
+            citer_meta,
+        })
+    }
+
+    fn is_owned(&self, r: &RefCheckInput<'_>) -> bool {
+        // 1. Canonical identifier checks (DOI + chapter stem, arXiv, ISBN-10/13, MR)
+        if let Some(d) = r.doi {
+            if self.dois.contains(d) || self.doi_stems.contains(d) {
+                return true;
+            }
+            if let Some(stem) = doi_book_stem(d) {
+                if self.dois.contains(&stem) || self.doi_stems.contains(&stem) {
+                    return true;
+                }
+            }
+        }
+        if let Some(ax) = r.arxiv_id {
+            if self.arxivs.contains(ax) {
+                return true;
+            }
+        }
+        if let Some(ib) = r.isbn {
+            if self.isbns.contains(ib) {
+                return true;
+            }
+            if let Some(core) = isbn9_core(ib) {
+                if self.isbn9_cores.contains(&core) {
+                    return true;
+                }
+            }
+        }
+        if let Some(m) = r.mr {
+            if self.mrs.contains(m) {
+                return true;
+            }
+        }
+
+        let raw_title_words = tokenize_alnum_words(r.title);
+        let ref_words = clean_canonical_words(&raw_title_words);
+        let ref_canon = ref_words.join(" ");
+        if ref_canon.len() < 4 {
+            return false;
+        }
+        let ref_sig = significant_word_set(&ref_words);
+        let ref_part = extract_part_marker(&raw_title_words);
+
+        let mut ref_author_tokens = extract_surname_tokens(r.authors);
+        let mut full_ref_words = raw_title_words.clone();
+        if let Some(unstr) = r.unstructured {
+            let u_words = tokenize_alnum_words(unstr);
+            for w in &u_words {
+                if w.len() >= 3 && self.by_surname.contains_key(w) {
+                    ref_author_tokens.insert(w.clone());
+                }
+            }
+            full_ref_words = u_words;
+        } else {
+            for w in &raw_title_words {
+                if w.len() >= 3 && self.by_surname.contains_key(w) {
+                    ref_author_tokens.insert(w.clone());
+                }
+            }
+        }
+
+        // 2. Exact canonical title match (protects short single-word titles by requiring author match)
+        if let Some(indices) = self.by_canon_title.get(&ref_canon) {
+            let strong_title = ref_words.len() >= 2 && ref_canon.len() >= 10;
+            for &idx in indices {
+                let doc = &self.docs[idx];
+                if !part_markers_compatible(doc.part_marker, ref_part) {
+                    continue;
+                }
+                let shares_author = !ref_author_tokens.is_empty()
+                    && doc.surnames.iter().any(|s| ref_author_tokens.contains(s));
+                let author_conflict = !ref_author_tokens.is_empty()
+                    && !doc.surnames.is_empty()
+                    && !shares_author
+                    && ref_words.len() <= 3;
+                if shares_author || (strong_title && !author_conflict) {
+                    return true;
+                }
+            }
+        }
+
+        // 3. Primary title before `:` (matches book/paper with or without subtitle)
+        let ref_primary = primary_title_before_colon(r.title);
+        let primary_candidates: &[String] = match ref_primary {
+            Some(ref p) => std::slice::from_ref(p),
+            None => std::slice::from_ref(&ref_canon),
+        };
+        for pkey in primary_candidates {
+            if let Some(indices) = self.by_primary_title.get(pkey) {
+                for &idx in indices {
+                    let doc = &self.docs[idx];
+                    if !part_markers_compatible(doc.part_marker, ref_part) {
+                        continue;
+                    }
+                    let shares_author = doc.surnames.iter().any(|s| ref_author_tokens.contains(s));
+                    let year_close = match (doc.year, r.year) {
+                        (Some(a), Some(b)) => (a - b).abs() <= 2,
+                        _ => false,
+                    };
+                    if shares_author
+                        || year_close
+                        || (doc.surnames.is_empty() && ref_author_tokens.is_empty() && pkey.len() >= 16)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Also check when ref has a subtitle and library doc only has the primary title
+        if let Some(ref ref_prim) = ref_primary {
+            if let Some(indices) = self.by_canon_title.get(ref_prim) {
+                for &idx in indices {
+                    let doc = &self.docs[idx];
+                    if !part_markers_compatible(doc.part_marker, ref_part) {
+                        continue;
+                    }
+                    let shares_author = doc.surnames.iter().any(|s| ref_author_tokens.contains(s));
+                    let year_close = match (doc.year, r.year) {
+                        (Some(a), Some(b)) => (a - b).abs() <= 2,
+                        _ => false,
+                    };
+                    if shares_author || year_close {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // 4. Same-author title containment / high token overlap (catches Crossref `unstructured` citations,
+        //    edition suffixes, subtitle omissions, minor punctuation/wording variants).
+        if !ref_author_tokens.is_empty() {
+            let mut seen_docs: HashSet<usize> = HashSet::new();
+            for tok in &ref_author_tokens {
+                let Some(indices) = self.by_surname.get(tok) else {
+                    continue;
+                };
+                for &idx in indices {
+                    if !seen_docs.insert(idx) {
+                        continue;
+                    }
+                    let doc = &self.docs[idx];
+                    if !part_markers_compatible(doc.part_marker, ref_part) {
+                        continue;
+                    }
+                    // Contiguous subslice in either direction (e.g. "algebraic geometry" inside
+                    // "r hartshorne algebraic geometry gtm 52 springer 1977", or "functional analysis"
+                    // inside "functional analysis an introduction").
+                    if doc.words.len() >= 2
+                        && total_words_chars(&doc.words) >= 9
+                        && (contains_contiguous_subslice(&full_ref_words, &doc.words)
+                            || contains_contiguous_subslice(&ref_words, &doc.words))
+                    {
+                        return true;
+                    }
+                    if ref_words.len() >= 2
+                        && total_words_chars(&ref_words) >= 9
+                        && contains_contiguous_subslice(&doc.words, &ref_words)
+                    {
+                        return true;
+                    }
+                    // Token overlap for slightly reworded / abbreviated titles by the same author
+                    if doc.sig_words.len() >= 2 && ref_sig.len() >= 2 {
+                        let inter = doc.sig_words.intersection(&ref_sig).count();
+                        let union = doc.sig_words.len() + ref_sig.len() - inter;
+                        let min_len = doc.sig_words.len().min(ref_sig.len());
+                        if inter >= 2
+                            && ((inter * 100 >= union * 68)
+                                || (inter * 100 >= min_len * 85 && min_len >= 2))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. High title-token overlap (catches missing-author citations and unenriched heuristic files
+        //    such as `Evans - Partial Differential Equations.pdf`).
+        let full_ref_sig = significant_word_set(&full_ref_words);
+        let mut cand_hits: HashMap<usize, usize> = HashMap::new();
+        let mut query_words: Vec<&String> = full_ref_sig.iter().filter(|w| w.len() >= 4).collect();
+        query_words.sort_by_key(|w| self.by_word.get(*w).map_or(0, Vec::len));
+        for w in query_words.into_iter().take(8) {
+            if let Some(indices) = self.by_word.get(w) {
+                if indices.len() > 250 {
+                    continue;
+                }
+                for &idx in indices {
+                    *cand_hits.entry(idx).or_insert(0) += 1;
+                }
+            }
+        }
+
+        for (idx, shared_rare) in cand_hits {
+            if shared_rare < 2 {
+                continue;
+            }
+            let doc = &self.docs[idx];
+            if !part_markers_compatible(doc.part_marker, ref_part) {
+                continue;
+            }
+
+            // Unenriched local file whose filename/title contains both the cited author surname and title
+            if doc.surnames.is_empty() {
+                if !ref_author_tokens.is_empty()
+                    && ref_author_tokens.iter().any(|s| doc.heuristic_word_set.contains(s))
+                    && ref_words.len() >= 2
+                    && total_words_chars(&ref_words) >= 9
+                {
+                    if contains_contiguous_subslice(&doc.heuristic_words, &ref_words) {
+                        return true;
+                    }
+                    let inter = ref_sig
+                        .iter()
+                        .filter(|w| doc.heuristic_word_set.contains(*w))
+                        .count();
+                    if inter >= 2 && inter * 100 >= ref_sig.len() * 85 {
+                        return true;
+                    }
+                }
+                // Also match Crossref unstructured strings directly against heuristic title/filename words
+                if doc.words.len() >= 3
+                    && total_words_chars(&doc.words) >= 14
+                    && contains_contiguous_subslice(&full_ref_words, &doc.words)
+                {
+                    return true;
+                }
+                if doc.sig_words.len() >= 3 {
+                    let inter = doc.sig_words.intersection(&full_ref_sig).count();
+                    if inter >= 3 && inter * 100 >= doc.sig_words.len() * 85 {
+                        return true;
+                    }
+                }
+            }
+
+            // Very strong multi-word title similarity even without matching author fields
+            if doc.sig_words.len() >= 3 && ref_sig.len() >= 3 {
+                let inter = doc.sig_words.intersection(&ref_sig).count();
+                let union = doc.sig_words.len() + ref_sig.len() - inter;
+                let min_len = doc.sig_words.len().min(ref_sig.len());
+                let author_conflict = !ref_author_tokens.is_empty()
+                    && !doc.surnames.is_empty()
+                    && !doc.surnames.iter().any(|s| ref_author_tokens.contains(s));
+                if !author_conflict
+                    && ((inter >= 3 && inter * 100 >= union * 82)
+                        || (inter >= 4 && inter * 100 >= min_len * 90))
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
 /// Aggregates the most-cited works referenced by documents in the user's library (via already-cached
 /// Crossref and Semantic Scholar payloads, zero extra network calls) that are NOT yet owned locally.
 /// `category`: `None` / `"all"` | `"paper"` | `"book"`.
@@ -953,51 +1624,12 @@ pub fn find_missing_cited_classics(
         _ => None,
     };
 
-    // Build lookup of already-owned library works + citer brief info.
-    let mut owned_dois: HashSet<String> = HashSet::new();
-    let mut owned_arxiv: HashSet<String> = HashSet::new();
-    let mut owned_isbns: HashSet<String> = HashSet::new();
-    let mut owned_titles: HashSet<String> = HashSet::new();
-    let mut doc_by_doi: HashMap<String, i64> = HashMap::new();
-    let mut doc_by_arxiv: HashMap<String, i64> = HashMap::new();
-    let mut citer_meta: HashMap<i64, (String, Option<i64>)> = HashMap::new();
-
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, title, title_norm, year, doi, arxiv_id, isbn
-             FROM documents",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, title, title_norm, year, doi, arxiv, isbn) = row?;
-            citer_meta.insert(id, (title, year));
-            let tn = title_norm.trim().to_string();
-            if tn.len() >= 8 {
-                owned_titles.insert(tn);
-            }
-            if let Some(d) = doi.as_deref().and_then(normalize_doi) {
-                owned_dois.insert(d.clone());
-                doc_by_doi.entry(d).or_insert(id);
-            }
-            if let Some(ax) = arxiv.as_deref().and_then(normalize_arxiv_base_id) {
-                owned_arxiv.insert(ax.clone());
-                doc_by_arxiv.entry(ax).or_insert(id);
-            }
-            if let Some(ib) = isbn.as_deref().and_then(normalize_isbn_digits) {
-                owned_isbns.insert(ib);
-            }
-        }
-    }
+    let OwnedMatcherBuild {
+        matcher: owned_matcher,
+        doc_by_doi,
+        doc_by_arxiv,
+        citer_meta,
+    } = OwnedDocMatcher::from_db(conn)?;
 
     if doc_by_doi.is_empty() && doc_by_arxiv.is_empty() {
         return Ok(Vec::new());
@@ -1008,40 +1640,44 @@ pub fn find_missing_cited_classics(
     let mut record_ref = |citing_doc_id: i64,
                           title_raw: &str,
                           authors_raw: &str,
+                          unstructured_raw: Option<&str>,
                           year: Option<i64>,
                           venue: Option<String>,
                           doi: Option<String>,
                           arxiv_id: Option<String>,
                           isbn: Option<String>,
+                          mr: Option<String>,
                           is_book: bool| {
-        if let Some(ref d) = doi {
-            if owned_dois.contains(d) {
-                return;
-            }
-        }
-        if let Some(ref ax) = arxiv_id {
-            if owned_arxiv.contains(ax) {
-                return;
-            }
-        }
-        if let Some(ref ib) = isbn {
-            if owned_isbns.contains(ib) {
-                return;
-            }
-        }
         let title = clean_ref_title(title_raw);
         if title.len() < 4 {
             return;
         }
-        let title_norm = normalize_math_text(&title);
-        if title_norm.len() < 4 || owned_titles.contains(&title_norm) {
+        let check = RefCheckInput {
+            title: &title,
+            authors: authors_raw,
+            unstructured: unstructured_raw,
+            year,
+            doi: doi.as_deref(),
+            arxiv_id: arxiv_id.as_deref(),
+            isbn: isbn.as_deref(),
+            mr: mr.as_deref(),
+        };
+        if owned_matcher.is_owned(&check) {
+            return;
+        }
+        let title_norm = clean_canonical_words(&tokenize_alnum_words(&title)).join(" ");
+        if title_norm.len() < 4 {
             return;
         }
 
         let key = if let Some(ref d) = doi {
             format!("doi:{d}")
         } else if let Some(ref ib) = isbn {
-            format!("isbn:{ib}")
+            if let Some(core) = isbn9_core(ib) {
+                format!("isbn9:{core}")
+            } else {
+                format!("isbn:{ib}")
+            }
         } else if let Some(ref ax) = arxiv_id {
             format!("arxiv:{ax}")
         } else {
@@ -1136,7 +1772,32 @@ pub fn find_missing_cited_classics(
 
             for (citing_id, refs) in cr_batches {
                 for r in refs {
-                    let doi = r.get("DOI").and_then(Value::as_str).and_then(normalize_doi);
+                    let unstructured = r
+                        .get("unstructured")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let doi = r
+                        .get("DOI")
+                        .and_then(Value::as_str)
+                        .and_then(normalize_doi)
+                        .or_else(|| {
+                            unstructured.and_then(|u| {
+                                ref_doi_re().find(u).and_then(|m| normalize_doi(m.as_str()))
+                            })
+                        });
+                    let arxiv_id = unstructured.and_then(|u| {
+                        ref_arxiv_re()
+                            .captures(u)
+                            .and_then(|c| c.get(1))
+                            .and_then(|m| normalize_arxiv_base_id(m.as_str()))
+                    });
+                    let mr = unstructured.and_then(|u| {
+                        ref_mr_re()
+                            .captures(u)
+                            .and_then(|c| c.get(1))
+                            .and_then(|m| normalize_mr_digits(m.as_str()))
+                    });
                     let isbn = r
                         .get("ISBN")
                         .and_then(Value::as_str)
@@ -1162,11 +1823,6 @@ pub fn find_missing_cited_classics(
                         .and_then(Value::as_str)
                         .and_then(extract_year_from_str)
                         .or_else(|| r.get("year").and_then(Value::as_i64));
-                    let unstructured = r
-                        .get("unstructured")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty());
 
                     let title_owned: String = if let Some(t) = article_title.or(volume_title) {
                         t.to_string()
@@ -1194,11 +1850,13 @@ pub fn find_missing_cited_classics(
                         citing_id,
                         &title_owned,
                         author,
+                        unstructured,
                         eff_year,
                         venue,
                         doi,
-                        None,
+                        arxiv_id,
                         isbn,
+                        mr,
                         is_book,
                     );
                 }
@@ -1277,10 +1935,12 @@ pub fn find_missing_cited_classics(
                     citing_id,
                     title,
                     &authors,
+                    None,
                     year,
                     venue,
                     doi,
                     arxiv_id,
+                    None,
                     None,
                     is_book,
                 );
@@ -1291,6 +1951,20 @@ pub fn find_missing_cited_classics(
     let mut items: Vec<MissingClassicItem> = agg_map
         .into_values()
         .filter_map(|agg| {
+            // Re-check aggregated record against library (in case author/title/IDs were split across citations)
+            let final_check = RefCheckInput {
+                title: &agg.title,
+                authors: &agg.authors,
+                unstructured: None,
+                year: agg.year,
+                doi: agg.doi.as_deref(),
+                arxiv_id: agg.arxiv_id.as_deref(),
+                isbn: agg.isbn.as_deref(),
+                mr: None,
+            };
+            if owned_matcher.is_owned(&final_check) {
+                return None;
+            }
             let work_category = if agg.is_book_votes > agg.is_paper_votes {
                 "book"
             } else {
@@ -1559,5 +2233,151 @@ mod tests {
         assert_eq!(papers.len(), 1);
         assert_eq!(papers[0].title, "On Spectral Operators");
         assert_eq!(papers[0].work_category, "paper");
+    }
+
+    #[test]
+    fn excludes_already_owned_books_and_papers_across_fuzzy_variants_without_false_positives() {
+        let db = Database::in_memory().unwrap();
+        let w = db.writer();
+        insert_source_root(
+            &w,
+            &NewSourceRoot {
+                id: "r1".into(),
+                label: "Math".into(),
+                root_path: "/tmp/math".into(),
+                is_network_or_cloud: false,
+            },
+        )
+        .unwrap();
+
+        let citer = create_heuristic_document(&w, "Citing Survey").unwrap();
+        w.execute(
+            "UPDATE documents SET doi = '10.1000/survey-1' WHERE id = ?1",
+            params![citer],
+        )
+        .unwrap();
+
+        // 1. Owned book with ISBN-10 and structured author (no DOI) -> cited with ISBN-13 & unstructured
+        let hartshorne = create_heuristic_document(&w, "Algebraic Geometry").unwrap();
+        w.execute(
+            "UPDATE documents SET work_type = 'book', isbn = '0-387-90244-9', year = 1977 WHERE id = ?1",
+            params![hartshorne],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Hartshorne', 'Robin', 'hartshorne')",
+            params![hartshorne],
+        )
+        .unwrap();
+
+        // 2. Owned book with subtitle (Brezis) -> should NOT exclude Rudin's Functional Analysis!
+        let brezis = create_heuristic_document(
+            &w,
+            "Functional Analysis, Sobolev Spaces and Partial Differential Equations",
+        )
+        .unwrap();
+        w.execute(
+            "UPDATE documents SET work_type = 'book', year = 2011 WHERE id = ?1",
+            params![brezis],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Brezis', 'Haim', 'brezis')",
+            params![brezis],
+        )
+        .unwrap();
+
+        // 3. Owned book with subtitle -> cited without subtitle by same author
+        let folland = create_heuristic_document(&w, "Real Analysis: Modern Techniques and Their Applications").unwrap();
+        w.execute(
+            "UPDATE documents SET work_type = 'book', year = 1999 WHERE id = ?1",
+            params![folland],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Folland', 'Gerald', 'folland')",
+            params![folland],
+        )
+        .unwrap();
+
+        // 4. Owned unenriched heuristic PDF (no document_authors, no DOI/ISBN)
+        let evans = create_heuristic_document(&w, "Evans - Partial Differential Equations").unwrap();
+        insert_file_record(
+            &w,
+            &NewFileRecord {
+                document_id: evans,
+                root_id: "r1",
+                rel_path: "Books/Evans - Partial Differential Equations.pdf",
+                format: "pdf",
+                size_bytes: 100,
+                mtime_ns: 1,
+                blake3_hash: "h-evans",
+                index_state: "ready",
+            },
+        )
+        .unwrap();
+
+        // 5. Owned book with DOI -> cited via chapter DOI suffix `_4`
+        let kato = create_heuristic_document(&w, "Perturbation Theory for Linear Operators").unwrap();
+        w.execute(
+            "UPDATE documents SET work_type = 'book', doi = '10.1007/978-3-642-66282-9' WHERE id = ?1",
+            params![kato],
+        )
+        .unwrap();
+
+        // 6. Owned paper Part I -> Part II by same author MUST still be suggested!
+        let part1 = create_heuristic_document(&w, "Regularity for Navier-Stokes Equations I").unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Smith', 'Alice', 'smith')",
+            params![part1],
+        )
+        .unwrap();
+
+        // 7. Owned paper with minor typographic variant (en-dash vs hyphen, trailing period)
+        let ckn = create_heuristic_document(
+            &w,
+            "Partial regularity of suitable weak solutions of the Navier-Stokes equations",
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO document_authors (document_id, role, position, family_name, given_name, name_norm)
+             VALUES (?1, 'author', 0, 'Caffarelli', 'Luis', 'caffarelli')",
+            params![ckn],
+        )
+        .unwrap();
+
+        let cr_body = r#"{
+            "message": {
+                "reference": [
+                    {"ISBN": "978-0-387-90244-9", "volume-title": "Algebraic Geometry", "author": "R. Hartshorne", "year": "1977"},
+                    {"unstructured": "R. Hartshorne, Algebraic Geometry, Graduate Texts in Mathematics 52, Springer-Verlag, New York, 1977."},
+                    {"volume-title": "Real Analysis", "author": "G. B. Folland", "year": "1999"},
+                    {"volume-title": "Partial Differential Equations", "author": "L. C. Evans", "year": "1998"},
+                    {"unstructured": "L. C. Evans, Partial Differential Equations, AMS, 1998."},
+                    {"DOI": "10.1007/978-3-642-66282-9_4", "volume-title": "Chapter 4: Stability Theorems", "author": "T. Kato", "year": "1976"},
+                    {"article-title": "Partial regularity of suitable weak solutions of the Navier–Stokes equations.", "author": "L. Caffarelli", "journal-title": "Comm. Pure Appl. Math.", "year": "1982"},
+                    {"ISBN": "9780070542365", "volume-title": "Functional Analysis", "author": "W. Rudin", "year": "1991"},
+                    {"DOI": "10.1000/smith-part2", "article-title": "Regularity for Navier-Stokes Equations II", "author": "A. Smith", "journal-title": "Invent. Math.", "year": "2022"}
+                ]
+            }
+        }"#;
+        w.execute(
+            "INSERT INTO metadata_http_cache (source, lookup_key, response_body, status_code, fetched_at)
+             VALUES ('crossref', 'doi:10.1000/survey-1', ?1, 200, 1)",
+            params![cr_body],
+        )
+        .unwrap();
+
+        let res = find_missing_cited_classics(&w, Some("all"), 20).unwrap();
+        let titles: Vec<&str> = res.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Functional Analysis", "Regularity for Navier-Stokes Equations II"],
+            "Expected only Rudin's Functional Analysis and Smith's Part II, got: {titles:?}"
+        );
     }
 }

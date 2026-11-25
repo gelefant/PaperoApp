@@ -628,7 +628,7 @@
 
   async function handleToggleStatementsOnly(active: boolean) {
     statementsOnly = active;
-    if (committedContentQuery.trim()) {
+    if (searchResults !== null && committedContentQuery.trim()) {
       await handleSearch(committedContentQuery);
     }
   }
@@ -2322,6 +2322,7 @@
       {inspectorOpen}
       {notesScopeActive}
       hasNotes={totalAnnotationsCount > 0}
+      {statementsOnly}
       updateAvailableVersion={updateInfo?.update_available ? updateInfo.latest_version : null}
       onSearch={handleSearch}
       onClearSearch={async () => {
@@ -2340,6 +2341,7 @@
       onMetaFilterChange={handleMetaFilterChange}
       onWorkCategoryChange={handleWorkCategoryChange}
       onToggleNotesScope={handleToggleNotesScope}
+      onToggleStatementsOnly={handleToggleStatementsOnly}
       onOpenClassics={() => (classicsModalOpen = true)}
       onVerifiedFilterChange={handleVerifiedFilterChange}
       onSortByChange={handleSortByChange}
