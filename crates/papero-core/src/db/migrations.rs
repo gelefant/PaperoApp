@@ -140,6 +140,108 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         rebuild_minhashes_and_recompute_duplicates_v6(conn)?;
     }
 
+    if current_version < 7 {
+        migrate_v7_annotations_reading_collections(conn)?;
+    }
+
+    Ok(())
+}
+
+fn migrate_v7_annotations_reading_collections(conn: &Connection) -> Result<()> {
+    let existing_cols: std::collections::HashSet<String> = {
+        let mut st = conn.prepare("PRAGMA table_info(documents)")?;
+        let iter = st.query_map([], |r| r.get::<_, String>(1))?;
+        iter.filter_map(std::result::Result::ok).collect()
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    if !existing_cols.contains("reading_status") {
+        tx.execute_batch(
+            "ALTER TABLE documents ADD COLUMN reading_status TEXT NOT NULL DEFAULT 'unread';",
+        )?;
+    }
+    if !existing_cols.contains("is_starred") {
+        tx.execute_batch(
+            "ALTER TABLE documents ADD COLUMN is_starred INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !existing_cols.contains("published_notice_json") {
+        tx.execute_batch("ALTER TABLE documents ADD COLUMN published_notice_json TEXT;")?;
+    }
+
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_annotations (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            blake3_hash     TEXT NOT NULL,
+            page_ord        INTEGER NOT NULL,
+            kind            TEXT NOT NULL DEFAULT 'highlight',
+            color           TEXT NOT NULL DEFAULT 'yellow',
+            rects_json      TEXT NOT NULL DEFAULT '[]',
+            quoted_text     TEXT NOT NULL DEFAULT '',
+            note_markdown   TEXT NOT NULL DEFAULT '',
+            search_norm     TEXT NOT NULL DEFAULT '',
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_annotations_hash_page ON file_annotations(blake3_hash, page_ord, id);
+        CREATE INDEX IF NOT EXISTS idx_file_annotations_hash_kind ON file_annotations(blake3_hash, kind);
+
+        CREATE TABLE IF NOT EXISTS file_reading_state (
+            blake3_hash     TEXT PRIMARY KEY,
+            last_page_ord   INTEGER NOT NULL DEFAULT 1,
+            last_opened_at  INTEGER,
+            zoom_mode       TEXT NOT NULL DEFAULT 'fit-width',
+            custom_zoom     REAL NOT NULL DEFAULT 1.0,
+            rotation_deg    INTEGER NOT NULL DEFAULT 0,
+            updated_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_reading_state_opened ON file_reading_state(last_opened_at DESC);
+
+        CREATE TABLE IF NOT EXISTS collections (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            color_hex   TEXT,
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS collection_documents (
+            collection_id   INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            position        INTEGER NOT NULL DEFAULT 0,
+            added_at        INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, document_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_collection_docs_doc ON collection_documents(document_id);
+
+        CREATE TABLE IF NOT EXISTS saved_searches (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            search_mode TEXT NOT NULL DEFAULT 'metadata',
+            query_text  TEXT NOT NULL DEFAULT '',
+            filter_json TEXT NOT NULL DEFAULT '{}',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            created_at  INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS document_citations (
+            citing_doc_id   INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            cited_doc_id    INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            source          TEXT NOT NULL,
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            PRIMARY KEY (citing_doc_id, cited_doc_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_doc_citations_cited ON document_citations(cited_doc_id);
+        CREATE INDEX IF NOT EXISTS idx_docs_reading_status ON documents(reading_status);
+        CREATE INDEX IF NOT EXISTS idx_docs_starred ON documents(is_starred) WHERE is_starred != 0;",
+    )?;
+
+    let now = chrono::Utc::now().timestamp();
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+        rusqlite::params![7i64, now],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

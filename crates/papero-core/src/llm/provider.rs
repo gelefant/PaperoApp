@@ -143,3 +143,19 @@ pub struct LlmKeyVerifyResult {
     pub models: Vec<LlmModelInfo>,
     pub message: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocLlmScope {
+    Selection,
+    Page,
+    Document,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum LlmStreamEvent {
+    Delta { text: String },
+    Done { result: LlmAnswerResult },
+    Error { message: String },
+}

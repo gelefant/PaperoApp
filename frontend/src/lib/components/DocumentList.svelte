@@ -3,6 +3,7 @@
   import { tr, type Lang } from '../i18n';
   import { shouldShowRowVerifyControl } from '../viewerUtils';
   import type {
+    CollectionView,
     DocumentListItem,
     SortDirection,
     SortField,
@@ -14,6 +15,8 @@
     lang?: Lang;
     documents: DocumentListItem[];
     selectedDocId: number | null;
+    selectedDocIds?: number[];
+    collections?: CollectionView[];
     workCategory?: WorkCategory;
     verifiedFilter?: VerifiedFilter;
     unverifiedCount?: number;
@@ -24,17 +27,28 @@
     onChangeSortBy?: (sortBy: SortField) => void;
     onToggleSortDir?: () => void;
     onToggleVerified?: (docId: number, verified: boolean) => void | Promise<void>;
+    onToggleStarred?: (docId: number, starred: boolean) => void | Promise<void>;
     onSelectDoc: (doc: DocumentListItem) => void;
+    onChangeSelectedDocIds?: (ids: number[]) => void;
     onOpenDoc: (doc: DocumentListItem) => void;
     onContextMenu: (e: MouseEvent, doc: DocumentListItem) => void;
     onConfirmMsc?: (docId: number, mscCode: string | null) => Promise<void>;
     onRejectMsc?: (docId: number) => Promise<void>;
+    onBatchAddTag?: (docIds: number[], tagName: string) => Promise<void>;
+    onBatchRemoveTag?: (docIds: number[], tagName: string) => Promise<void>;
+    onBatchSetVerified?: (docIds: number[], verified: boolean) => Promise<void>;
+    onBatchAddToCollection?: (collectionId: number, docIds: number[]) => Promise<void>;
+    onBatchExportBibtex?: (docIds: number[]) => Promise<void>;
+    onBatchExportCsv?: (docIds: number[]) => Promise<void>;
+    onBatchEnqueueOcr?: (docIds: number[]) => Promise<void>;
   }
 
   let {
     lang = 'it',
     documents,
     selectedDocId,
+    selectedDocIds = [],
+    collections = [],
     workCategory = 'all',
     verifiedFilter = 'all',
     unverifiedCount,
@@ -45,12 +59,90 @@
     onChangeSortBy,
     onToggleSortDir,
     onToggleVerified,
+    onToggleStarred,
     onSelectDoc,
+    onChangeSelectedDocIds,
     onOpenDoc,
     onContextMenu,
     onConfirmMsc,
     onRejectMsc,
+    onBatchAddTag,
+    onBatchRemoveTag,
+    onBatchSetVerified,
+    onBatchAddToCollection,
+    onBatchExportBibtex,
+    onBatchExportCsv,
+    onBatchEnqueueOcr,
   }: Props = $props();
+
+  const selectedIdSet = $derived(new Set(selectedDocIds));
+  let anchorDocId = $state<number | null>(null);
+  let batchTagMode = $state<'none' | 'add' | 'remove'>('none');
+  let batchTagInput = $state('');
+  let batchBusy = $state(false);
+
+  function handleRowClick(e: MouseEvent, doc: DocumentListItem) {
+    const mod = e.metaKey || e.ctrlKey;
+    if (e.shiftKey && onChangeSelectedDocIds) {
+      e.preventDefault();
+      const anchor = anchorDocId ?? selectedDocId;
+      const anchorIdx = anchor !== null ? documents.findIndex((d) => d.document_id === anchor) : -1;
+      const targetIdx = documents.findIndex((d) => d.document_id === doc.document_id);
+      if (anchorIdx >= 0 && targetIdx >= 0) {
+        const lo = Math.min(anchorIdx, targetIdx);
+        const hi = Math.max(anchorIdx, targetIdx);
+        const rangeIds = documents.slice(lo, hi + 1).map((d) => d.document_id);
+        const next = mod ? Array.from(new Set([...selectedDocIds, ...rangeIds])) : rangeIds;
+        onChangeSelectedDocIds(next);
+        onSelectDoc(doc);
+        return;
+      }
+    }
+    if (mod && onChangeSelectedDocIds) {
+      e.preventDefault();
+      const base = new Set(
+        selectedDocIds.length > 0 ? selectedDocIds : selectedDocId !== null ? [selectedDocId] : []
+      );
+      if (base.has(doc.document_id)) {
+        base.delete(doc.document_id);
+      } else {
+        base.add(doc.document_id);
+      }
+      anchorDocId = doc.document_id;
+      onChangeSelectedDocIds(Array.from(base));
+      if (base.size > 0) onSelectDoc(doc);
+      return;
+    }
+    anchorDocId = doc.document_id;
+    if (selectedDocIds.length > 0) {
+      onChangeSelectedDocIds?.([]);
+    }
+    onSelectDoc(doc);
+  }
+
+  async function runBatch(fn: () => Promise<void>) {
+    batchBusy = true;
+    try {
+      await fn();
+    } finally {
+      batchBusy = false;
+    }
+  }
+
+  async function submitBatchTag(e: Event) {
+    e.preventDefault();
+    const tag = batchTagInput.trim();
+    if (!tag || selectedDocIds.length < 2) return;
+    await runBatch(async () => {
+      if (batchTagMode === 'add') {
+        await onBatchAddTag?.(selectedDocIds, tag);
+      } else if (batchTagMode === 'remove') {
+        await onBatchRemoveTag?.(selectedDocIds, tag);
+      }
+      batchTagInput = '';
+      batchTagMode = 'none';
+    });
+  }
 
   const showVerifyControl = $derived(shouldShowRowVerifyControl(verifiedFilter, unverifiedCount));
 
@@ -316,6 +408,7 @@
           onchange={(e) => onChangeSortBy?.((e.currentTarget as HTMLSelectElement).value as SortField)}
         >
           <option value="updated">{tr(lang, 'sortUpdated')}</option>
+          <option value="last_opened">{lang === 'en' ? 'Last read' : 'Ultima lettura'}</option>
           <option value="title">{tr(lang, 'sortTitle')}</option>
           <option value="author">{tr(lang, 'sortAuthor')}</option>
           <option value="year">{tr(lang, 'sortYear')}</option>
@@ -341,6 +434,125 @@
         </button>
       </div>
     </div>
+    {#if selectedDocIds.length >= 2}
+      <div class="batch-bar" role="toolbar" aria-label="Azioni multiple">
+        <span class="batch-count">{selectedDocIds.length} {tr(lang, 'batchSelectedCount')}</span>
+        {#if onBatchAddTag}
+          <button
+            type="button"
+            class="batch-btn"
+            class:active={batchTagMode === 'add'}
+            disabled={batchBusy}
+            onclick={() => (batchTagMode = batchTagMode === 'add' ? 'none' : 'add')}
+          >
+            + Tag
+          </button>
+        {/if}
+        {#if onBatchRemoveTag}
+          <button
+            type="button"
+            class="batch-btn"
+            class:active={batchTagMode === 'remove'}
+            disabled={batchBusy}
+            onclick={() => (batchTagMode = batchTagMode === 'remove' ? 'none' : 'remove')}
+          >
+            − Tag
+          </button>
+        {/if}
+        {#if onBatchSetVerified}
+          <button
+            type="button"
+            class="batch-btn ok"
+            disabled={batchBusy}
+            title="Segna selezionati come verificati ✓"
+            onclick={() => runBatch(() => onBatchSetVerified(selectedDocIds, true))}
+          >
+            ✓
+          </button>
+          <button
+            type="button"
+            class="batch-btn"
+            disabled={batchBusy}
+            title="Rimuovi spunta verificato dai selezionati"
+            onclick={() => runBatch(() => onBatchSetVerified(selectedDocIds, false))}
+          >
+            ✓✕
+          </button>
+        {/if}
+        {#if onBatchAddToCollection && collections.length > 0}
+          <select
+            class="batch-select"
+            disabled={batchBusy}
+            value=""
+            onchange={(e) => {
+              const cid = Number((e.currentTarget as HTMLSelectElement).value);
+              (e.currentTarget as HTMLSelectElement).value = '';
+              if (cid > 0) {
+                void runBatch(() => onBatchAddToCollection(cid, selectedDocIds));
+              }
+            }}
+          >
+            <option value="">+ Collezione…</option>
+            {#each collections as col (col.id)}
+              <option value={String(col.id)}>{col.name}</option>
+            {/each}
+          </select>
+        {/if}
+        {#if onBatchExportBibtex}
+          <button
+            type="button"
+            class="batch-btn"
+            disabled={batchBusy}
+            onclick={() => runBatch(() => onBatchExportBibtex(selectedDocIds))}
+          >
+            .bib
+          </button>
+        {/if}
+        {#if onBatchExportCsv}
+          <button
+            type="button"
+            class="batch-btn"
+            disabled={batchBusy}
+            onclick={() => runBatch(() => onBatchExportCsv(selectedDocIds))}
+          >
+            .csv
+          </button>
+        {/if}
+        {#if onBatchEnqueueOcr}
+          <button
+            type="button"
+            class="batch-btn"
+            disabled={batchBusy}
+            onclick={() => runBatch(() => onBatchEnqueueOcr(selectedDocIds))}
+          >
+            OCR
+          </button>
+        {/if}
+        <button
+          type="button"
+          class="batch-clear"
+          title="Deseleziona"
+          onclick={() => {
+            batchTagMode = 'none';
+            onChangeSelectedDocIds?.([]);
+          }}
+        >
+          ✕
+        </button>
+      </div>
+      {#if batchTagMode !== 'none'}
+        <form class="batch-tag-form" onsubmit={submitBatchTag}>
+          <input
+            type="text"
+            placeholder={batchTagMode === 'add' ? 'Tag da aggiungere…' : 'Tag da rimuovere…'}
+            bind:value={batchTagInput}
+          />
+          <button type="submit" class="batch-btn primary" disabled={batchBusy || !batchTagInput.trim()}>
+            Applica
+          </button>
+        </form>
+      {/if}
+    {/if}
   </div>
   {#if documents.length === 0}
     <div class="empty">
@@ -353,11 +565,12 @@
         <div
           use:measureRow={doc.document_id}
           class="doc-row"
-          class:selected={doc.document_id === selectedDocId}
+          class:selected={doc.document_id === selectedDocId || selectedIdSet.has(doc.document_id)}
+          class:multi-selected={selectedIdSet.size >= 2 && selectedIdSet.has(doc.document_id)}
           class:unavailable={!doc.is_available}
           role="button"
           tabindex="0"
-          onclick={() => onSelectDoc(doc)}
+          onclick={(e) => handleRowClick(e, doc)}
           ondblclick={() => onOpenDoc(doc)}
           onkeydown={(e) => e.key === 'Enter' && onOpenDoc(doc)}
           oncontextmenu={(e) => {
@@ -367,6 +580,21 @@
           }}
         >
           <div class="doc-title">
+            {#if onToggleStarred}
+              <button
+                type="button"
+                class="star-btn"
+                class:starred={Boolean(doc.is_starred)}
+                title={doc.is_starred ? 'Rimuovi dai preferiti' : 'Aggiungi ai preferiti'}
+                aria-label={doc.is_starred ? 'Rimuovi dai preferiti' : 'Aggiungi ai preferiti'}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  onToggleStarred(doc.document_id, !doc.is_starred);
+                }}
+              >
+                {doc.is_starred ? '★' : '☆'}
+              </button>
+            {/if}
             {#if showVerifyControl}
               {#if onToggleVerified}
                 <button
@@ -393,6 +621,11 @@
             <span class="fmt-badge">{doc.format.toUpperCase()}</span>
             {#if doc.work_type === 'book'}
               <span class="book-badge">{tr(lang, 'bookBadge')}</span>
+            {/if}
+            {#if doc.reading_status === 'reading'}
+              <span class="read-badge reading" title={tr(lang, 'statusReading')}>●</span>
+            {:else if doc.reading_status === 'read'}
+              <span class="read-badge read" title={tr(lang, 'statusRead')}>✓</span>
             {/if}
             <span class="title-text">{doc.title}</span>
             {#if doc.msc_primary}
@@ -756,5 +989,95 @@
   .empty {
     padding: 20px;
     color: var(--text-muted);
+  }
+  .batch-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 7px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  .batch-count {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent);
+    margin-right: 4px;
+  }
+  .batch-btn {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg-panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .batch-btn.ok {
+    color: #15803d;
+    border-color: #86efac;
+  }
+  .batch-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .batch-select {
+    font-size: 11px;
+    height: 23px;
+    padding: 1px 4px;
+    border-radius: 5px;
+  }
+  .batch-clear {
+    margin-left: auto;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0 4px;
+  }
+  .batch-tag-form {
+    display: flex;
+    gap: 4px;
+  }
+  .batch-tag-form input {
+    flex: 1;
+    height: 24px;
+    font-size: 11.5px;
+    padding: 2px 6px;
+  }
+  .doc-row.multi-selected {
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .star-btn {
+    border: none;
+    background: transparent;
+    padding: 0 2px;
+    font-size: 13px;
+    line-height: 1;
+    color: var(--text-muted);
+    opacity: 0.25;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .doc-row:hover .star-btn,
+  .star-btn.starred {
+    opacity: 1;
+  }
+  .star-btn.starred {
+    color: #d97706;
+  }
+  .read-badge {
+    font-size: 9px;
+    font-weight: 800;
+    flex-shrink: 0;
+  }
+  .read-badge.reading {
+    color: #2563eb;
+  }
+  .read-badge.read {
+    color: #16a34a;
   }
 </style>

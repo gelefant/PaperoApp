@@ -1,6 +1,9 @@
 use crate::state::{read_file_range_at, AppState, ViewerFileError};
 use papero_core::backup::{stage_pending_restore, BackupReport, RestoreReport};
-use papero_core::bibtex::{format_mrlookup_bibtex, BibtexExportOptions};
+use papero_core::bibtex::{
+    compute_citation_key, format_cite_command, format_mrlookup_bibtex, BibtexExportOptions,
+    BibtexFormat, BibtexKeyPattern,
+};
 use papero_core::classify::{
     add_tag_to_document, build_msc_tree, confirm_document_msc, list_all_tags,
     list_topic_clusters as core_list_topic_clusters, propose_msc_knn_on_db, reject_proposed_msc,
@@ -13,9 +16,21 @@ use papero_core::credentials::{
     delete_secret_key, load_polite_email, load_secret_key, save_polite_email, save_secret_key,
     SecretApiKey,
 };
+use papero_core::db::repos::annotations::{
+    create_annotation_for_file, delete_annotation, export_annotations_markdown,
+    list_annotations_for_file, search_annotations, set_document_reading_status,
+    set_document_starred, toggle_page_bookmark, update_annotation, upsert_reading_state_for_file,
+    AnnotationSearchHit, FileAnnotation, FileReadingState, NewFileAnnotation, ReadingStatePatch,
+    UpdateFileAnnotation,
+};
+use papero_core::db::repos::collections::{
+    add_documents_to_collection, create_collection, create_saved_search, delete_collection,
+    delete_saved_search, list_collections, list_saved_searches, remove_documents_from_collection,
+    rename_collection, reorder_collections, CollectionView, SavedSearchView,
+};
 use papero_core::db::repos::docs::{
-    get_file_location, get_file_viewer_info, hydrate_bm25_results_filtered, list_documents_for_ui,
-    ContentSearchDocResult, DocumentListItem, FileViewerInfo,
+    get_file_location, get_file_viewer_info, list_documents_for_ui, ContentSearchDocResult,
+    DocumentListItem, FileViewerInfo,
 };
 use papero_core::db::repos::roots::{
     insert_source_root, list_source_roots, normalize_root_dir_path, rebind_source_root_path,
@@ -30,29 +45,33 @@ use papero_core::dedup::{
 use papero_core::extract::alt_text::{import_alt_formula_markdown, AltFormulaImportReport};
 use papero_core::extract::djvu::extract_djvu_single_page_spans;
 use papero_core::extract::ocr::{
-    detect_tesseract, enqueue_ocr_for_scanned_files, run_ocr_for_file, run_pending_ocr_queue,
-    OcrEnvironmentStatus, OcrFileReport, OcrProgressEvent,
+    detect_tesseract, enqueue_ocr_for_documents, enqueue_ocr_for_scanned_files, run_ocr_for_file,
+    run_pending_ocr_queue, OcrEnvironmentStatus, OcrFileReport, OcrProgressEvent,
 };
 use papero_core::extract::types::ExtractedSpan;
 use papero_core::fs::roots::new_root_id;
 use papero_core::fs::scanner::{rescan_sources, ScanControl};
 use papero_core::index::hybrid::{
-    hybrid_search, DocScoreAggregation, HybridSearchContext, HybridSearchOptions,
-    HybridSearchResponse,
+    hybrid_search, search_bm25_filtered, ContentSearchFilter, DocScoreAggregation,
+    HybridSearchContext, HybridSearchOptions, HybridSearchResponse,
 };
 use papero_core::index::worker::{
     count_embed_progress, run_embed_queue_with_progress, run_extract_bm25_queue, WorkerBatchReport,
 };
 use papero_core::llm::{
-    accept_cloud_consent, generate_grounded_answer, list_models, prepare_grounded_prompt,
-    verify_provider_key, LlmAnswerResult, LlmKeyVerifyResult, LlmModelInfo, LlmPromptPreview,
-    LlmProvider,
+    accept_cloud_consent, generate_grounded_answer, generate_grounded_answer_streaming,
+    list_models, prepare_document_scoped_prompt, prepare_grounded_prompt,
+    send_prepared_prompt_streaming, verify_provider_key, DocLlmScope, LlmAnswerResult,
+    LlmKeyVerifyResult, LlmModelInfo, LlmPromptPreview, LlmProvider, LlmStreamEvent,
 };
 use papero_core::metadata::io::{
     export_documents_bibtex, export_documents_csv, import_bibtex, import_zotero_csl_json,
-    metadata_view_to_record,
+    metadata_view_to_record, write_bibtex_file_atomically,
 };
 use papero_core::metadata::models::DocumentMetadataView;
+use papero_core::metadata::relations::{
+    get_document_relations, refresh_local_citations_for_doc, DocumentRelationsView,
+};
 use papero_core::metadata::resolver::{
     apply_manual_metadata_edit_with_locks, clear_metadata_jobs_for_doc,
     confirm_metadata_candidate_with_options, dismiss_metadata_candidate,
@@ -61,9 +80,10 @@ use papero_core::metadata::resolver::{
     list_documents_for_bulk_metadata, prepare_guided_search_edit, resolve_document_metadata,
     resolve_document_metadata_with_hints, run_pending_metadata_jobs_cancellable,
     search_documents_metadata, set_document_metadata_verified, GuidedSearchHints,
-    ManualMetadataEdit, MetadataLookupScope, MetadataSearchFilter,
-    ResolveOutcome, SaveAndFetchResult, WaterfallClients,
+    ManualMetadataEdit, MetadataLookupScope, MetadataSearchFilter, ResolveOutcome,
+    SaveAndFetchResult, WaterfallClients,
 };
+use papero_core::metadata::smart_paste::{parse_smart_paste, SmartPasteResult};
 use papero_core::ml::{
     current_process_rss_bytes, download_model_profile, list_model_statuses as core_list_model_statuses,
     profile_is_ready, resolved_onnxruntime_path, DownloadProgressEvent, ModelProfile,
@@ -156,6 +176,14 @@ pub struct UiSettingsPayload {
     pub last_backup_at: Option<i64>,
     #[serde(default)]
     pub last_backup_bytes: Option<u64>,
+    #[serde(default)]
+    pub bibtex_key_pattern: BibtexKeyPattern,
+    #[serde(default)]
+    pub bibtex_format: BibtexFormat,
+    #[serde(default)]
+    pub bibtex_auto_sync_path: Option<String>,
+    #[serde(default)]
+    pub bibtex_auto_sync_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -476,25 +504,21 @@ pub async fn search_content_bm25(
     root_ids: Option<Vec<String>>,
     limit: Option<usize>,
     work_category: Option<String>,
+    filter: Option<ContentSearchFilter>,
 ) -> Result<Vec<ContentSearchDocResult>, String> {
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let base_limit = limit.unwrap_or(50);
-        let fetch_limit = match work_category.as_deref() {
-            Some("book") | Some("paper") => (base_limit * 6).max(300),
-            _ => base_limit,
-        };
-        let hits = st
-            .bm25
-            .search(&query, root_ids.as_deref(), fetch_limit)
-            .map_err(|e| e.to_string())?;
-        let r = st.db.reader();
-        let mut docs = hydrate_bm25_results_filtered(&r, &hits, work_category.as_deref())
-            .map_err(|e| e.to_string())?;
-        if docs.len() > base_limit {
-            docs.truncate(base_limit);
+        let mut eff_filter = filter.unwrap_or_default();
+        if eff_filter.root_ids.is_none() && root_ids.is_some() {
+            eff_filter.root_ids = root_ids;
         }
-        Ok(docs)
+        if eff_filter.work_category.is_none() && work_category.is_some() {
+            eff_filter.work_category = work_category;
+        }
+        let r = st.db.reader();
+        search_bm25_filtered(&r, &st.bm25, &query, &eff_filter, base_limit)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -723,6 +747,10 @@ pub async fn get_ui_settings(state: State<'_, Arc<AppState>>) -> Result<UiSettin
             auto_backup_enabled: cfg.auto_backup_enabled,
             last_backup_at: cfg.last_backup_at,
             last_backup_bytes: cfg.last_backup_bytes,
+            bibtex_key_pattern: cfg.bibtex_key_pattern,
+            bibtex_format: cfg.bibtex_format,
+            bibtex_auto_sync_path: cfg.bibtex_auto_sync_path.clone(),
+            bibtex_auto_sync_enabled: cfg.bibtex_auto_sync_enabled,
         }
     })
     .await
@@ -834,6 +862,20 @@ pub async fn save_ui_settings(
                 cfg.last_backup_bytes = None;
             }
         }
+        let bibtex_changed = cfg.bibtex_key_pattern != settings.bibtex_key_pattern
+            || cfg.bibtex_format != settings.bibtex_format
+            || cfg.bibtex_auto_sync_enabled != settings.bibtex_auto_sync_enabled
+            || cfg.bibtex_auto_sync_path != settings.bibtex_auto_sync_path;
+        cfg.bibtex_key_pattern = settings.bibtex_key_pattern;
+        cfg.bibtex_format = settings.bibtex_format;
+        cfg.bibtex_auto_sync_path = settings
+            .bibtex_auto_sync_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        cfg.bibtex_auto_sync_enabled =
+            settings.bibtex_auto_sync_enabled && cfg.bibtex_auto_sync_path.is_some();
         cfg.save(&st.paths.config_path).map_err(|e| e.to_string())?;
 
         save_polite_email(settings.polite_email.as_deref(), Some(&st.paths.config_path))
@@ -852,6 +894,9 @@ pub async fn save_ui_settings(
         }
         AppState::refresh_watcher(&st, None);
         st.schedule_auto_backup();
+        if bibtex_changed {
+            st.schedule_bibtex_auto_sync();
+        }
         Ok(())
     })
     .await
@@ -967,6 +1012,7 @@ pub async fn set_document_metadata_verified_cmd(
     .await
     .map_err(|e| e.to_string())??;
     state.schedule_auto_backup();
+    state.schedule_bibtex_auto_sync();
     Ok(res)
 }
 
@@ -986,6 +1032,7 @@ pub async fn save_document_metadata(
     .map_err(|e| e.to_string())??;
     spawn_background_dedup(&state);
     state.schedule_auto_backup();
+    state.schedule_bibtex_auto_sync();
     Ok(view)
 }
 
@@ -1090,6 +1137,7 @@ pub async fn save_and_fetch_document_metadata(
 
     if outcome.status != "cancelled" {
         spawn_background_dedup(&state);
+        state.schedule_bibtex_auto_sync();
     }
     state.schedule_auto_backup();
     Ok(SaveAndFetchResult { outcome, metadata })
@@ -1127,6 +1175,9 @@ pub async fn fetch_document_metadata(
     if outcome.status == "updated" || outcome.status == "candidates_found" {
         spawn_background_dedup(&state);
         state.schedule_auto_backup();
+        if outcome.status == "updated" {
+            state.schedule_bibtex_auto_sync();
+        }
     }
     Ok(outcome)
 }
@@ -1250,6 +1301,9 @@ pub async fn fetch_all_metadata_cmd(
     }
     if updated > 0 || candidates > 0 {
         state.schedule_auto_backup();
+        if updated > 0 {
+            state.schedule_bibtex_auto_sync();
+        }
     }
     if !cancelled {
         spawn_background_embedder(Arc::clone(&state));
@@ -1295,6 +1349,7 @@ pub async fn confirm_candidate(
     .map_err(|e| e.to_string())??;
     spawn_background_dedup(&state);
     state.schedule_auto_backup();
+    state.schedule_bibtex_auto_sync();
     Ok(view)
 }
 
@@ -1311,19 +1366,76 @@ pub async fn dismiss_candidate(
     .map_err(|e| e.to_string())?
 }
 
+fn current_bibtex_options(state: &AppState) -> BibtexExportOptions {
+    let cfg = state.config.read().expect("config poisoned");
+    BibtexExportOptions {
+        key_pattern: cfg.bibtex_key_pattern,
+        format: cfg.bibtex_format,
+        ..Default::default()
+    }
+}
+
+fn load_source_root_paths(state: &AppState) -> Vec<String> {
+    let r = state.db.reader();
+    list_source_roots(&r)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sr| sr.root_path)
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CiteKeyPayload {
+    pub key: String,
+    pub cite_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BibtexSyncReport {
+    pub path: String,
+    pub count: usize,
+}
+
 #[tauri::command]
 pub async fn get_document_bibtex(
     state: State<'_, Arc<AppState>>,
     document_id: i64,
 ) -> Result<String, String> {
-    let db = Arc::clone(&state.db);
+    let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
-        let view = core_get_document_metadata(&db, document_id).map_err(|e| e.to_string())?;
+        let opts = current_bibtex_options(&st);
+        let view = core_get_document_metadata(&st.db, document_id).map_err(|e| e.to_string())?;
         let rec = metadata_view_to_record(&view);
-        Ok(format_mrlookup_bibtex(&rec, &BibtexExportOptions::default()))
+        Ok(format_mrlookup_bibtex(&rec, &opts))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_document_cite_key_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+) -> Result<CiteKeyPayload, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let opts = current_bibtex_options(&st);
+        let view = core_get_document_metadata(&st.db, document_id).map_err(|e| e.to_string())?;
+        let rec = metadata_view_to_record(&view);
+        let key = compute_citation_key(&rec, opts.key_pattern);
+        let cite_command = format_cite_command(&rec, opts.key_pattern);
+        Ok(CiteKeyPayload { key, cite_command })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn sync_bibtex_now_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<BibtexSyncReport, String> {
+    let (path, count) = AppState::run_bibtex_auto_sync_now(&state).await?;
+    Ok(BibtexSyncReport { path, count })
 }
 
 fn load_export_views(state: &AppState, document_ids: &[i64]) -> Result<Vec<DocumentMetadataView>, String> {
@@ -1344,10 +1456,12 @@ pub async fn export_bibtex_many(
 ) -> Result<String, String> {
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
+        let opts = current_bibtex_options(&st);
         let views = load_export_views(&st, &document_ids)?;
-        let out = export_documents_bibtex(&views, &BibtexExportOptions::default());
+        let out = export_documents_bibtex(&views, &opts);
         if let Some(p) = file_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            std::fs::write(p, &out).map_err(|e| e.to_string())?;
+            let roots = load_source_root_paths(&st);
+            write_bibtex_file_atomically(Path::new(p), &out, &roots).map_err(|e| e.to_string())?;
         }
         Ok(out)
     })
@@ -1366,7 +1480,8 @@ pub async fn export_csv_many(
         let views = load_export_views(&st, &document_ids)?;
         let out = export_documents_csv(&views);
         if let Some(p) = file_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            std::fs::write(p, &out).map_err(|e| e.to_string())?;
+            let roots = load_source_root_paths(&st);
+            write_bibtex_file_atomically(Path::new(p), &out, &roots).map_err(|e| e.to_string())?;
         }
         Ok(out)
     })
@@ -1416,6 +1531,7 @@ pub async fn import_metadata_file(
         let _ = run_duplicate_detection(&st.db);
         if matched_documents > 0 {
             st.schedule_auto_backup();
+            st.schedule_bibtex_auto_sync();
         }
         Ok(ImportMetadataReport {
             total_entries,
@@ -1636,6 +1752,7 @@ pub async fn search_content_hybrid(
     rerank_override: Option<bool>,
     limit_override: Option<usize>,
     work_category: Option<String>,
+    filter: Option<ContentSearchFilter>,
 ) -> Result<HybridSearchResponse, String> {
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
@@ -1645,6 +1762,14 @@ pub async fn search_content_hybrid(
             ModelProfile::Light => cfg.rerank_top_m_light,
             ModelProfile::Quality => cfg.rerank_top_m_quality,
         };
+        let mut eff_filter = filter.unwrap_or_default();
+        if eff_filter.root_ids.is_none() && root_ids.is_some() {
+            eff_filter.root_ids = root_ids.clone();
+        }
+        if eff_filter.work_category.is_none() && work_category.is_some() {
+            eff_filter.work_category = work_category.clone();
+        }
+        let eff_roots = eff_filter.root_ids.clone();
         let opts = HybridSearchOptions {
             top_n_per_branch: cfg.hybrid_top_n,
             rerank_enabled: rerank_override.unwrap_or(cfg.reranker_enabled),
@@ -1654,6 +1779,7 @@ pub async fn search_content_hybrid(
             rrf_k: 60.0,
             aggregation: DocScoreAggregation::from_str_lossy(&cfg.doc_score_aggregation),
             work_category,
+            filter: eff_filter,
         };
 
         let ort_ready = resolved_onnxruntime_path(cfg.onnxruntime_lib_path.as_deref()).is_some();
@@ -1680,14 +1806,14 @@ pub async fn search_content_hybrid(
                     OnnxReranker::load_isolated(&models_dir, profile, ort_lib.as_deref(), threads)
                 }),
             };
-            hybrid_search(&r, &st.bm25, &query, root_ids.as_deref(), &opts, Some(ctx))
+            hybrid_search(&r, &st.bm25, &query, eff_roots.as_deref(), &opts, Some(ctx))
                 .map_err(|e| e.to_string())
         } else {
             type LoaderFn<T> = fn() -> papero_core::error::Result<T>;
             let none_ctx: Option<
                 HybridSearchContext<'_, LoaderFn<OnnxEmbedder>, LoaderFn<OnnxReranker>>,
             > = None;
-            hybrid_search(&r, &st.bm25, &query, root_ids.as_deref(), &opts, none_ctx)
+            hybrid_search(&r, &st.bm25, &query, eff_roots.as_deref(), &opts, none_ctx)
                 .map_err(|e| e.to_string())
         }
     })
@@ -2294,4 +2420,780 @@ pub async fn generate_llm_answer_cmd(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn generate_llm_answer_stream_cmd(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    results: Vec<ContentSearchDocResult>,
+    max_passages: Option<usize>,
+    max_input_tokens: Option<usize>,
+    on_event: Channel<LlmStreamEvent>,
+) -> Result<LlmAnswerResult, String> {
+    let st = Arc::clone(&state);
+    let cfg = st.config.read().expect("config poisoned").clone();
+    let key = if cfg.llm_provider.is_cloud() {
+        load_provider_key_from_keyring(cfg.llm_provider)?
+    } else {
+        None
+    };
+    let ev_channel = on_event.clone();
+    let res = generate_grounded_answer_streaming(
+        Some(&st.db),
+        &cfg,
+        key.as_ref(),
+        &query,
+        &results,
+        max_passages,
+        max_input_tokens,
+        None,
+        move |delta| {
+            let _ = ev_channel.send(LlmStreamEvent::Delta {
+                text: delta.to_string(),
+            });
+        },
+    )
+    .await;
+    match res {
+        Ok(ans) => {
+            let _ = on_event.send(LlmStreamEvent::Done { result: ans.clone() });
+            Ok(ans)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = on_event.send(LlmStreamEvent::Error {
+                message: msg.clone(),
+            });
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn preview_doc_llm_prompt_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+    file_id: i64,
+    scope: DocLlmScope,
+    page_ord: u32,
+    selection_text: Option<String>,
+    question: String,
+    max_passages: Option<usize>,
+    max_input_tokens: Option<usize>,
+) -> Result<LlmPromptPreview, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let cfg = st.config.read().expect("config poisoned").clone();
+        let r = st.db.reader();
+        let prep = prepare_document_scoped_prompt(
+            &r,
+            &cfg,
+            document_id,
+            file_id,
+            scope,
+            page_ord,
+            selection_text.as_deref(),
+            &question,
+            max_passages,
+            max_input_tokens,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(prep.preview)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn ask_document_llm_stream_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+    file_id: i64,
+    scope: DocLlmScope,
+    page_ord: u32,
+    selection_text: Option<String>,
+    question: String,
+    max_passages: Option<usize>,
+    max_input_tokens: Option<usize>,
+    on_event: Channel<LlmStreamEvent>,
+) -> Result<LlmAnswerResult, String> {
+    let st = Arc::clone(&state);
+    let cfg = st.config.read().expect("config poisoned").clone();
+    let key = if cfg.llm_provider.is_cloud() {
+        load_provider_key_from_keyring(cfg.llm_provider)?
+    } else {
+        None
+    };
+
+    let cfg_prep = cfg.clone();
+    let db_prep = Arc::clone(&st.db);
+    let prepared = tokio::task::spawn_blocking(move || {
+        let r = db_prep.reader();
+        prepare_document_scoped_prompt(
+            &r,
+            &cfg_prep,
+            document_id,
+            file_id,
+            scope,
+            page_ord,
+            selection_text.as_deref(),
+            &question,
+            max_passages,
+            max_input_tokens,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let ev_channel = on_event.clone();
+    let res = send_prepared_prompt_streaming(&cfg, key.as_ref(), prepared, None, move |delta| {
+        let _ = ev_channel.send(LlmStreamEvent::Delta {
+            text: delta.to_string(),
+        });
+    })
+    .await;
+
+    match res {
+        Ok(ans) => {
+            let _ = on_event.send(LlmStreamEvent::Done { result: ans.clone() });
+            Ok(ans)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = on_event.send(LlmStreamEvent::Error {
+                message: msg.clone(),
+            });
+            Err(msg)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Annotations, Bookmarks, Notes & Reading State (v0.5.0)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn list_file_annotations_cmd(
+    state: State<'_, Arc<AppState>>,
+    file_id: i64,
+) -> Result<Vec<FileAnnotation>, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let r = db.reader();
+        list_annotations_for_file(&r, file_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_file_annotation_cmd(
+    state: State<'_, Arc<AppState>>,
+    file_id: i64,
+    input: NewFileAnnotation,
+) -> Result<FileAnnotation, String> {
+    let db = Arc::clone(&state.db);
+    let ann = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        create_annotation_for_file(&w, file_id, &input).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(ann)
+}
+
+#[tauri::command]
+pub async fn update_file_annotation_cmd(
+    state: State<'_, Arc<AppState>>,
+    annotation_id: i64,
+    patch: UpdateFileAnnotation,
+) -> Result<FileAnnotation, String> {
+    let db = Arc::clone(&state.db);
+    let ann = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        update_annotation(&w, annotation_id, &patch).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(ann)
+}
+
+#[tauri::command]
+pub async fn delete_file_annotation_cmd(
+    state: State<'_, Arc<AppState>>,
+    annotation_id: i64,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        delete_annotation(&w, annotation_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_page_bookmark_cmd(
+    state: State<'_, Arc<AppState>>,
+    file_id: i64,
+    page_ord: u32,
+    label: Option<String>,
+) -> Result<Option<FileAnnotation>, String> {
+    let db = Arc::clone(&state.db);
+    let res = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        toggle_page_bookmark(&w, file_id, page_ord, label.as_deref()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn search_annotations_cmd(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    file_id: Option<i64>,
+) -> Result<Vec<AnnotationSearchHit>, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let r = db.reader();
+        search_annotations(&r, &query, file_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn export_annotations_markdown_cmd(
+    state: State<'_, Arc<AppState>>,
+    file_id: Option<i64>,
+    file_path: Option<String>,
+) -> Result<String, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let md = {
+            let r = st.db.reader();
+            export_annotations_markdown(&r, file_id).map_err(|e| e.to_string())?
+        };
+        if let Some(p) = file_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let roots = load_source_root_paths(&st);
+            write_bibtex_file_atomically(Path::new(p), &md, &roots).map_err(|e| e.to_string())?;
+        }
+        Ok(md)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn upsert_reading_state_cmd(
+    state: State<'_, Arc<AppState>>,
+    file_id: i64,
+    patch: ReadingStatePatch,
+) -> Result<FileReadingState, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        upsert_reading_state_for_file(&w, file_id, &patch).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_document_reading_status_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+    status: String,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        set_document_reading_status(&w, document_id, &status).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_document_starred_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+    starred: bool,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        set_document_starred(&w, document_id, starred).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Collections, Saved Searches & Batch Actions (v0.5.0)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn list_collections_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<CollectionView>, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let r = db.reader();
+        list_collections(&r).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_collection_cmd(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    color_hex: Option<String>,
+) -> Result<CollectionView, String> {
+    let db = Arc::clone(&state.db);
+    let col = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        create_collection(&w, &name, color_hex.as_deref()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(col)
+}
+
+#[tauri::command]
+pub async fn rename_collection_cmd(
+    state: State<'_, Arc<AppState>>,
+    collection_id: i64,
+    name: String,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        rename_collection(&w, collection_id, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_collection_cmd(
+    state: State<'_, Arc<AppState>>,
+    collection_id: i64,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        delete_collection(&w, collection_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn reorder_collections_cmd(
+    state: State<'_, Arc<AppState>>,
+    ordered_ids: Vec<i64>,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        reorder_collections(&w, &ordered_ids).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn add_docs_to_collection_cmd(
+    state: State<'_, Arc<AppState>>,
+    collection_id: i64,
+    document_ids: Vec<i64>,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    let n = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        add_documents_to_collection(&w, collection_id, &document_ids).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if n > 0 {
+        state.schedule_auto_backup();
+    }
+    Ok(n)
+}
+
+#[tauri::command]
+pub async fn remove_docs_from_collection_cmd(
+    state: State<'_, Arc<AppState>>,
+    collection_id: i64,
+    document_ids: Vec<i64>,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    let n = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        remove_documents_from_collection(&w, collection_id, &document_ids)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if n > 0 {
+        state.schedule_auto_backup();
+    }
+    Ok(n)
+}
+
+#[tauri::command]
+pub async fn list_saved_searches_cmd(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<SavedSearchView>, String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let r = db.reader();
+        list_saved_searches(&r).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn create_saved_search_cmd(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    search_mode: String,
+    query_text: String,
+    filter_json: String,
+) -> Result<SavedSearchView, String> {
+    let db = Arc::clone(&state.db);
+    let view = tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        create_saved_search(&w, &name, &search_mode, &query_text, &filter_json)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(view)
+}
+
+#[tauri::command]
+pub async fn delete_saved_search_cmd(
+    state: State<'_, Arc<AppState>>,
+    saved_search_id: i64,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tokio::task::spawn_blocking(move || {
+        let w = db.writer();
+        delete_saved_search(&w, saved_search_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    state.schedule_auto_backup();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn batch_add_tag_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_ids: Vec<i64>,
+    tag_name: String,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    let count = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let w = db.writer();
+        let mut applied = 0usize;
+        for doc_id in document_ids {
+            add_tag_to_document(&w, doc_id, &tag_name).map_err(|e| e.to_string())?;
+            applied += 1;
+        }
+        Ok(applied)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if count > 0 {
+        state.schedule_auto_backup();
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn batch_remove_tag_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_ids: Vec<i64>,
+    tag_name: String,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    let count = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let w = db.writer();
+        let mut removed = 0usize;
+        for doc_id in document_ids {
+            remove_tag_from_document(&w, doc_id, &tag_name).map_err(|e| e.to_string())?;
+            removed += 1;
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if count > 0 {
+        state.schedule_auto_backup();
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn batch_set_verified_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_ids: Vec<i64>,
+    verified: bool,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    let count = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let mut updated = 0usize;
+        for doc_id in document_ids {
+            set_document_metadata_verified(&db, doc_id, verified).map_err(|e| e.to_string())?;
+            updated += 1;
+        }
+        Ok(updated)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if count > 0 {
+        state.schedule_auto_backup();
+        state.schedule_bibtex_auto_sync();
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn batch_enqueue_ocr_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_ids: Vec<i64>,
+) -> Result<usize, String> {
+    let db = Arc::clone(&state.db);
+    let queued = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let w = db.writer();
+        enqueue_ocr_for_documents(&w, &document_ids).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(queued)
+}
+
+// ---------------------------------------------------------------------------
+// Document Relations & Smart Paste (v0.5.0)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn get_document_relations_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+) -> Result<DocumentRelationsView, String> {
+    let st = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        {
+            let w = st.db.writer();
+            let _ = refresh_local_citations_for_doc(&w, document_id);
+        }
+        let raw_prof = st.config.read().expect("config poisoned").ml_profile.clone();
+        let profile = ModelProfile::from_str_lossy(&raw_prof);
+        let vindex = st.vector_index_for(profile);
+        let r = st.db.reader();
+        get_document_relations(&r, Some(vindex.as_ref()), document_id, 5).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SmartPasteApplyResult {
+    pub kind: String,
+    pub summary: String,
+    pub outcome: Option<ResolveOutcome>,
+    pub metadata: DocumentMetadataView,
+}
+
+#[tauri::command]
+pub async fn apply_smart_paste_cmd(
+    state: State<'_, Arc<AppState>>,
+    document_id: i64,
+    raw_input: String,
+) -> Result<SmartPasteApplyResult, String> {
+    let parsed = parse_smart_paste(&raw_input);
+    match parsed {
+        SmartPasteResult::Empty => {
+            Err("Nessun DOI, arXiv, MR, zbMATH, ISBN o voce BibTeX riconosciuto.".to_string())
+        }
+        SmartPasteResult::Bibtex { records } => {
+            let db = Arc::clone(&state.db);
+            let metadata = tokio::task::spawn_blocking(move || -> Result<DocumentMetadataView, String> {
+                import_metadata_records_into_library(&db, &records[..1], Some(document_id))
+                    .map_err(|e| e.to_string())?;
+                core_get_document_metadata(&db, document_id).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            spawn_background_dedup(&state);
+            state.schedule_auto_backup();
+            state.schedule_bibtex_auto_sync();
+            Ok(SmartPasteApplyResult {
+                kind: "bibtex".to_string(),
+                summary: "BibTeX importato e applicato.".to_string(),
+                outcome: None,
+                metadata,
+            })
+        }
+        SmartPasteResult::Identifiers {
+            doi,
+            arxiv_id,
+            mr_number,
+            zbl_number,
+            isbn,
+        } => {
+            let mut summary_parts = Vec::new();
+            if let Some(ref d) = doi {
+                summary_parts.push(format!("DOI {d}"));
+            }
+            if let Some(ref a) = arxiv_id {
+                summary_parts.push(format!("arXiv:{a}"));
+            }
+            if let Some(ref m) = mr_number {
+                summary_parts.push(format!("MR{m}"));
+            }
+            if let Some(ref z) = zbl_number {
+                summary_parts.push(format!("Zbl {z}"));
+            }
+            if let Some(ref i) = isbn {
+                summary_parts.push(format!("ISBN {i}"));
+            }
+            let summary = summary_parts.join(" · ");
+
+            let db_upd = Arc::clone(&state.db);
+            let (d_c, a_c, m_c, z_c, i_c) = (
+                doi.clone(),
+                arxiv_id.clone(),
+                mr_number.clone(),
+                zbl_number.clone(),
+                isbn.clone(),
+            );
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let current =
+                    core_get_document_metadata(&db_upd, document_id).map_err(|e| e.to_string())?;
+                let mut locks: Vec<String> = current.manual_locked_fields.clone();
+                let mut push_lock = |name: &str| {
+                    if !locks.iter().any(|l| l == name) {
+                        locks.push(name.to_string());
+                    }
+                };
+                if d_c.is_some() {
+                    push_lock("doi");
+                }
+                if a_c.is_some() {
+                    push_lock("arxiv_id");
+                }
+                if m_c.is_some() {
+                    push_lock("mr_number");
+                }
+                if z_c.is_some() {
+                    push_lock("zbl_number");
+                }
+                if i_c.is_some() {
+                    push_lock("isbn");
+                }
+                let edit = ManualMetadataEdit {
+                    document_id,
+                    work_type: current.work_type,
+                    title: current.title,
+                    authors: current.authors,
+                    journal_abbrev: current.journal_abbrev,
+                    journal_full: current.journal_full,
+                    booktitle: current.booktitle,
+                    series: current.series,
+                    volume: current.volume,
+                    issue_number: current.issue_number,
+                    year: current.year,
+                    pages: current.pages,
+                    edition: current.edition,
+                    publisher: current.publisher,
+                    address: current.address,
+                    isbn: i_c.or(current.isbn),
+                    issn: current.issn,
+                    doi: d_c.or(current.doi),
+                    arxiv_id: a_c.or(current.arxiv_id),
+                    mr_number: m_c.or(current.mr_number),
+                    mr_reviewer: current.mr_reviewer,
+                    zbl_number: z_c.or(current.zbl_number),
+                    url: current.url,
+                    msc_primary: current.msc_primary,
+                    msc_secondary: current.msc_secondary,
+                    abstract_text: current.abstract_text,
+                    exclude_from_cloud_llm: current.exclude_from_cloud_llm,
+                    tags: current.tags,
+                    edited_fields: locks.clone(),
+                };
+                apply_manual_metadata_edit_with_locks(&db_upd, &edit, Some(&locks), false)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+            let cfg = state.config.read().expect("config poisoned").clone();
+            let outcome = if cfg.network_lookups_enabled {
+                let clients = Arc::clone(&state.clients.read().expect("clients poisoned"));
+                let res = resolve_document_metadata(
+                    &state.db,
+                    &clients,
+                    &cfg,
+                    document_id,
+                    MetadataLookupScope::SingleRecordUserAction,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Some(res)
+            } else {
+                None
+            };
+
+            let db_after = Arc::clone(&state.db);
+            let metadata = tokio::task::spawn_blocking(move || {
+                core_get_document_metadata(&db_after, document_id).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+            spawn_background_dedup(&state);
+            state.schedule_auto_backup();
+            state.schedule_bibtex_auto_sync();
+
+            Ok(SmartPasteApplyResult {
+                kind: "identifiers".to_string(),
+                summary,
+                outcome,
+                metadata,
+            })
+        }
+    }
 }

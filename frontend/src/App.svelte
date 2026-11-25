@@ -6,7 +6,10 @@
   import { normalizeLang, tr } from './lib/i18n';
   import type {
     BackupReport,
+    BibtexSyncReport,
+    CollectionView,
     ContentSearchDocResult,
+    ContentSearchFilter,
     ContentSearchPassageHit,
     DocumentListItem,
     DocumentMetadataView,
@@ -26,8 +29,11 @@
     MscTreeNode,
     NormalizedRect,
     OcrEnvironmentStatus,
+    ReadingStatus,
+    SavedSearchView,
     ScanProgressEvent,
     SettingsTabId,
+    SmartPasteApplyResult,
     SortDirection,
     SortField,
     SourceRoot,
@@ -93,6 +99,9 @@
   let mscTree = $state.raw<MscTreeNode[]>([]);
   let clusters = $state.raw<TopicClusterView[]>([]);
   let tags = $state.raw<TagSummary[]>([]);
+  let collections = $state.raw<CollectionView[]>([]);
+  let savedSearches = $state.raw<SavedSearchView[]>([]);
+  let selectedDocIds = $state<number[]>([]);
   let knnBusy = $state(false);
   let clusteringBusy = $state(false);
   let settings = $state<UiSettingsPayload | null>(null);
@@ -115,6 +124,7 @@
   let ocrStatus = $state<OcrEnvironmentStatus | null>(null);
   let llmPreview = $state<LlmPromptPreview | null>(null);
   let llmAnswer = $state<LlmAnswerResult | null>(null);
+  let llmStreamText = $state('');
   let llmLoading = $state(false);
   let llmError = $state('');
   let cloudConsentModal = $state<{ provider: LlmProvider; preview: LlmPromptPreview } | null>(null);
@@ -127,6 +137,7 @@
   let unlistenBackup: UnlistenFn | null = null;
   let unlistenDuplicates: UnlistenFn | null = null;
   let unlistenEmbed: UnlistenFn | null = null;
+  let unlistenBibtexSync: UnlistenFn | null = null;
   let appDestroyed = false;
   let fsRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let docsReqSeq = 0;
@@ -220,21 +231,83 @@
   }
 
   async function refreshTaxonomy() {
-    const [tree, cl, tg] = await Promise.all([
+    const [tree, cl, tg, cols, saved] = await Promise.all([
       api.getMscTree(),
       api.listTopicClusters(),
       api.listAllTags(),
+      api.listCollections().catch(() => [] as CollectionView[]),
+      api.listSavedSearches().catch(() => [] as SavedSearchView[]),
     ]);
     mscTree = tree;
     clusters = cl;
     tags = tg;
+    collections = cols;
+    savedSearches = saved;
   }
 
   function hasSidebarFilter() {
     return Boolean(
-      metaFilter.msc_prefix || metaFilter.cluster_id || metaFilter.tag || metaFilter.root_id
+      metaFilter.msc_prefix ||
+        metaFilter.cluster_id ||
+        metaFilter.tag ||
+        metaFilter.root_id ||
+        metaFilter.collection_id ||
+        metaFilter.reading_status ||
+        metaFilter.starred_only ||
+        metaFilter.recent_only ||
+        metaFilter.author ||
+        metaFilter.year_from !== null && metaFilter.year_from !== undefined ||
+        metaFilter.year_to !== null && metaFilter.year_to !== undefined
     );
   }
+
+  /** Builds ContentSearchFilter propagating Tag/Cluster/Collection/Author/Year/Root/Category/Reading/Starred — intentionally excluding MSC2020. */
+  function buildActiveContentFilter(): ContentSearchFilter {
+    return {
+      root_ids: metaFilter.root_id ? [metaFilter.root_id] : null,
+      tag: metaFilter.tag || null,
+      cluster_id: metaFilter.cluster_id ?? null,
+      collection_id: metaFilter.collection_id ?? null,
+      author: metaFilter.author || null,
+      year_from: metaFilter.year_from ?? null,
+      year_to: metaFilter.year_to ?? null,
+      work_category: activeWorkCategory !== 'all' ? activeWorkCategory : null,
+      reading_status: metaFilter.reading_status || null,
+      starred_only: metaFilter.starred_only ? true : null,
+    };
+  }
+
+  const activeContentFilterChips = $derived.by(() => {
+    const chips: string[] = [];
+    if (metaFilter.tag) chips.push(`#${metaFilter.tag}`);
+    if (metaFilter.cluster_id) {
+      const cl = clusters.find((c) => c.id === metaFilter.cluster_id);
+      chips.push(cl ? cl.label : `Cluster #${metaFilter.cluster_id}`);
+    }
+    if (metaFilter.collection_id) {
+      const col = collections.find((c) => c.id === metaFilter.collection_id);
+      chips.push(col ? col.name : `Collezione #${metaFilter.collection_id}`);
+    }
+    if (metaFilter.root_id) {
+      const rt = roots.find((r) => r.id === metaFilter.root_id);
+      chips.push(rt ? rt.label : 'Cartella');
+    }
+    if (metaFilter.author) chips.push(`Autore: ${metaFilter.author}`);
+    if (metaFilter.year_from || metaFilter.year_to) {
+      chips.push(`${metaFilter.year_from ?? '…'}–${metaFilter.year_to ?? '…'}`);
+    }
+    if (metaFilter.reading_status) {
+      chips.push(
+        metaFilter.reading_status === 'reading'
+          ? 'In lettura'
+          : metaFilter.reading_status === 'read'
+            ? 'Letto'
+            : 'Da leggere'
+      );
+    }
+    if (metaFilter.starred_only) chips.push('★ Preferiti');
+    return chips;
+  });
 
   function hasListFilterOrCustomSort() {
     return Boolean(
@@ -308,6 +381,10 @@
       nextFilter.cluster_id = null;
       filterChanged = true;
     }
+    if (nextFilter.collection_id && !collections.some((c) => c.id === nextFilter.collection_id)) {
+      nextFilter.collection_id = null;
+      filterChanged = true;
+    }
     if (nextFilter.msc_prefix) {
       const pfx = nextFilter.msc_prefix.toUpperCase();
       const mscStillPopulated = mscTree.some(
@@ -354,9 +431,19 @@
 
   async function applySidebarFilter(patch: Partial<MetadataSearchFilter>) {
     activeLeftView = 'library';
-    searchResults = null;
-    searchStats = null;
     metaFilter = { ...metaFilter, ...patch };
+    // MSC2020 is intentionally excluded from content search -> switch to metadata catalog
+    if ('msc_prefix' in patch && patch.msc_prefix) {
+      searchResults = null;
+      searchStats = null;
+      await refreshDocuments();
+      return;
+    }
+    // Keep content search results open & filter them coherently when clicking Tag/Cluster/Collection/Folder!
+    if (searchResults !== null && committedContentQuery.trim()) {
+      await Promise.all([handleSearch(committedContentQuery), refreshDocuments()]);
+      return;
+    }
     await refreshDocuments();
   }
 
@@ -367,8 +454,270 @@
       cluster_id: null,
       tag: null,
       root_id: null,
+      collection_id: null,
+      reading_status: null,
+      starred_only: null,
+      recent_only: null,
+      author: null,
+      year_from: null,
+      year_to: null,
     };
+    if (searchResults !== null && committedContentQuery.trim()) {
+      await Promise.all([handleSearch(committedContentQuery), refreshDocuments()]);
+      return;
+    }
     await refreshDocuments();
+  }
+
+  async function handleSelectQuickView(view: 'all' | 'recent' | 'reading' | 'starred') {
+    activeLeftView = 'library';
+    if (view === 'all') {
+      metaFilter = {
+        ...metaFilter,
+        collection_id: null,
+        reading_status: null,
+        starred_only: null,
+        recent_only: null,
+        sort_by: 'updated',
+        sort_dir: 'desc',
+      };
+    } else if (view === 'recent') {
+      searchResults = null;
+      searchStats = null;
+      metaFilter = {
+        ...metaFilter,
+        collection_id: null,
+        reading_status: null,
+        starred_only: null,
+        recent_only: true,
+        sort_by: 'last_opened',
+        sort_dir: 'desc',
+      };
+      await refreshDocuments();
+      return;
+    } else if (view === 'reading') {
+      metaFilter = {
+        ...metaFilter,
+        recent_only: null,
+        starred_only: null,
+        reading_status: metaFilter.reading_status === 'reading' ? null : 'reading',
+      };
+    } else if (view === 'starred') {
+      metaFilter = {
+        ...metaFilter,
+        recent_only: null,
+        reading_status: null,
+        starred_only: !metaFilter.starred_only,
+      };
+    }
+    if (searchResults !== null && committedContentQuery.trim()) {
+      await Promise.all([handleSearch(committedContentQuery), refreshDocuments()]);
+      return;
+    }
+    await refreshDocuments();
+  }
+
+  async function handleCreateCollection(name: string) {
+    await api.createCollection(name);
+    await refreshTaxonomy();
+  }
+
+  async function handleRenameCollection(collectionId: number, name: string) {
+    await api.renameCollection(collectionId, name);
+    await refreshTaxonomy();
+  }
+
+  async function handleDeleteCollection(collectionId: number) {
+    await api.deleteCollection(collectionId);
+    if (metaFilter.collection_id === collectionId) {
+      metaFilter = { ...metaFilter, collection_id: null };
+    }
+    await Promise.all([refreshTaxonomy(), refreshDocuments()]);
+  }
+
+  async function handleReorderCollections(orderedIds: number[]) {
+    await api.reorderCollections(orderedIds);
+    await refreshTaxonomy();
+  }
+
+  async function handleAddDocToCollection(collectionId: number, docId: number) {
+    await api.addDocsToCollection(collectionId, [docId]);
+    await refreshTaxonomy();
+    if (selectedDocId === docId) await loadInspectorMetadata(docId);
+  }
+
+  async function handleRemoveDocFromCollection(collectionId: number, docId: number) {
+    await api.removeDocsFromCollection(collectionId, [docId]);
+    await Promise.all([refreshTaxonomy(), refreshDocuments()]);
+    if (selectedDocId === docId) await loadInspectorMetadata(docId);
+  }
+
+  async function handleSaveCurrentView(name: string) {
+    const mode = searchResults !== null || searchMode === 'content' ? 'content' : 'metadata';
+    const q = mode === 'content' ? committedContentQuery || query : query;
+    await api.createSavedSearch(name, mode, q.trim(), JSON.stringify(metaFilter));
+    await refreshTaxonomy();
+  }
+
+  async function handleApplySavedSearch(view: SavedSearchView) {
+    activeLeftView = 'library';
+    let parsed: MetadataSearchFilter = {
+      work_category: 'all',
+      verified_filter: 'all',
+      sort_by: 'updated',
+      sort_dir: 'desc',
+    };
+    try {
+      const obj = JSON.parse(view.filter_json);
+      if (obj && typeof obj === 'object') parsed = { ...parsed, ...obj };
+    } catch {
+      // Fallback to default filter
+    }
+    metaFilter = parsed;
+    query = view.query_text;
+    searchMode = view.search_mode === 'content' ? 'content' : 'metadata';
+    if (searchMode === 'content' && view.query_text.trim()) {
+      await handleSearch(view.query_text);
+    } else {
+      searchResults = null;
+      searchStats = null;
+      await refreshDocuments();
+    }
+  }
+
+  async function handleDeleteSavedSearch(id: number) {
+    await api.deleteSavedSearch(id);
+    await refreshTaxonomy();
+  }
+
+  async function handleSetReadingStatus(docId: number, status: ReadingStatus) {
+    await api.setDocumentReadingStatus(docId, status);
+    const patch = (d: DocumentListItem) =>
+      d.document_id === docId ? { ...d, reading_status: status } : d;
+    allDocuments = allDocuments.map(patch);
+    documents = documents.map(patch);
+    if (selectedMeta && selectedMeta.document_id === docId) {
+      selectedMeta = { ...selectedMeta, reading_status: status };
+    }
+    if (metaFilter.reading_status) {
+      await refreshDocuments(false);
+    }
+  }
+
+  async function handleToggleStarred(docId: number, starred: boolean) {
+    await api.setDocumentStarred(docId, starred);
+    const patch = (d: DocumentListItem) =>
+      d.document_id === docId ? { ...d, is_starred: starred } : d;
+    allDocuments = allDocuments.map(patch);
+    documents = documents.map(patch);
+    if (selectedMeta && selectedMeta.document_id === docId) {
+      selectedMeta = { ...selectedMeta, is_starred: starred };
+    }
+    if (metaFilter.starred_only) {
+      await refreshDocuments(false);
+    }
+  }
+
+  async function handleCopyCiteCommand(docId: number): Promise<string> {
+    const res = await api.getDocumentCiteKey(docId);
+    try {
+      await navigator.clipboard.writeText(res.cite_command);
+      scanStatusText = `Copiato ${res.cite_command}`;
+    } catch {
+      // Ignore clipboard error
+    }
+    return res.cite_command;
+  }
+
+  async function handleApplySmartPaste(
+    docId: number,
+    rawInput: string
+  ): Promise<SmartPasteApplyResult> {
+    fetchingMeta = true;
+    fetchStatusMsg = 'Riconoscimento identificatore / BibTeX…';
+    try {
+      const res = await api.applySmartPaste(docId, rawInput);
+      selectedMeta = res.metadata;
+      fetchStatusMsg =
+        res.outcome?.status === 'updated'
+          ? `${res.summary} → aggiornato da ${res.outcome.source ?? 'fonte esterna'}.`
+          : res.outcome?.status === 'candidates_found'
+            ? `${res.summary} → trovati ${res.outcome.candidates_count} candidati.`
+            : res.summary;
+      await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
+      return res;
+    } finally {
+      fetchingMeta = false;
+    }
+  }
+
+  async function handleBatchAddTag(docIds: number[], tagName: string) {
+    const n = await api.batchAddTag(docIds, tagName);
+    scanStatusText = `Tag #${tagName} aggiunto a ${n} documenti.`;
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
+    if (selectedDocId !== null && docIds.includes(selectedDocId)) {
+      await loadInspectorMetadata(selectedDocId);
+    }
+  }
+
+  async function handleBatchRemoveTag(docIds: number[], tagName: string) {
+    const n = await api.batchRemoveTag(docIds, tagName);
+    scanStatusText = `Tag #${tagName} rimosso da ${n} documenti.`;
+    await Promise.all([refreshDocuments(true), refreshTaxonomy()]);
+    if (selectedDocId !== null && docIds.includes(selectedDocId)) {
+      await loadInspectorMetadata(selectedDocId);
+    }
+  }
+
+  async function handleBatchSetVerified(docIds: number[], verified: boolean) {
+    const n = await api.batchSetVerified(docIds, verified);
+    scanStatusText = verified
+      ? `${n} documenti segnati come verificati ✓.`
+      : `Verifica rimossa da ${n} documenti.`;
+    await refreshDocuments(true);
+    if (selectedDocId !== null && docIds.includes(selectedDocId)) {
+      await loadInspectorMetadata(selectedDocId);
+    }
+  }
+
+  async function handleBatchAddToCollection(collectionId: number, docIds: number[]) {
+    const n = await api.addDocsToCollection(collectionId, docIds);
+    const col = collections.find((c) => c.id === collectionId);
+    scanStatusText = `Aggiunti ${n} documenti alla collezione «${col?.name ?? collectionId}».`;
+    await refreshTaxonomy();
+    if (selectedDocId !== null && docIds.includes(selectedDocId)) {
+      await loadInspectorMetadata(selectedDocId);
+    }
+  }
+
+  async function handleBatchExportBibtex(docIds: number[]) {
+    const outPath = await saveFileDialog({
+      defaultPath: 'papero_selezionati.bib',
+      filters: [{ name: 'BibTeX', extensions: ['bib'] }],
+    });
+    if (!outPath) return;
+    await api.exportBibtexMany(docIds, outPath);
+    scanStatusText = `Esportati ${docIds.length} record BibTeX in ${outPath}`;
+  }
+
+  async function handleBatchExportCsv(docIds: number[]) {
+    const outPath = await saveFileDialog({
+      defaultPath: 'papero_selezionati.csv',
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    });
+    if (!outPath) return;
+    await api.exportCsvMany(docIds, outPath);
+    scanStatusText = `Esportati ${docIds.length} record CSV in ${outPath}`;
+  }
+
+  async function handleBatchEnqueueOcr(docIds: number[]) {
+    const queued = await api.batchEnqueueOcr(docIds);
+    if (queued === 0) {
+      scanStatusText = 'Nessun file da accodare per OCR nella selezione.';
+      return;
+    }
+    scanStatusText = `${queued} file accodati per OCR. Avvio elaborazione…`;
+    await handleRunPendingOcr();
   }
 
   async function handleRunKnnProposals() {
@@ -644,6 +993,20 @@
       return;
     }
     unlistenEmbed = unEmb;
+
+    const unBib = await listen<BibtexSyncReport>('papero://bibtex-synced', (ev) => {
+      if (!appDestroyed) {
+        scanStatusText =
+          lang === 'en'
+            ? `Auto-synced ${ev.payload.count} BibTeX entries to ${ev.payload.path}`
+            : `Sincronizzate ${ev.payload.count} voci BibTeX in ${ev.payload.path}`;
+      }
+    });
+    if (appDestroyed) {
+      unBib();
+      return;
+    }
+    unlistenBibtexSync = unBib;
   });
 
   onDestroy(() => {
@@ -656,6 +1019,7 @@
     unlistenBackup?.();
     unlistenDuplicates?.();
     unlistenEmbed?.();
+    unlistenBibtexSync?.();
   });
 
   async function handleAddFolder() {
@@ -709,11 +1073,23 @@
   }
 
   async function executeGenerateLlmAnswer() {
-    if (!searchResults || searchResults.length === 0 || !query.trim()) return;
+    const activeQ = (committedContentQuery || query).trim();
+    if (!searchResults || searchResults.length === 0 || !activeQ) return;
     llmLoading = true;
     llmError = '';
+    llmAnswer = null;
+    llmStreamText = '';
     try {
-      llmAnswer = await api.generateLlmAnswer(query.trim(), searchResults);
+      const ans = await api.generateLlmAnswerStream(activeQ, searchResults, (ev) => {
+        if (ev.event === 'delta') {
+          llmStreamText += ev.text;
+        } else if (ev.event === 'done') {
+          llmAnswer = ev.result;
+        } else if (ev.event === 'error') {
+          llmError = ev.message;
+        }
+      });
+      llmAnswer = ans;
     } catch (e) {
       llmError = String(e);
     } finally {
@@ -753,6 +1129,7 @@
   async function handleSearch(q: string) {
     const seq = ++searchReqSeq;
     llmAnswer = null;
+    llmStreamText = '';
     llmError = '';
     llmPreview = null;
     cloudConsentModal = null;
@@ -770,12 +1147,14 @@
       return;
     }
     activeLeftView = 'library';
+    const contentFilter = buildActiveContentFilter();
     const resp = await api.searchContentHybrid(
       trimmed,
-      metaFilter.root_id ? [metaFilter.root_id] : undefined,
+      contentFilter.root_ids ?? undefined,
       null,
       null,
-      activeWorkCategory
+      activeWorkCategory,
+      contentFilter
     );
     if (seq !== searchReqSeq) return;
     committedContentQuery = trimmed;
@@ -921,7 +1300,8 @@
     pageOrd = 1,
     highlightRects: NormalizedRect[] = [],
     matches: ViewerTargetPassage[] = [],
-    activeMatchIndex = 0
+    activeMatchIndex = 0,
+    explicitPageJump = false
   ) {
     if (settings?.viewer_open_in_separate_window) {
       await api.openDetachedViewerWindow(
@@ -940,6 +1320,7 @@
           ? {
               ...t,
               targetPage: pageOrd,
+              explicitPageJump: explicitPageJump || highlightRects.length > 0 || pageOrd > 1,
               highlightRects,
               matches: matches.length ? matches : t.matches,
               activeMatchIndex,
@@ -959,6 +1340,7 @@
         title,
         format,
         targetPage: pageOrd,
+        explicitPageJump: explicitPageJump || highlightRects.length > 0 || pageOrd > 1,
         highlightRects,
         matches,
         activeMatchIndex,
@@ -983,7 +1365,8 @@
         pass.page_ord,
         pass.bboxes,
         matches,
-        Math.max(0, idx)
+        Math.max(0, idx),
+        true
       );
     });
   }
@@ -1016,7 +1399,8 @@
         c.page_ord,
         c.bboxes,
         matches,
-        Math.max(0, idx)
+        Math.max(0, idx),
+        true
       );
     });
   }
@@ -1741,16 +2125,31 @@
           {clusters}
           {tags}
           {roots}
+          {collections}
+          {savedSearches}
           activeMscPrefix={metaFilter.msc_prefix ?? null}
           activeClusterId={metaFilter.cluster_id ?? null}
           activeTag={metaFilter.tag ?? null}
           activeRootId={metaFilter.root_id ?? null}
+          activeCollectionId={metaFilter.collection_id ?? null}
+          activeReadingStatus={metaFilter.reading_status ?? null}
+          activeStarredOnly={Boolean(metaFilter.starred_only)}
+          activeRecentOnly={Boolean(metaFilter.recent_only)}
           {knnBusy}
           {clusteringBusy}
           onSelectMsc={(code) => applySidebarFilter({ msc_prefix: code })}
           onSelectCluster={(cid) => applySidebarFilter({ cluster_id: cid })}
           onSelectTag={(tg) => applySidebarFilter({ tag: tg })}
           onSelectRoot={(rid) => applySidebarFilter({ root_id: rid })}
+          onSelectCollection={(colId) => applySidebarFilter({ collection_id: colId })}
+          onSelectQuickView={handleSelectQuickView}
+          onCreateCollection={handleCreateCollection}
+          onRenameCollection={handleRenameCollection}
+          onDeleteCollection={handleDeleteCollection}
+          onReorderCollections={handleReorderCollections}
+          onSaveCurrentView={handleSaveCurrentView}
+          onApplySavedSearch={handleApplySavedSearch}
+          onDeleteSavedSearch={handleDeleteSavedSearch}
           onClearAllFilters={clearSidebarFilters}
           onRunKnnProposals={handleRunKnnProposals}
           onRunClustering={handleRunClustering}
@@ -1782,10 +2181,17 @@
             results={displayedSearchResults}
             {searchStats}
             workCategory={activeWorkCategory}
+            activeFilterChips={activeContentFilterChips}
+            authorFilter={metaFilter.author ?? ''}
+            yearFromFilter={metaFilter.year_from ?? null}
+            yearToFilter={metaFilter.year_to ?? null}
             onChangeWorkCategory={handleWorkCategoryChange}
+            onChangeContentMetaFilters={(patch) => applySidebarFilter(patch)}
+            onClearContentFilters={clearSidebarFilters}
             llmProvider={settings?.llm_provider ?? 'disabled'}
             {llmPreview}
             {llmAnswer}
+            {llmStreamText}
             {llmLoading}
             {llmError}
             onGenerateAnswer={handleGenerateLlmAnswer}
@@ -1812,6 +2218,8 @@
             {lang}
             {documents}
             {selectedDocId}
+            {selectedDocIds}
+            {collections}
             workCategory={activeWorkCategory}
             verifiedFilter={activeVerifiedFilter}
             unverifiedCount={unverifiedDocsCount}
@@ -1822,9 +2230,11 @@
             onChangeSortBy={handleSortByChange}
             onToggleSortDir={handleToggleSortDir}
             onToggleVerified={(docId, verified) => handleToggleDocVerified(docId, verified, false)}
+            onToggleStarred={handleToggleStarred}
             onSelectDoc={(doc) => {
               requestSelectDocument(doc.document_id);
             }}
+            onChangeSelectedDocIds={(ids) => (selectedDocIds = ids)}
             onOpenDoc={(doc) => {
               requestSelectDocument(doc.document_id, () => {
                 openInViewer(doc.file_id, doc.title, doc.format, 1);
@@ -1832,6 +2242,13 @@
             }}
             onConfirmMsc={handleConfirmMsc}
             onRejectMsc={handleRejectMsc}
+            onBatchAddTag={handleBatchAddTag}
+            onBatchRemoveTag={handleBatchRemoveTag}
+            onBatchSetVerified={handleBatchSetVerified}
+            onBatchAddToCollection={handleBatchAddToCollection}
+            onBatchExportBibtex={handleBatchExportBibtex}
+            onBatchExportCsv={handleBatchExportCsv}
+            onBatchEnqueueOcr={handleBatchEnqueueOcr}
             onContextMenu={(e, doc) => {
               contextTarget = {
                 x: e.clientX,
@@ -1851,6 +2268,7 @@
         <ViewerTabs
           {tabs}
           {activeTabId}
+          llmProvider={settings?.llm_provider ?? 'disabled'}
           onSelectTab={(id) => (activeTabId = id)}
           onCloseTab={(id) => {
             tabs = tabs.filter((t) => t.tabId !== id);
@@ -1860,6 +2278,14 @@
           }}
           onSelectMatchIndex={handleSelectMatchIndex}
           onOpenExternal={(fid, page) => api.openFileExternal(fid, page, null)}
+          onConsentAccepted={(prov) => {
+            if (settings) {
+              if (prov === 'anthropic') settings = { ...settings, llm_consent_anthropic: true };
+              else if (prov === 'openai') settings = { ...settings, llm_consent_openai: true };
+              else if (prov === 'gemini') settings = { ...settings, llm_consent_gemini: true };
+            }
+          }}
+          onStatusMessage={(msg) => (scanStatusText = msg)}
         />
       </section>
 
@@ -1870,6 +2296,7 @@
             meta={selectedMeta}
             {selectedFileId}
             {clusters}
+            {collections}
             loading={loadingMeta}
             fetchingOnline={fetchingMeta}
             lastFetchMessage={fetchStatusMsg}
@@ -1883,6 +2310,13 @@
             onConfirmCandidate={handleConfirmCandidate}
             onDismissCandidate={handleDismissCandidate}
             onCopyBibtex={handleCopyBibtex}
+            onCopyCiteCommand={handleCopyCiteCommand}
+            onApplySmartPaste={handleApplySmartPaste}
+            onSetReadingStatus={handleSetReadingStatus}
+            onSetStarred={handleToggleStarred}
+            onAddToCollection={handleAddDocToCollection}
+            onRemoveFromCollection={handleRemoveDocFromCollection}
+            onSelectRelatedDoc={(docId) => requestSelectDocument(docId)}
             onImportAltFormula={handleImportAltFormula}
             onRunOcr={handleRunOcrForFile}
             onConfirmMsc={handleConfirmMsc}

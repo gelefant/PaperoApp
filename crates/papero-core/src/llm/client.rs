@@ -11,6 +11,7 @@ use crate::llm::guard::{
 use crate::llm::provider::{
     LlmAnswerResult, LlmKeyVerifyResult, LlmModelInfo, LlmProvider, LlmUsage,
 };
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -341,14 +342,41 @@ pub async fn generate_grounded_answer(
     send_prepared_prompt(config, api_key, prepared, base_url_override).await
 }
 
-/// Dispatches an already-filtered [`PreparedPrompt`] to the active LLM provider without
-/// holding any database lock across `.await`.
-pub async fn send_prepared_prompt(
+/// Streaming variant of [`generate_grounded_answer`], emitting incremental token deltas via
+/// `on_delta` while still enforcing privacy exclusions, cloud consent, and citation parsing.
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_grounded_answer_streaming<F>(
+    db: Option<&Database>,
     config: &AppConfig,
     api_key: Option<&SecretApiKey>,
-    prepared: PreparedPrompt,
+    query: &str,
+    results: &[ContentSearchDocResult],
+    max_passages_override: Option<usize>,
+    max_input_tokens_override: Option<usize>,
     base_url_override: Option<&str>,
-) -> Result<LlmAnswerResult> {
+    on_delta: F,
+) -> Result<LlmAnswerResult>
+where
+    F: FnMut(&str) + Send,
+{
+    let prepared = {
+        let reader_guard = db.map(Database::reader);
+        prepare_grounded_prompt(
+            reader_guard.as_deref(),
+            config,
+            query,
+            results,
+            max_passages_override,
+            max_input_tokens_override,
+        )?
+    };
+    send_prepared_prompt_streaming(config, api_key, prepared, base_url_override, on_delta).await
+}
+
+fn validate_and_short_circuit_prompt(
+    config: &AppConfig,
+    prepared: &PreparedPrompt,
+) -> Result<(LlmProvider, String, Option<LlmAnswerResult>)> {
     let provider = config.llm_provider;
     if !provider.is_enabled() {
         return Err(CoreError::Config(
@@ -374,7 +402,6 @@ pub async fn send_prepared_prompt(
         ));
     }
 
-    // Short-circuit BEFORE making any HTTP request when zero non-excluded passages exist.
     if prepared.selected_passages.is_empty() {
         let is_en = config.ui_language.trim().eq_ignore_ascii_case("en");
         let answer_markdown = if is_en {
@@ -387,18 +414,71 @@ pub async fn send_prepared_prompt(
         } else {
             Some("no passages retrieved for query".to_string())
         };
-        return Ok(LlmAnswerResult {
+        return Ok((
             provider,
-            model,
-            answer_markdown,
-            citations: Vec::new(),
-            refused: true,
-            refusal_reason: reason,
-            usage: LlmUsage::default(),
-            estimated_input_tokens: 0,
-            included_passages: 0,
-            excluded_passages: prepared.preview.passages_excluded_cloud,
-        });
+            model.clone(),
+            Some(LlmAnswerResult {
+                provider,
+                model,
+                answer_markdown,
+                citations: Vec::new(),
+                refused: true,
+                refusal_reason: reason,
+                usage: LlmUsage::default(),
+                estimated_input_tokens: 0,
+                included_passages: 0,
+                excluded_passages: prepared.preview.passages_excluded_cloud,
+            }),
+        ));
+    }
+
+    Ok((provider, model, None))
+}
+
+fn finalize_answer(
+    provider: LlmProvider,
+    model: String,
+    answer_text: String,
+    usage: LlmUsage,
+    prepared: &PreparedPrompt,
+) -> LlmAnswerResult {
+    let trimmed = answer_text.trim().to_string();
+    let refused = detect_refusal(&trimmed);
+    let citations = if refused {
+        Vec::new()
+    } else {
+        parse_citations(&trimmed, &prepared.selected_passages)
+    };
+
+    LlmAnswerResult {
+        provider,
+        model,
+        answer_markdown: trimmed,
+        citations,
+        refused,
+        refusal_reason: if refused {
+            Some("passages insufficient to answer query".to_string())
+        } else {
+            None
+        },
+        usage,
+        estimated_input_tokens: prepared.preview.estimated_input_tokens,
+        included_passages: prepared.preview.passages_included,
+        excluded_passages: prepared.preview.passages_excluded_cloud,
+    }
+}
+
+/// Dispatches an already-filtered [`PreparedPrompt`] to the active LLM provider without
+/// holding any database lock across `.await`.
+pub async fn send_prepared_prompt(
+    config: &AppConfig,
+    api_key: Option<&SecretApiKey>,
+    prepared: PreparedPrompt,
+    base_url_override: Option<&str>,
+) -> Result<LlmAnswerResult> {
+    let (provider, model, short_circuit) = validate_and_short_circuit_prompt(config, &prepared)?;
+    if let Some(early) = short_circuit {
+        return Ok(early);
     }
 
     let (answer_text, usage) = invoke_provider_chat(
@@ -412,50 +492,61 @@ pub async fn send_prepared_prompt(
     )
     .await?;
 
-    let refused = detect_refusal(&answer_text);
-    let citations = if refused {
-        Vec::new()
-    } else {
-        parse_citations(&answer_text, &prepared.selected_passages)
-    };
-
-    Ok(LlmAnswerResult {
-        provider,
-        model,
-        answer_markdown: answer_text,
-        citations,
-        refused,
-        refusal_reason: if refused {
-            Some("passages insufficient to answer query".to_string())
-        } else {
-            None
-        },
-        usage,
-        estimated_input_tokens: prepared.preview.estimated_input_tokens,
-        included_passages: prepared.preview.passages_included,
-        excluded_passages: prepared.preview.passages_excluded_cloud,
-    })
+    Ok(finalize_answer(provider, model, answer_text, usage, &prepared))
 }
 
-async fn invoke_provider_chat(
+/// Streaming dispatch of an already-filtered [`PreparedPrompt`], forwarding each text delta
+/// to `on_delta` as it arrives from Ollama (NDJSON) or OpenAI / Anthropic / Gemini (SSE).
+pub async fn send_prepared_prompt_streaming<F>(
+    config: &AppConfig,
+    api_key: Option<&SecretApiKey>,
+    prepared: PreparedPrompt,
+    base_url_override: Option<&str>,
+    mut on_delta: F,
+) -> Result<LlmAnswerResult>
+where
+    F: FnMut(&str) + Send,
+{
+    let (provider, model, short_circuit) = validate_and_short_circuit_prompt(config, &prepared)?;
+    if let Some(early) = short_circuit {
+        if !early.answer_markdown.is_empty() {
+            on_delta(&early.answer_markdown);
+        }
+        return Ok(early);
+    }
+
+    let (answer_text, usage) = invoke_provider_chat_streaming(
+        provider,
+        &model,
+        api_key,
+        Some(&config.llm_ollama_url),
+        base_url_override,
+        &prepared,
+        config.llm_max_output_tokens.clamp(128, 8192),
+        on_delta,
+    )
+    .await?;
+
+    Ok(finalize_answer(provider, model, answer_text, usage, &prepared))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_chat_request(
+    client: &Client,
     provider: LlmProvider,
+    base: &str,
     model: &str,
     api_key: Option<&SecretApiKey>,
-    ollama_url: Option<&str>,
-    base_url_override: Option<&str>,
     prepared: &PreparedPrompt,
     max_output_tokens: usize,
-) -> Result<(String, LlmUsage)> {
-    let base = resolve_base_url(provider, ollama_url, base_url_override);
-    let is_local = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
-    let client = build_http_client(is_local)?;
-
+    stream: bool,
+) -> Result<reqwest::RequestBuilder> {
     let req = match provider {
         LlmProvider::Disabled => unreachable!(),
         LlmProvider::Ollama => {
             let body = json!({
                 "model": model,
-                "stream": false,
+                "stream": stream,
                 "options": {
                     "num_predict": max_output_tokens,
                     "temperature": 0.1
@@ -469,7 +560,7 @@ async fn invoke_provider_chat(
         }
         LlmProvider::Anthropic => {
             let key = require_cloud_key(provider, api_key)?;
-            let body = json!({
+            let mut body = json!({
                 "model": model,
                 "max_tokens": max_output_tokens,
                 "temperature": 0.1,
@@ -478,6 +569,9 @@ async fn invoke_provider_chat(
                     { "role": "user", "content": prepared.user_prompt }
                 ]
             });
+            if stream {
+                body["stream"] = json!(true);
+            }
             client
                 .post(format!("{base}/v1/messages"))
                 .header("x-api-key", key.expose())
@@ -486,7 +580,7 @@ async fn invoke_provider_chat(
         }
         LlmProvider::OpenAi => {
             let key = require_cloud_key(provider, api_key)?;
-            let body = json!({
+            let mut body = json!({
                 "model": model,
                 "max_tokens": max_output_tokens,
                 "temperature": 0.1,
@@ -495,6 +589,10 @@ async fn invoke_provider_chat(
                     { "role": "user", "content": prepared.user_prompt }
                 ]
             });
+            if stream {
+                body["stream"] = json!(true);
+                body["stream_options"] = json!({ "include_usage": true });
+            }
             client
                 .post(format!("{base}/v1/chat/completions"))
                 .bearer_auth(key.expose())
@@ -518,12 +616,42 @@ async fn invoke_provider_chat(
                     "maxOutputTokens": max_output_tokens
                 }
             });
+            let url = if stream {
+                format!("{base}/v1beta/models/{clean_model}:streamGenerateContent?alt=sse")
+            } else {
+                format!("{base}/v1beta/models/{clean_model}:generateContent")
+            };
             client
-                .post(format!("{base}/v1beta/models/{clean_model}:generateContent"))
+                .post(url)
                 .header("x-goog-api-key", key.expose())
                 .json(&body)
         }
     };
+    Ok(req)
+}
+
+async fn invoke_provider_chat(
+    provider: LlmProvider,
+    model: &str,
+    api_key: Option<&SecretApiKey>,
+    ollama_url: Option<&str>,
+    base_url_override: Option<&str>,
+    prepared: &PreparedPrompt,
+    max_output_tokens: usize,
+) -> Result<(String, LlmUsage)> {
+    let base = resolve_base_url(provider, ollama_url, base_url_override);
+    let is_local = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    let client = build_http_client(is_local)?;
+    let req = build_chat_request(
+        &client,
+        provider,
+        &base,
+        model,
+        api_key,
+        prepared,
+        max_output_tokens,
+        false,
+    )?;
 
     let resp = req.send().await.map_err(|e| {
         CoreError::Network(format!(
@@ -555,6 +683,250 @@ async fn invoke_provider_chat(
         .map_err(|e| CoreError::Network(format!("Invalid provider response JSON: {e}")))?;
 
     parse_chat_response(provider, &val)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_provider_chat_streaming<F>(
+    provider: LlmProvider,
+    model: &str,
+    api_key: Option<&SecretApiKey>,
+    ollama_url: Option<&str>,
+    base_url_override: Option<&str>,
+    prepared: &PreparedPrompt,
+    max_output_tokens: usize,
+    mut on_delta: F,
+) -> Result<(String, LlmUsage)>
+where
+    F: FnMut(&str) + Send,
+{
+    let base = resolve_base_url(provider, ollama_url, base_url_override);
+    let is_local = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    let mut builder = Client::builder()
+        .user_agent(concat!("Papero/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(180));
+    if is_local {
+        builder = builder.no_proxy();
+    }
+    let client = builder
+        .build()
+        .map_err(|e| CoreError::Network(format!("LLM HTTP client init failed: {e}")))?;
+
+    let req = build_chat_request(
+        &client,
+        provider,
+        &base,
+        model,
+        api_key,
+        prepared,
+        max_output_tokens,
+        true,
+    )?;
+
+    let resp = req.send().await.map_err(|e| {
+        CoreError::Network(format!(
+            "{}: errore di rete: {}",
+            provider.display_name(),
+            sanitize_error_snippet(&e.to_string(), api_key)
+        ))
+    })?;
+
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(map_provider_http_error(
+            provider,
+            status,
+            &body_text,
+            retry_after.as_deref(),
+            api_key,
+        ));
+    }
+
+    let mut full_text = String::new();
+    let mut usage = LlmUsage::default();
+    let mut raw_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| {
+            CoreError::Network(format!(
+                "{}: stream interrotto: {}",
+                provider.display_name(),
+                sanitize_error_snippet(&e.to_string(), api_key)
+            ))
+        })?;
+        raw_buf.extend_from_slice(&chunk);
+        while let Some(nl_pos) = raw_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = raw_buf.drain(..=nl_pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            process_stream_line(provider, &line, &mut full_text, &mut usage, &mut on_delta);
+        }
+    }
+    if !raw_buf.is_empty() {
+        let tail = String::from_utf8_lossy(&raw_buf);
+        process_stream_line(provider, &tail, &mut full_text, &mut usage, &mut on_delta);
+    }
+
+    if usage.total_tokens.is_none() {
+        usage.total_tokens = usage.input_tokens.zip(usage.output_tokens).map(|(a, b)| a + b);
+    }
+
+    Ok((full_text, usage))
+}
+
+fn process_stream_line<F>(
+    provider: LlmProvider,
+    raw_line: &str,
+    full_text: &mut String,
+    usage: &mut LlmUsage,
+    on_delta: &mut F,
+) where
+    F: FnMut(&str),
+{
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let payload = match provider {
+        LlmProvider::Ollama => trimmed,
+        LlmProvider::OpenAi | LlmProvider::Anthropic | LlmProvider::Gemini => {
+            let Some(rest) = trimmed.strip_prefix("data:") else {
+                return;
+            };
+            let rest = rest.trim();
+            if rest.is_empty() || rest == "[DONE]" {
+                return;
+            }
+            rest
+        }
+        LlmProvider::Disabled => return,
+    };
+
+    let Ok(val) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+
+    match provider {
+        LlmProvider::Ollama => {
+            if let Some(delta) = val
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .or_else(|| val.get("response").and_then(Value::as_str))
+            {
+                if !delta.is_empty() {
+                    full_text.push_str(delta);
+                    on_delta(delta);
+                }
+            }
+            if let Some(input) = val.get("prompt_eval_count").and_then(Value::as_u64) {
+                usage.input_tokens = Some(input);
+            }
+            if let Some(output) = val.get("eval_count").and_then(Value::as_u64) {
+                usage.output_tokens = Some(output);
+            }
+        }
+        LlmProvider::OpenAi => {
+            if let Some(delta) = val
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(Value::as_str)
+            {
+                if !delta.is_empty() {
+                    full_text.push_str(delta);
+                    on_delta(delta);
+                }
+            }
+            if let Some(u) = val.get("usage") {
+                if let Some(input) = u.get("prompt_tokens").and_then(Value::as_u64) {
+                    usage.input_tokens = Some(input);
+                }
+                if let Some(output) = u.get("completion_tokens").and_then(Value::as_u64) {
+                    usage.output_tokens = Some(output);
+                }
+                if let Some(total) = u.get("total_tokens").and_then(Value::as_u64) {
+                    usage.total_tokens = Some(total);
+                }
+            }
+        }
+        LlmProvider::Anthropic => {
+            let ev_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+            match ev_type {
+                "message_start" => {
+                    if let Some(input) = val
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        usage.input_tokens = Some(input);
+                    }
+                }
+                "content_block_delta" => {
+                    if let Some(delta) = val
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        if !delta.is_empty() {
+                            full_text.push_str(delta);
+                            on_delta(delta);
+                        }
+                    }
+                }
+                "message_delta" => {
+                    if let Some(output) = val
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(Value::as_u64)
+                    {
+                        usage.output_tokens = Some(output);
+                    }
+                }
+                _ => {}
+            }
+        }
+        LlmProvider::Gemini => {
+            if let Some(parts) = val
+                .get("candidates")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("content"))
+                .and_then(|ct| ct.get("parts"))
+                .and_then(Value::as_array)
+            {
+                for part in parts {
+                    if let Some(delta) = part.get("text").and_then(Value::as_str) {
+                        if !delta.is_empty() {
+                            full_text.push_str(delta);
+                            on_delta(delta);
+                        }
+                    }
+                }
+            }
+            if let Some(u) = val.get("usageMetadata") {
+                if let Some(input) = u.get("promptTokenCount").and_then(Value::as_u64) {
+                    usage.input_tokens = Some(input);
+                }
+                if let Some(output) = u.get("candidatesTokenCount").and_then(Value::as_u64) {
+                    usage.output_tokens = Some(output);
+                }
+                if let Some(total) = u.get("totalTokenCount").and_then(Value::as_u64) {
+                    usage.total_tokens = Some(total);
+                }
+            }
+        }
+        LlmProvider::Disabled => {}
+    }
 }
 
 fn parse_chat_response(provider: LlmProvider, v: &Value) -> Result<(String, LlmUsage)> {

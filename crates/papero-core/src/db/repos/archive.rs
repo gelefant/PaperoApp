@@ -35,8 +35,16 @@ pub struct ManualMetadataSnapshot {
     pub manual_locked_fields: Vec<String>,
     #[serde(default)]
     pub metadata_verified: bool,
+    #[serde(default = "default_archive_reading_status")]
+    pub reading_status: String,
+    #[serde(default)]
+    pub is_starred: bool,
     pub authors: Vec<ArchivedAuthor>,
     pub msc_secondary: Vec<(String, String)>,
+}
+
+fn default_archive_reading_status() -> String {
+    "unread".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +73,7 @@ pub fn archive_if_manual(conn: &Connection, document_id: i64, blake3_hash: &str)
                     year, pages, edition, publisher, address, isbn, issn, doi,
                     arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer,
                     zbl_number, url, msc_primary, msc_primary_status, abstract_text,
-                    manual_locked_fields, metadata_verified
+                    manual_locked_fields, metadata_verified, reading_status, is_starred
              FROM documents WHERE id = ?1",
             params![document_id],
             |r| {
@@ -102,6 +110,10 @@ pub fn archive_if_manual(conn: &Connection, document_id: i64, blake3_hash: &str)
                     abstract_text: r.get(27)?,
                     manual_locked_fields: locked,
                     metadata_verified: r.get::<_, i64>(29)? != 0,
+                    reading_status: r
+                        .get::<_, Option<String>>(30)?
+                        .unwrap_or_else(default_archive_reading_status),
+                    is_starred: r.get::<_, Option<i64>>(31)?.unwrap_or(0) != 0,
                     authors: Vec::new(),
                     msc_secondary: Vec::new(),
                 })
@@ -128,6 +140,8 @@ pub fn archive_if_manual(conn: &Connection, document_id: i64, blake3_hash: &str)
         && tags.is_empty()
         && !has_confirmed_msc
         && !snapshot.metadata_verified
+        && snapshot.reading_status == "unread"
+        && !snapshot.is_starred
     {
         return Ok(false);
     }
@@ -211,9 +225,9 @@ pub fn apply_restored_archive(
             arxiv_id = ?19, arxiv_version = ?20, mr_number = ?21, mr_number_display = ?22,
             mr_reviewer = ?23, zbl_number = ?24, url = ?25, msc_primary = ?26,
             msc_primary_status = ?27, abstract_text = ?28, manual_locked_fields = ?29,
-            metadata_verified = ?30,
-            metadata_source = 'manual', updated_at = ?31
-         WHERE id = ?32",
+            metadata_verified = ?30, reading_status = ?31, is_starred = ?32,
+            metadata_source = 'manual', updated_at = ?33
+         WHERE id = ?34",
         params![
             s.work_type,
             s.title,
@@ -245,6 +259,8 @@ pub fn apply_restored_archive(
             s.abstract_text,
             locked_json,
             s.metadata_verified as i64,
+            s.reading_status,
+            s.is_starred as i64,
             now,
             document_id
         ],

@@ -280,6 +280,14 @@ pub struct AppConfig {
     pub last_backup_at: Option<i64>,
     /// Payload size in bytes of the last completed backup.
     pub last_backup_bytes: Option<u64>,
+    /// Citation key generation pattern (`mr_default` | `author_year` | `author_year_word` | `author_lower_year`).
+    pub bibtex_key_pattern: crate::bibtex::BibtexKeyPattern,
+    /// BibTeX export dialect (`bibtex` | `biblatex`).
+    pub bibtex_format: crate::bibtex::BibtexFormat,
+    /// Optional external `.bib` file path kept synchronized automatically on metadata updates.
+    pub bibtex_auto_sync_path: Option<String>,
+    /// Whether automatic live `.bib` synchronization to `bibtex_auto_sync_path` is enabled.
+    pub bibtex_auto_sync_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -350,6 +358,10 @@ impl Default for AppConfig {
             auto_backup_enabled: true,
             last_backup_at: None,
             last_backup_bytes: None,
+            bibtex_key_pattern: crate::bibtex::BibtexKeyPattern::MrDefault,
+            bibtex_format: crate::bibtex::BibtexFormat::Bibtex,
+            bibtex_auto_sync_path: None,
+            bibtex_auto_sync_enabled: false,
         }
     }
 }
@@ -477,6 +489,8 @@ pub fn sanitize_config_for_backup(cfg: &mut AppConfig) {
     cfg.backup_path = None;
     cfg.last_backup_at = None;
     cfg.last_backup_bytes = None;
+    cfg.bibtex_auto_sync_path = None;
+    cfg.bibtex_auto_sync_enabled = false;
 }
 
 fn is_incompatible_tool_path(raw: &str) -> bool {

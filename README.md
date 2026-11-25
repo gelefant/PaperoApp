@@ -2,20 +2,21 @@
 
 **A fast, free desktop library for your PDF and DjVu books and research papers.**
 
-Papero scans your existing folders, lets you search inside all your documents in milliseconds, automatically fetches clean bibliographic metadata & BibTeX, and opens huge 800-page books without slowing down your computer.
+Papero scans your existing folders, lets you search inside all your documents in milliseconds, automatically fetches clean bibliographic metadata & BibTeX/BibLaTeX, and opens huge 800-page books without slowing down your computer.
 
-> **Your files are always safe:** Papero treats your folders as **strictly read-only**. It never moves, renames, edits, or deletes your PDF/DjVu files.
+> **Your files are always safe:** Papero treats your folders as **strictly read-only**. It never moves, renames, edits, or deletes your PDF/DjVu files. Every note, highlight, index, cache, and setting lives exclusively in local AppData (and is preserved in portable compressed backups).
 
 ---
 
 ## What Papero Does
 
-- **One library for all your folders:** Point Papero to one or more folders on your PC/Mac/external drives — it catalogs your PDFs and DjVu files automatically.
-- **Instant reader:** Opens 800+ page PDFs and DjVu books right inside the app, with search highlights, bookmarks, zoom, and page thumbnails.
-- **Smart search:** Find papers by title, author, year, tag, or phrases inside the text — even with accents or typos (`Poincaré` / `Poincare`, `Erdős` / `Erdos`).
-- **Automatic citations & BibTeX:** Automatically fills in title, authors, journal abbreviations, conference proceedings, DOI, MR/zbMATH numbers, and copies ready-to-use BibTeX in one click.
-- **Keep your library tidy:** Spots duplicate files, lets you tag and group papers by topic, and backs up your catalog in one file.
-- **100% local and free:** Everything works offline after setup (except when fetching metadata online), with no accounts or subscriptions required.
+- **One library for all your folders:** Point Papero to one or more folders on your PC/Mac/external drives — it catalogs your PDFs and DjVu files automatically, with real-time folder watching and seamless cross-OS folder rebinding.
+- **Instant built-in reader:** Opens 800+ page PDFs and DjVu books right inside the app with streaming range loading, clickable internal PDF links (`\ref`, `\cite`, TOC) + `Alt+←` / `Alt+→` jump history, persistent reading position, **Seppia / Night** reading modes, **2-page spread**, per-file **±90° rotation**, and real `⌘F` / `Ctrl+F` visual search highlighting with hyphenation & mathematical diacritic folding.
+- **Non-destructive reading annotations:** Highlight passages in 4 colors, drop page bookmarks, and write personal **Markdown / LaTeX** notes keyed by file content hash (surviving file moves/renames), locally searchable and exportable to `.md`.
+- **Smart filtered search:** Find papers by title, author, year, tag, cluster, collection, folder, or full-text hybrid search (BM25 + optional local semantic vectors & cross-encoder reranker) — tolerant to accents and transliterations (`Poincaré` / `Poincare`, `Erdős` / `Erdos`, `Čech` / `Cech`).
+- **Automatic citations, Smart Paste & Live `.bib` Auto-Sync:** Automatically fills bibliographic metadata from **14 free, zero-API-key databases**, supports instant *Paste DOI / arXiv / MR / ISBN / URL / BibTeX* resolution, configurable citation keys (`MR`, `AuthorYear`, `AuthorYearWord`, BibTeX/BibLaTeX) with collision disambiguation, one-click `\cite{key}` copy, and optional live auto-sync to an external `.bib` file for your LaTeX editor.
+- **Organize & discover connections:** Multi-select batch actions (`Shift` / `⌘` / `Ctrl+Click`), reorderable **Collections**, **Quick Views** (*Recent*, *Reading*, *Starred ★*) & **Saved Searches**, **Similar documents** (local HNSW), local **Cites / Cited by** links, arXiv preprint published-version alerts, 4-level duplicate detection, MSC2020 navigation, and one-file Zstd backups.
+- **100% local and free:** Everything works offline after setup (except optional online metadata lookups or optional on-demand LLM answers), with no accounts or subscriptions required.
 
 ---
 
@@ -59,7 +60,7 @@ Go directly to:
   ```
 
 ### 3. First launch
-Open Papero, follow the quick 4-step welcome wizard, choose the folder(s) containing your PDFs/DjVu files, and let Papero index them.
+Open Papero, follow the quick 4-step welcome wizard (or restore directly from an existing `.papero-backup`), choose the folder(s) containing your PDFs/DjVu files, and let Papero index them.
 
 *(Optional extras: if you have scanned image-only PDFs/DjVus and want Papero to read their text, you can also install **Tesseract OCR** — see below. Everything else works right out of the box.)*
 
@@ -69,27 +70,41 @@ Open Papero, follow the quick 4-step welcome wizard, choose the folder(s) contai
 
 ### Core Architecture & Features
 
-- **Read-Only Guarantee & Derived Storage:** Papero never writes into configured source folders. All SQLite databases, Tantivy/HNSW indices, thumbnails, OCR text, and HTTP caches live inside the OS application data directory.
-- **Incremental BLAKE3 Rescan & Source Archive:** Tracks 7 file states (`unchanged`, `new`, `copy`, `moved`, `modified`, `removed` with manual-metadata restoration, `offline`/unmounted drives preserved without purging metadata).
+- **Strictly Read-Only Guarantee & Derived Storage:** Papero never writes into configured `source_roots` — enforced across rescans, OCR, BibTeX/CSV/Markdown exports, and Live `.bib` Auto-Sync. All derived state (SQLite WAL schema v7, Tantivy BM25 index, disk-mmapped USearch HNSW vectors, DjVu raster LRU cache, and HTTP metadata cache) lives strictly inside the OS application data directory.
+- **Incremental BLAKE3 Rescan & Source Archive:** Tracks 7 file states (`unchanged`, `new`, `copy`, `moved`, `modified`, `removed` with BLAKE3-keyed manual metadata & reading-status archive restoration, `offline`/unmounted drives preserved without purging metadata), with cross-OS folder rebinding (`rebind_source_root`).
 - **Instant Unified PDF & DjVu Viewer:**
-  - Byte-range streaming (`papero-doc://` HTTP `206 Partial Content`) opens 800+ page PDFs via `pdf.js` without loading whole files into RAM.
+  - Byte-range streaming (`read_pdf_range_cmd` / `papero-doc://` HTTP `206 Partial Content`) opens 800+ page PDFs via lazily loaded `pdf.js` without loading whole files into RAM.
   - Background `ddjvu` rasterization with bounded disk LRU cache + invisible selectable text layer from `djvused` S-expressions.
-  - Clickable passage highlights (`[0,1]` top-left normalized bounding boxes), bookmarks/outline, printed vs ordinal page labels, zoom controls, optional detached viewer window, and OS external reader presets (`DjView`, `Skim`, `SumatraPDF`, `Okular`, `Evince`, `Zathura`, macOS `Preview`).
-- **Hybrid Search (100% Local):**
-  - **Lexical:** Tantivy BM25 with mathematical diacritic/transliteration folding (`Čech`, `Schrödinger`, `Poincaré`, `Erdős`, `Möbius`).
-  - **Semantic + Reranking:** Optional INT8 ONNX models (`multilingual-e5-small` / `bge-m3` embeddings via `usearch` HNSW on disk + `mmarco-mMiniLMv2` / `bge-reranker-v2-m3` cross-encoder) fused via Reciprocal Rank Fusion (RRF), with automatic idle unloading from RAM (`LazyModelSlot`).
-- **Bibliographic Metadata & Exact MRLookup BibTeX:**
-  - Waterfall client supporting **11 free, zero-API-key databases**: **AMS MRLookup** (toggleable), **zbMATH Open** (`CC-BY-SA 4.0`), **DBLP** (`CC0`), **OpenAlex** (`CC0`), **Crossref**, **arXiv**, **Semantic Scholar**, **INSPIRE-HEP** (`CC0`), **DataCite** (`CC0`), **Europe PMC**, and **Open Library** (books only), with strict per-source rate limiters, one-click bulk metadata scan, and permanent local cache.
-  - Automatic journal abbreviation normalization via a curated AMS/zbMATH table, live zbMATH Serials (`/v1/serial/_search`) lookup, and ISO-4 rules; handles title-only conference proceedings and field locks cleanly, and formats BibTeX matching MRLookup alignment (`@article {MR...,` + LaTeX escaping).
-- **4-Level Duplicate Detection:** Exact BLAKE3, PDF structural/content hash, normalized metadata distance, and MinHash LSH fuzzy text similarity.
-- **Mathematical Classification:** Navigable **MSC2020** hierarchy (63 top-level classes), embedding-based k-NN suggestions, unsupervised spherical k-means topic clustering with editable labels, and free tags.
-- **Compressed Backups:** Streaming Zstd-compressed backup archives (`PAPERO_BKP_V2`) with backward-compatible V1 restore.
+  - Lightweight internal-only PDF link hotspots (`\ref`, `\cite`, TOC) + per-tab Back/Forward jump history (`Alt+←` / `Alt+→`).
+  - Non-destructive highlights (`NormalizedRect[]` in 4 colors), page bookmarks, and Markdown/LaTeX notes persisted in SQLite keyed by `blake3_hash` + `page_ord`, searchable with diacritic folding and exportable to Markdown.
+  - Persistent per-file reading state (`last_page_ord`, `last_opened_at`, `zoom_mode`, `custom_zoom`, `rotation_deg`), **Normal / Sepia / Night** page color filters, virtualized **2-page spread**, and real `⌘F` / `Ctrl+F` visual match highlighting (diacritic folding + hyphenated line-break joining across PDF & DjVu).
+  - Optional detached viewer windows and OS external reader presets (`DjView`, `Skim`, `SumatraPDF`, `Okular`, `Evince`, `Zathura`, macOS `Preview`).
+- **Filtered Hybrid Search & Lazy KaTeX Rendering (100% Local):**
+  - **Lexical:** Tantivy BM25 with mathematical diacritic/transliteration folding (`Čech`, `Schrödinger`, `Poincaré`, `Erdős`, `Möbius`, `Łukasiewicz`).
+  - **Semantic + Reranking:** Optional INT8 ONNX models (`multilingual-e5-small` / `bge-m3` embeddings via `usearch` HNSW on disk + `mmarco-mMiniLMv2` / `bge-reranker-v2-m3` cross-encoder) fused via Reciprocal Rank Fusion (RRF), with automatic idle unloading (`LazyModelSlot`) and pause/resume controls.
+  - **Unified Filtering:** Tag, Topic Cluster, Collection, Author, Year range, Source Folder, Reading Status, Starred, and Paper/Book category filters propagate directly into both BM25 and vector HNSW search (pushdown allowlist + compact passage bitset).
+  - **Lazy KaTeX + Markdown:** `katex` (`.woff2`-only fonts) is dynamically imported only when math delimiters (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`) are encountered — rendering formulas in Inspector abstracts, imported Nougat/Marker passages, viewer notes, and streaming LLM answers with zero cold-start penalty.
+- **Bibliographic Metadata (14 Free Databases), Smart Paste & Live `.bib` Sync:**
+  - Configurable drag-and-drop priority waterfall across **14 free, zero-API-key bibliographic sources**: **AMS MRLookup** (toggleable single/bulk), **zbMATH Open** (`CC-BY-SA 4.0`), **Crossref**, **DBLP** (`CC0`), **OpenAlex** (`CC0`), **INSPIRE-HEP** (`CC0`), **arXiv**, **DataCite** (`CC0`), **Semantic Scholar**, **Europe PMC**, **Harvard LibraryCloud** (MARC21), **Library of Congress (SRU)**, **Google Books**, and **Open Library**, with per-source rate limiters, permanent local response cache, metadata verification checkmark (`✓`) lock, per-field locks, and guided title/author search.
+  - **Smart Paste:** Single Inspector input automatically recognizing raw IDs or full URLs (DOI, arXiv, MR, zbMATH, ISBN-10/13) and pasted BibTeX entries.
+  - **BibTeX / BibLaTeX & Live Auto-Sync:** Exact MRLookup alignment (`@article {MR...,`) or BibLaTeX dialect, customizable citation key patterns (`MR` default, `AuthorYear`, `AuthorYearWord`, `author_lower_year`), automatic collision disambiguation (`a`, `b`, `c`) on multi-exports, quick `\cite{key}` copy, and debounced atomic auto-sync to an external `.bib` file.
+- **Related Documents, Citations & Preprint Alerts:**
+  - On-the-fly **Similar in your library** (top-5 via mmapped USearch HNSW, zero extra indexing cost).
+  - Local **Cites / Cited by** cross-linking from extracted bibliography references and cached OpenAlex/Crossref/Semantic Scholar metadata.
+  - Discrete **Published version detected** badge when an `arXiv` preprint in the library has a published journal DOI/MR.
+- **Catalog Organization & Deduplication:**
+  - Virtualized 60 fps catalog with multi-select (`Shift+Click` / `⌘+Click` / `Ctrl+Click`) and contextual batch actions (tag add/remove, verify/unverify, add to collection, export `.bib`/`.csv`, enqueue OCR).
+  - Reorderable **Collections**, **Quick Views** (*Recent*, *Reading*, *Starred ★*), and **Saved Searches**.
+  - **4-Level Duplicate Detection:** Exact BLAKE3, PDF structural/content hash, normalized metadata distance, and MinHash LSH fuzzy text similarity.
+  - **Mathematical Classification:** Navigable **MSC2020** hierarchy (63 top-level classes), embedding-based k-NN suggestions, unsupervised spherical k-means topic clustering with editable labels, and free tags.
+- **Portable Compressed Backups (`PAPERO_BKP_V2`):** Streaming Zstd-compressed backup archives (including SQLite annotations, reading states, collections, saved views, BM25/vector indices, and sanitized preferences — never OS keychain keys) with optional debounced automatic background updates and V1/V2 restore compatibility.
 
 ### Release Sizing & Code-Signing Notes
 
-- Targeted compressed installer size: **≤ 40 MB** for `.dmg`, `.deb`, `.exe`, and `.msi` (the Linux `.AppImage` embeds WebKitGTK/GTK runtime libraries cleanly outside the 40 MB native cap).
+- Targeted compressed installer size: **≤ 40 MB** for `.dmg`, `.deb`, `.exe`, and `.msi` (enforced by CI in `.github/workflows/release.yml`; the Linux `.AppImage` embeds WebKitGTK/GTK runtime libraries cleanly outside the 40 MB native cap).
+- **Windows Static CRT:** `papero-app.exe` statically links the MSVC C/C++ runtime (`/MT` via `.cargo/config.toml`), verified in CI, while staging the required CRT DLLs exclusively alongside `onnxruntime.dll`.
 - **Note on Free Open-Source Code Signing (SignPath Foundation):**
-  **SignPath Foundation** provides free code signing certificates for qualifying open-source projects on GitHub, acting as the legal publisher for signed releases. Typical eligibility requirements include: a public open-source repository under an OSI-approved license (`MIT`/`Apache-2.0`), an established public commit and release history, compliance with SignPath's Code Signing Policy, and manual/CI approval flows owned by maintainers. SignPath is **not** integrated into this repository's CI until approved and explicitly configured by the project maintainer.
+  **SignPath Foundation** provides free code signing certificates for qualifying open-source projects on GitHub, acting as the legal publisher for signed releases. SignPath is **not** integrated into this repository's CI until approved and explicitly configured by the project maintainer.
 - **Linux *"Show in Folder"*:** Papero attempts `org.freedesktop.FileManager1.ShowItems` via D-Bus with a 2-second timeout and falls back to `xdg-open`; you can force direct `xdg-open` in **Settings → Visualizzatore & Lettori**.
 
 ---
@@ -111,7 +126,7 @@ Papero bundles DjVuLibre (`ddjvu`, `djvused`, `djvutxt`) and PDFium directly, bu
   sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-ita tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-rus
   ```
 
-Once installed, Papero automatically detects Tesseract (`--version` and `--list-langs`) and lets you run OCR on single documents (right-click → *Esegui OCR (Tesseract)*) or batch-process all scanned files in the background without touching source files.
+Once installed, Papero automatically detects Tesseract (`--version` and `--list-langs`) and lets you run OCR on single documents, multi-selected batches, or all pending scanned files without touching source files.
 
 ### 2. Nougat / Marker (Optional Formula LaTeX Import)
 
@@ -127,23 +142,23 @@ Tesseract recognizes prose well on clean scans but often struggles with multi-li
   pip install marker-pdf
   marker_single /path/to/paper.pdf --output_dir ./marker_out
   ```
-- Papero stores imported LaTeX snippets as dedicated formula passages (`is_alt_formula = 1`), preserving them even if you re-run Tesseract OCR later.
+- Papero stores imported LaTeX snippets as dedicated formula passages (`is_alt_formula = 1`), rendered via lazy KaTeX and preserved even if you re-run Tesseract OCR later.
 
 ---
 
 ## Bibliographic Sources & Optional LLM Integration
 
-### Bibliographic Databases
+### Bibliographic Databases (14 Free Sources)
 - **Crossref, OpenAlex & Open Library polite pool:** In the first-run wizard or Settings, you may optionally enter an email address saved strictly locally (in your OS credential store when available). Papero includes **no hardcoded developer email**.
-- **AMS MRLookup:** Free and unauthenticated, enabled via toggle; please avoid heavy automated bulk queries against MRLookup in respect of AMS usage guidelines.
+- **AMS MRLookup:** Free and unauthenticated, toggleable separately for single lookups and rate-limited bulk scans (`1 req/5s`) in respect of AMS usage guidelines.
 - **zbMATH Open:** Metadata is redistributed under `CC-BY-SA 4.0` (FIZ Karlsruhe).
-- **DBLP, OpenAlex, INSPIRE-HEP & DataCite:** Open bibliographic metadata (`CC0 1.0`), alongside **arXiv**, **Semantic Scholar**, and **Europe PMC** — all queried free of charge with zero API keys required.
+- **DBLP, OpenAlex, INSPIRE-HEP & DataCite:** Open bibliographic metadata (`CC0 1.0`), alongside **arXiv**, **Semantic Scholar**, **Europe PMC**, **Harvard LibraryCloud**, **Library of Congress (SRU)**, **Google Books**, and **Open Library** — all queried free of charge with zero API keys required.
 
-### Generative LLM Providers: API Keys vs Consumer Subscriptions
+### Generative LLM Providers: Streaming, Document Q&A & Privacy
 
-All core Papero features (search, semantic embeddings, reranking, classification, viewer, BibTeX, duplicates, OCR) are **100% local and free without any LLM**.
+All core Papero features (search, semantic embeddings, reranking, classification, viewer, annotations, BibTeX, duplicates, OCR) are **100% local and free without any LLM**.
 
-You can optionally enable an **on-demand** LLM backend in **Settings → LLM (Opzionale)** (`Disattivato` by default) to synthesize grounded answers with clickable `[Doc #id, p. X]` inline citations directly over your retrieved local passages:
+You can optionally enable an **on-demand** LLM backend in **Settings → LLM (Opzionale)** (`Disattivato` by default) to stream grounded Markdown + KaTeX answers token-by-token both across search results (`[Doc #id, p. X]`) and directly inside the viewer (**"Ask this document / page / selection"** with clickable `[p. X]` citations):
 
 - **Consumer web subscriptions DO NOT work for desktop API apps:** Plans such as **ChatGPT Plus / Pro**, **Claude Pro / Max**, and **Google One AI Premium (Gemini Advanced)** only cover web/mobile chat apps and **do not include developer API credits**.
 - **Cloud providers require your own API key (saved strictly in OS Keyring):**
@@ -151,8 +166,8 @@ You can optionally enable an **on-demand** LLM backend in **Settings → LLM (Op
   - **OpenAI API:** <https://platform.openai.com/api-keys>
   - **Google Gemini API (AI Studio):** <https://aistudio.google.com/apikey>
   API requests go directly from your machine to the selected provider (`api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`) using live model discovery (`/v1/models` or `/v1beta/models`), with **no hardcoded model lists, no third-party proxy, and keys never written to config files, logs, or backups**.
-- **Privacy & Google Gemini Free Tier notice:** Commercial Anthropic and OpenAI API inputs are not used for model training by default. Google AI Studio's rate-limited **Free Tier (Unpaid)** terms allow Google to review and use submitted prompts/outputs for product improvement (whereas Paid Tier projects do not train on API inputs). Papero provides per-folder and per-document cloud exclusions (`exclude_from_cloud_llm`), shows a pre-send token estimator, enforces configurable passage/token caps, and requires explicit confirmation before the first cloud transmission.
-- **Zero-cost private alternative (Ollama):** Install [Ollama](https://ollama.com/) locally (`http://127.0.0.1:11434`, live models fetched via `GET /api/tags`) to run open-weight models completely offline with zero API costs and zero network egress.
+- **Privacy & Google Gemini Free Tier notice:** Commercial Anthropic and OpenAI API inputs are not used for model training by default. Google AI Studio's rate-limited **Free Tier (Unpaid)** terms allow Google to review and use submitted prompts/outputs for product improvement (whereas Paid Tier projects do not train on API inputs). Papero enforces per-folder and per-document cloud exclusions (`exclude_from_cloud_llm`), shows a pre-send token estimator, caps passages/tokens, and requires explicit confirmation before the first cloud transmission.
+- **Zero-cost private alternative (Ollama):** Install [Ollama](https://ollama.com/) locally (`http://127.0.0.1:11434`, live models fetched via `GET /api/tags`) to run open-weight models completely offline with streaming, zero API costs, and zero network egress.
 
 ---
 

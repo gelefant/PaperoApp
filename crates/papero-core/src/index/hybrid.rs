@@ -1,15 +1,74 @@
-use crate::db::repos::docs::{ContentSearchDocResult, ContentSearchPassageHit};
+use crate::db::repos::docs::{
+    hydrate_bm25_results, ContentSearchDocResult, ContentSearchPassageHit,
+};
 use crate::error::Result;
 use crate::extract::types::unpack_bboxes;
 use crate::index::bm25::{Bm25Hit, Bm25Index};
 use crate::index::vector::{VectorHit, VectorIndex};
 use crate::ml::{LazyModelSlot, OnnxEmbedder, OnnxReranker};
+use crate::text_norm::normalize_math_text;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 pub const DEFAULT_RRF_K: f32 = 60.0;
+
+/// Filters propagated to both hybrid (BM25 + HNSW vector) and pure BM25 content search.
+/// Intentionally omits MSC2020 filtering per Papero design.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContentSearchFilter {
+    #[serde(default)]
+    pub root_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub cluster_id: Option<i64>,
+    #[serde(default)]
+    pub collection_id: Option<i64>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub year_from: Option<i64>,
+    #[serde(default)]
+    pub year_to: Option<i64>,
+    #[serde(default)]
+    pub work_category: Option<String>, // "all" | "paper" | "book"
+    #[serde(default)]
+    pub reading_status: Option<String>, // "unread" | "reading" | "read"
+    #[serde(default)]
+    pub starred_only: Option<bool>,
+}
+
+impl ContentSearchFilter {
+    pub fn normalized_category(&self) -> Option<&'static str> {
+        match self
+            .work_category
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("book") => Some("book"),
+            Some("paper") => Some("paper"),
+            _ => None,
+        }
+    }
+
+    pub fn has_doc_level_filters(&self) -> bool {
+        self.tag.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || self.cluster_id.is_some()
+            || self.collection_id.is_some()
+            || self.author.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || self.year_from.is_some()
+            || self.year_to.is_some()
+            || self.normalized_category().is_some()
+            || self
+                .reading_status
+                .as_deref()
+                .is_some_and(|s| matches!(s.trim(), "unread" | "reading" | "read"))
+            || self.starred_only == Some(true)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +97,8 @@ pub struct HybridSearchOptions {
     pub aggregation: DocScoreAggregation,
     #[serde(default)]
     pub work_category: Option<String>, // "all" | "paper" | "book"
+    #[serde(default)]
+    pub filter: ContentSearchFilter,
 }
 
 impl Default for HybridSearchOptions {
@@ -51,6 +112,7 @@ impl Default for HybridSearchOptions {
             rrf_k: DEFAULT_RRF_K,
             aggregation: DocScoreAggregation::Max,
             work_category: None,
+            filter: ContentSearchFilter::default(),
         }
     }
 }
@@ -128,30 +190,70 @@ where
     }
 
     let top_n = opts.top_n_per_branch.max(1);
-    let cat_filter = match opts
-        .work_category
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("book") => Some("book"),
-        Some("paper") => Some("paper"),
-        _ => None,
+    let mut effective_filter = opts.filter.clone();
+    if effective_filter.work_category.is_none() && opts.work_category.is_some() {
+        effective_filter.work_category = opts.work_category.clone();
+    }
+    if effective_filter.root_ids.is_none() {
+        if let Some(r) = root_ids {
+            effective_filter.root_ids = Some(r.to_vec());
+        }
+    }
+    let eff_roots = effective_filter.root_ids.as_deref();
+
+    let allowed_doc_ids = if effective_filter.has_doc_level_filters() {
+        Some(resolve_content_filter_doc_ids(conn, &effective_filter)?)
+    } else {
+        None
     };
+
+    if let Some(ref docs) = allowed_doc_ids {
+        if docs.is_empty() {
+            return Ok(HybridSearchResponse {
+                results: Vec::new(),
+                stats: HybridSearchStats {
+                    mode: "bm25_only".into(),
+                    bm25_hits: 0,
+                    vector_hits: 0,
+                    rrf_candidates: 0,
+                    reranked_count: 0,
+                    total_ms: t_start.elapsed().as_secs_f64() * 1000.0,
+                    bm25_ms: 0.0,
+                    embed_query_ms: 0.0,
+                    vector_ms: 0.0,
+                    rerank_ms: 0.0,
+                },
+            });
+        }
+    }
 
     let vector_can_run = ctx
         .as_ref()
         .is_some_and(|c| c.vector_index.is_some_and(|v| !v.is_empty()) && c.embedder_slot.is_some());
 
     // Only build the compact passage bitset when the vector branch will actually run with a filter!
-    let allowed_pids = if vector_can_run && (root_ids.is_some() || cat_filter.is_some()) {
-        Some(fetch_allowed_passage_ids(conn, root_ids, cat_filter)?)
+    let allowed_pids = if vector_can_run && (eff_roots.is_some() || allowed_doc_ids.is_some()) {
+        Some(fetch_allowed_passage_ids_for_docs(
+            conn,
+            eff_roots,
+            allowed_doc_ids.as_ref(),
+        )?)
     } else {
         None
     };
 
-    let bm25_fetch_limit = if cat_filter.is_some() {
-        (top_n * 6).max(300)
+    // Push small doc allowlists (<= 256 docs) directly into Tantivy so sparse Tags/Authors/Clusters
+    // never miss hits behind higher-scoring unfiltered corpus passages.
+    let bm25_pushdown_docs: Option<Vec<u64>> = allowed_doc_ids.as_ref().and_then(|set| {
+        if set.len() <= 256 {
+            Some(set.iter().map(|&id| id as u64).collect())
+        } else {
+            None
+        }
+    });
+
+    let bm25_fetch_limit = if allowed_doc_ids.is_some() && bm25_pushdown_docs.is_none() {
+        (top_n * 8).max(400)
     } else {
         top_n
     };
@@ -160,7 +262,12 @@ where
     let (bm25_res, vec_outcome) = std::thread::scope(|scope| {
         let bm25_handle = scope.spawn(|| {
             let t0 = Instant::now();
-            let hits = bm25.search(trimmed, root_ids, bm25_fetch_limit);
+            let hits = bm25.search_with_doc_ids(
+                trimmed,
+                eff_roots,
+                bm25_pushdown_docs.as_deref(),
+                bm25_fetch_limit,
+            );
             (hits, t0.elapsed().as_secs_f64() * 1000.0)
         });
 
@@ -178,13 +285,8 @@ where
     });
 
     let (mut bm25_hits, bm25_ms) = (bm25_res.0?, bm25_res.1);
-    if let Some(cat) = cat_filter {
-        if let Some(ref allowed) = allowed_pids {
-            bm25_hits.retain(|h| allowed.contains(h.passage_id));
-            bm25_hits.truncate(top_n);
-        } else if !bm25_hits.is_empty() {
-            // Filter the <= 300 BM25 hits by document `work_type` without scanning all 200k passages!
-            let allowed_docs = fetch_matching_doc_ids_for_hits(conn, &bm25_hits, cat)?;
+    if let Some(ref allowed_docs) = allowed_doc_ids {
+        if bm25_pushdown_docs.is_none() {
             bm25_hits.retain(|h| allowed_docs.contains(&(h.document_id as i64)));
             bm25_hits.truncate(top_n);
         }
@@ -429,6 +531,7 @@ pub(crate) struct HydratedPassage {
     pub printed_label: Option<String>,
     pub text_content: String,
     pub bboxes_blob: Vec<u8>,
+    pub is_alt_formula: bool,
     pub work_type: String,
     pub title: String,
     pub format: String,
@@ -436,93 +539,246 @@ pub(crate) struct HydratedPassage {
     pub is_available: bool,
 }
 
-fn fetch_matching_doc_ids_for_hits(
+/// Pure BM25 content search honoring the full [`ContentSearchFilter`] (Tag, Cluster, Collection,
+/// Author, Year range, Folder roots, Paper/Books — excluding MSC2020).
+pub fn search_bm25_filtered(
     conn: &Connection,
-    hits: &[Bm25Hit],
-    work_category: &str,
-) -> Result<HashSet<i64>> {
-    let mut doc_ids: Vec<i64> = hits.iter().map(|h| h.document_id as i64).collect();
-    doc_ids.sort_unstable();
-    doc_ids.dedup();
-    if doc_ids.is_empty() {
-        return Ok(HashSet::new());
+    bm25: &Bm25Index,
+    query: &str,
+    filter: &ContentSearchFilter,
+    limit: usize,
+) -> Result<Vec<ContentSearchDocResult>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || limit == 0 {
+        return Ok(Vec::new());
     }
-    let cat_clause = match work_category {
-        "book" => "work_type = 'book'",
-        "paper" => "work_type != 'book'",
-        _ => "1 = 1",
+    let eff_roots = filter.root_ids.as_deref();
+    let allowed_docs = if filter.has_doc_level_filters() {
+        Some(resolve_content_filter_doc_ids(conn, filter)?)
+    } else {
+        None
     };
-    let mut allowed = HashSet::with_capacity(doc_ids.len());
-    for chunk in doc_ids.chunks(500) {
-        let placeholders = chunk
+    if let Some(ref set) = allowed_docs {
+        if set.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
+    let pushdown: Option<Vec<u64>> = allowed_docs.as_ref().and_then(|set| {
+        if set.len() <= 256 {
+            Some(set.iter().map(|&id| id as u64).collect())
+        } else {
+            None
+        }
+    });
+    let fetch_limit = if allowed_docs.is_some() && pushdown.is_none() {
+        (limit * 8).max(400)
+    } else {
+        limit
+    };
+    let mut hits = bm25.search_with_doc_ids(trimmed, eff_roots, pushdown.as_deref(), fetch_limit)?;
+    if let Some(ref set) = allowed_docs {
+        if pushdown.is_none() {
+            hits.retain(|h| set.contains(&(h.document_id as i64)));
+            hits.truncate(limit);
+        }
+    }
+    let mut docs = hydrate_bm25_results(conn, &hits)?;
+    if docs.len() > limit {
+        docs.truncate(limit);
+    }
+    Ok(docs)
+}
+
+/// Resolves all `documents.id` values matching [`ContentSearchFilter`].
+pub fn resolve_content_filter_doc_ids(
+    conn: &Connection,
+    filter: &ContentSearchFilter,
+) -> Result<HashSet<i64>> {
+    let cat_clause = match filter.normalized_category() {
+        Some("book") => "AND d.work_type = 'book'",
+        Some("paper") => "AND d.work_type != 'book'",
+        _ => "",
+    };
+    let reading_clause = match filter
+        .reading_status
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("unread") => "AND d.reading_status = 'unread'",
+        Some("reading") => "AND d.reading_status = 'reading'",
+        Some("read") => "AND d.reading_status = 'read'",
+        _ => "",
+    };
+    let starred_clause = if filter.starred_only == Some(true) {
+        "AND d.is_starred != 0"
+    } else {
+        ""
+    };
+
+    let p_tag = filter
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let author_q = filter
+        .author
+        .as_deref()
+        .map(normalize_math_text)
+        .filter(|s| !s.trim().is_empty());
+    let author_tokens: Vec<&str> = author_q
+        .as_deref()
+        .map(|q| q.split_whitespace().collect())
+        .unwrap_or_default();
+
+    let sql = format!(
+        "SELECT d.id, d.authors_norm_summary
+         FROM documents d
+         WHERE (?1 IS NULL OR d.year >= ?1)
+           AND (?2 IS NULL OR d.year <= ?2)
+           AND (?3 IS NULL OR EXISTS (
+                SELECT 1 FROM document_tags dt
+                JOIN tags t ON t.id = dt.tag_id
+                WHERE dt.document_id = d.id AND LOWER(t.name) = LOWER(?3)
+           ))
+           AND (?4 IS NULL OR EXISTS (
+                SELECT 1 FROM document_clusters dc
+                WHERE dc.document_id = d.id AND dc.cluster_id = ?4
+           ))
+           AND (?5 IS NULL OR EXISTS (
+                SELECT 1 FROM collection_documents cd
+                WHERE cd.document_id = d.id AND cd.collection_id = ?5
+           ))
+           {cat_clause}
+           {reading_clause}
+           {starred_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params![
+        filter.year_from,
+        filter.year_to,
+        p_tag,
+        filter.cluster_id,
+        filter.collection_id,
+    ])?;
+
+    let mut allowed = HashSet::new();
+    while let Some(r) = rows.next()? {
+        let doc_id: i64 = r.get(0)?;
+        if !author_tokens.is_empty() {
+            let au_norm = r.get_ref(1)?.as_str().unwrap_or("");
+            if !author_tokens.iter().all(|tok| au_norm.contains(tok)) {
+                continue;
+            }
+        }
+        allowed.insert(doc_id);
+    }
+
+    // Intersect with root_ids if explicitly specified
+    if let Some(roots) = filter.root_ids.as_deref() {
+        if roots.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let placeholders = roots
             .iter()
             .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("SELECT id FROM documents WHERE id IN ({placeholders}) AND {cat_clause}");
-        let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> =
-            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0))?;
-        for r in rows {
-            allowed.insert(r?);
-        }
+        let r_sql = format!("SELECT DISTINCT document_id FROM files WHERE root_id IN ({placeholders})");
+        let mut r_stmt = conn.prepare(&r_sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            roots.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let root_docs: HashSet<i64> = r_stmt
+            .query_map(refs.as_slice(), |r| r.get::<_, i64>(0))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        allowed.retain(|id| root_docs.contains(id));
     }
+
     Ok(allowed)
 }
 
-fn fetch_allowed_passage_ids(
+fn fetch_allowed_passage_ids_for_docs(
     conn: &Connection,
     roots: Option<&[String]>,
-    work_category: Option<&str>,
+    allowed_docs: Option<&HashSet<i64>>,
 ) -> Result<PassageBitSet> {
     if let Some(r) = roots {
         if r.is_empty() {
             return Ok(PassageBitSet::new());
         }
     }
-    let cat_clause = match work_category {
-        Some("book") => "d.work_type = 'book'",
-        Some("paper") => "d.work_type != 'book'",
-        _ => "1 = 1",
-    };
+    if let Some(d) = allowed_docs {
+        if d.is_empty() {
+            return Ok(PassageBitSet::new());
+        }
+    }
 
     let mut set = PassageBitSet::new();
-    if let Some(root_list) = roots {
-        let placeholders = root_list
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
-        // Uses covering index `idx_passages_file_page(file_id, page_ord)` without reading passage heap pages!
-        let sql = format!(
-            "SELECT p.id FROM passages p
-             WHERE p.file_id IN (
-                 SELECT f.id FROM files f
-                 JOIN documents d ON d.id = f.document_id
-                 WHERE f.root_id IN ({placeholders}) AND {cat_clause}
-             )"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> =
-            root_list.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, i64>(0))?;
-        for r in rows {
-            set.insert(r? as u64);
+    match (roots, allowed_docs) {
+        (Some(root_list), Some(docs)) => {
+            let placeholders = root_list
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT p.id, p.document_id FROM passages p
+                 WHERE p.file_id IN (SELECT f.id FROM files f WHERE f.root_id IN ({placeholders}))"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let refs: Vec<&dyn rusqlite::ToSql> =
+                root_list.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows =
+                stmt.query_map(refs.as_slice(), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            for r in rows {
+                let (pid, did) = r?;
+                if docs.contains(&did) {
+                    set.insert(pid as u64);
+                }
+            }
         }
-    } else {
-        // Uses covering index `idx_passages_doc(document_id)` without reading passage heap pages!
-        let sql = format!(
-            "SELECT p.id FROM passages p
-             WHERE p.document_id IN (SELECT d.id FROM documents d WHERE {cat_clause})"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-        for r in rows {
-            set.insert(r? as u64);
+        (Some(root_list), None) => {
+            let placeholders = root_list
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT p.id FROM passages p
+                 WHERE p.file_id IN (SELECT f.id FROM files f WHERE f.root_id IN ({placeholders}))"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let refs: Vec<&dyn rusqlite::ToSql> =
+                root_list.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, i64>(0))?;
+            for r in rows {
+                set.insert(r? as u64);
+            }
         }
+        (None, Some(docs)) => {
+            let ids: Vec<i64> = docs.iter().copied().collect();
+            for chunk in ids.chunks(500) {
+                let placeholders = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!("SELECT p.id FROM passages p WHERE p.document_id IN ({placeholders})");
+                let mut stmt = conn.prepare(&sql)?;
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, i64>(0))?;
+                for r in rows {
+                    set.insert(r? as u64);
+                }
+            }
+        }
+        (None, None) => {}
     }
     Ok(set)
 }
@@ -545,7 +801,7 @@ fn hydrate_passages_by_ids(
             .join(",");
         let sql = format!(
             "SELECT p.id, p.document_id, p.file_id, p.page_ord, p.printed_label,
-                    p.text_content, p.bboxes_blob, d.work_type, d.title, f.format, f.rel_path, f.is_available
+                    p.text_content, p.bboxes_blob, p.is_alt_formula, d.work_type, d.title, f.format, f.rel_path, f.is_available
              FROM passages p
              JOIN documents d ON d.id = p.document_id
              JOIN files f ON f.id = p.file_id
@@ -564,11 +820,12 @@ fn hydrate_passages_by_ids(
                 printed_label: r.get(4)?,
                 text_content: r.get(5)?,
                 bboxes_blob: r.get(6)?,
-                work_type: r.get(7)?,
-                title: r.get(8)?,
-                format: r.get(9)?,
-                rel_path: r.get(10)?,
-                is_available: r.get::<_, i64>(11)? != 0,
+                is_alt_formula: r.get::<_, i64>(7)? != 0,
+                work_type: r.get(8)?,
+                title: r.get(9)?,
+                format: r.get(10)?,
+                rel_path: r.get(11)?,
+                is_available: r.get::<_, i64>(12)? != 0,
             })
         })?;
         for row in rows {
@@ -610,6 +867,7 @@ pub(crate) fn aggregate_and_sort_documents(
             score: cand.final_score,
             text_content: row.text_content.clone(),
             bboxes: unpack_bboxes(&row.bboxes_blob),
+            is_alt_formula: row.is_alt_formula,
         });
     }
 
@@ -950,5 +1208,219 @@ mod tests {
         assert_eq!(book_resp.results.len(), 1);
         assert_eq!(book_resp.results[0].document_id, book_doc_id);
         assert_eq!(book_resp.results[0].work_type, "book");
+    }
+
+    #[test]
+    fn hybrid_and_bm25_filter_by_tag_cluster_author_year_and_collection() {
+        use crate::classify::add_tag_to_document;
+        use crate::db::repos::collections::{add_documents_to_collection, create_collection};
+
+        let dir = tempdir().unwrap();
+        let db = Database::open(&dir.path().join("flt.db"), 2).unwrap();
+        let bm25 = Bm25Index::open_or_create(&dir.path().join("tantivy_flt")).unwrap();
+        let root_path = dir.path().join("docs");
+        std::fs::create_dir_all(&root_path).unwrap();
+
+        let (d1, d2, col_id, cluster_id) = {
+            let w = db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "r1".into(),
+                    label: "Docs".into(),
+                    root_path: root_path.to_string_lossy().into_owned(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+            let d1 = create_heuristic_document(&w, "Harmonic Maps 1995").unwrap();
+            w.execute(
+                "UPDATE documents SET year = 1995, authors_norm_summary = 'poincare henri' WHERE id = ?1",
+                [d1],
+            )
+            .unwrap();
+            let f1 = insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d1,
+                    root_id: "r1",
+                    rel_path: "a.pdf",
+                    format: "pdf",
+                    size_bytes: 100,
+                    mtime_ns: 0,
+                    blake3_hash: "h1",
+                    index_state: "bm25_done",
+                },
+            )
+            .unwrap();
+            let p1 = replace_file_pages_and_passages(
+                &w,
+                f1,
+                1,
+                true,
+                None,
+                &[FilePageInsert {
+                    file_id: f1,
+                    page_ord: 1,
+                    printed_label: Some("1".into()),
+                    width_pts: 600.0,
+                    height_pts: 800.0,
+                    text_source: "test".into(),
+                }],
+                &[PassageInsert {
+                    document_id: d1,
+                    file_id: f1,
+                    page_ord: 1,
+                    printed_label: Some("1".into()),
+                    chunk_index: 0,
+                    is_alt_formula: false,
+                    token_count: 8,
+                    text_content: "Elliptic regularity for harmonic maps.".into(),
+                    bboxes_blob: Vec::new(),
+                }],
+            )
+            .unwrap();
+
+            let d2 = create_heuristic_document(&w, "Elliptic PDE 2022").unwrap();
+            w.execute(
+                "UPDATE documents SET year = 2022, authors_norm_summary = 'erdos paul' WHERE id = ?1",
+                [d2],
+            )
+            .unwrap();
+            let f2 = insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: d2,
+                    root_id: "r1",
+                    rel_path: "b.pdf",
+                    format: "pdf",
+                    size_bytes: 100,
+                    mtime_ns: 0,
+                    blake3_hash: "h2",
+                    index_state: "bm25_done",
+                },
+            )
+            .unwrap();
+            let p2 = replace_file_pages_and_passages(
+                &w,
+                f2,
+                1,
+                true,
+                None,
+                &[FilePageInsert {
+                    file_id: f2,
+                    page_ord: 1,
+                    printed_label: Some("1".into()),
+                    width_pts: 600.0,
+                    height_pts: 800.0,
+                    text_source: "test".into(),
+                }],
+                &[PassageInsert {
+                    document_id: d2,
+                    file_id: f2,
+                    page_ord: 1,
+                    printed_label: Some("1".into()),
+                    chunk_index: 0,
+                    is_alt_formula: false,
+                    token_count: 8,
+                    text_content: "Elliptic regularity on singular domains.".into(),
+                    bboxes_blob: Vec::new(),
+                }],
+            )
+            .unwrap();
+
+            add_tag_to_document(&w, d1, "geometry").unwrap();
+            let col = create_collection(&w, "Project A", None).unwrap();
+            add_documents_to_collection(&w, col.id, &[d2]).unwrap();
+            w.execute(
+                "INSERT INTO topic_clusters (model_profile, label, is_label_locked, keywords_json, updated_at)
+                 VALUES ('light', 'PDE', 0, '[\"pde\"]', 1)",
+                [],
+            )
+            .unwrap();
+            let cl_id = w.last_insert_rowid();
+            w.execute(
+                "INSERT INTO document_clusters (document_id, cluster_id, is_user_assigned, score)
+                 VALUES (?1, ?2, 1, 1.0)",
+                rusqlite::params![d2, cl_id],
+            )
+            .unwrap();
+
+            bm25.add_passages(&[
+                Bm25Passage {
+                    passage_id: p1[0],
+                    document_id: d1 as u64,
+                    file_id: f1 as u64,
+                    root_id: "r1".into(),
+                    text_content: "Elliptic regularity for harmonic maps.".into(),
+                },
+                Bm25Passage {
+                    passage_id: p2[0],
+                    document_id: d2 as u64,
+                    file_id: f2 as u64,
+                    root_id: "r1".into(),
+                    text_content: "Elliptic regularity on singular domains.".into(),
+                },
+            ])
+            .unwrap();
+            bm25.commit().unwrap();
+            (d1, d2, col.id, cl_id)
+        };
+
+        let r = db.reader();
+        type LoaderFn<T> = fn() -> Result<T>;
+
+        // Tag filter
+        let tag_hits = search_bm25_filtered(
+            &r,
+            &bm25,
+            "elliptic regularity",
+            &ContentSearchFilter {
+                tag: Some("geometry".into()),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(tag_hits.len(), 1);
+        assert_eq!(tag_hits[0].document_id, d1);
+
+        // Author filter (accent-tolerant: Poincaré -> Poincare)
+        let none_ctx: Option<HybridSearchContext<'_, LoaderFn<OnnxEmbedder>, LoaderFn<OnnxReranker>>> = None;
+        let au_resp = hybrid_search(
+            &r,
+            &bm25,
+            "elliptic regularity",
+            None,
+            &HybridSearchOptions {
+                filter: ContentSearchFilter {
+                    author: Some("Poincaré".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            none_ctx,
+        )
+        .unwrap();
+        assert_eq!(au_resp.results.len(), 1);
+        assert_eq!(au_resp.results[0].document_id, d1);
+
+        // Year range + cluster + collection filter
+        let yr_hits = search_bm25_filtered(
+            &r,
+            &bm25,
+            "elliptic regularity",
+            &ContentSearchFilter {
+                year_from: Some(2010),
+                year_to: Some(2025),
+                cluster_id: Some(cluster_id),
+                collection_id: Some(col_id),
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(yr_hits.len(), 1);
+        assert_eq!(yr_hits[0].document_id, d2);
     }
 }

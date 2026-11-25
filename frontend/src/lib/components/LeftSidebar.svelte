@@ -1,7 +1,10 @@
 <script lang="ts">
   import { tr, type Lang } from '../i18n';
   import type {
+    CollectionView,
     MscTreeNode,
+    ReadingStatus,
+    SavedSearchView,
     SourceRoot,
     TagSummary,
     TopicClusterView,
@@ -15,16 +18,31 @@
     clusters: TopicClusterView[];
     tags: TagSummary[];
     roots: SourceRoot[];
+    collections?: CollectionView[];
+    savedSearches?: SavedSearchView[];
     activeMscPrefix: string | null;
     activeClusterId: number | null;
     activeTag: string | null;
     activeRootId: string | null;
+    activeCollectionId?: number | null;
+    activeReadingStatus?: ReadingStatus | string | null;
+    activeStarredOnly?: boolean;
+    activeRecentOnly?: boolean;
     knnBusy: boolean;
     clusteringBusy: boolean;
     onSelectMsc: (code: string | null) => void;
     onSelectCluster: (clusterId: number | null) => void;
     onSelectTag: (tagName: string | null) => void;
     onSelectRoot: (rootId: string | null) => void;
+    onSelectCollection?: (collectionId: number | null) => void;
+    onSelectQuickView?: (view: 'all' | 'recent' | 'reading' | 'starred') => void;
+    onCreateCollection?: (name: string) => Promise<void>;
+    onRenameCollection?: (collectionId: number, name: string) => Promise<void>;
+    onDeleteCollection?: (collectionId: number) => Promise<void>;
+    onReorderCollections?: (orderedIds: number[]) => Promise<void>;
+    onSaveCurrentView?: (name: string) => Promise<void>;
+    onApplySavedSearch?: (view: SavedSearchView) => Promise<void>;
+    onDeleteSavedSearch?: (id: number) => Promise<void>;
     onClearAllFilters: () => void;
     onRunKnnProposals: () => Promise<void>;
     onRunClustering: () => Promise<void>;
@@ -39,16 +57,31 @@
     clusters,
     tags,
     roots,
+    collections = [],
+    savedSearches = [],
     activeMscPrefix,
     activeClusterId,
     activeTag,
     activeRootId,
+    activeCollectionId = null,
+    activeReadingStatus = null,
+    activeStarredOnly = false,
+    activeRecentOnly = false,
     knnBusy,
     clusteringBusy,
     onSelectMsc,
     onSelectCluster,
     onSelectTag,
     onSelectRoot,
+    onSelectCollection,
+    onSelectQuickView,
+    onCreateCollection,
+    onRenameCollection,
+    onDeleteCollection,
+    onReorderCollections,
+    onSaveCurrentView,
+    onApplySavedSearch,
+    onDeleteSavedSearch,
     onClearAllFilters,
     onRunKnnProposals,
     onRunClustering,
@@ -60,11 +93,35 @@
   let editingClusterId = $state<number | null>(null);
   let editingClusterLabel = $state('');
 
+  // Collapsible sections (progressive disclosure)
+  let secOpen = $state({
+    collections: true,
+    saved: true,
+    msc: true,
+    clusters: true,
+    tags: true,
+    folders: true,
+  });
+
+  // Collection create/rename state
+  let addingCollection = $state(false);
+  let newCollectionName = $state('');
+  let editingCollectionId = $state<number | null>(null);
+  let editingCollectionName = $state('');
+
+  // Saved search creation state
+  let addingSavedView = $state(false);
+  let newSavedViewName = $state('');
+
   let hasAnyFilter = $derived(
     activeMscPrefix !== null ||
       activeClusterId !== null ||
       activeTag !== null ||
-      activeRootId !== null
+      activeRootId !== null ||
+      activeCollectionId !== null ||
+      Boolean(activeReadingStatus) ||
+      Boolean(activeStarredOnly) ||
+      Boolean(activeRecentOnly)
   );
 
   let visibleMscNodes = $derived(
@@ -88,6 +145,44 @@
     }
     await onRenameCluster(clusterId, trimmed);
     editingClusterId = null;
+  }
+
+  async function submitNewCollection(e: Event) {
+    e.preventDefault();
+    const trimmed = newCollectionName.trim();
+    if (!trimmed || !onCreateCollection) return;
+    await onCreateCollection(trimmed);
+    newCollectionName = '';
+    addingCollection = false;
+  }
+
+  async function commitRenameCollection(collectionId: number) {
+    const trimmed = editingCollectionName.trim();
+    if (!trimmed || !onRenameCollection) {
+      editingCollectionId = null;
+      return;
+    }
+    await onRenameCollection(collectionId, trimmed);
+    editingCollectionId = null;
+  }
+
+  async function moveCollection(idx: number, delta: number) {
+    if (!onReorderCollections) return;
+    const target = idx + delta;
+    if (target < 0 || target >= collections.length) return;
+    const ids = collections.map((c) => c.id);
+    const [moved] = ids.splice(idx, 1);
+    ids.splice(target, 0, moved);
+    await onReorderCollections(ids);
+  }
+
+  async function submitNewSavedView(e: Event) {
+    e.preventDefault();
+    const trimmed = newSavedViewName.trim();
+    if (!trimmed || !onSaveCurrentView) return;
+    await onSaveCurrentView(trimmed);
+    newSavedViewName = '';
+    addingSavedView = false;
   }
 </script>
 
@@ -121,10 +216,234 @@
     </div>
 
     <div class="sb-scroll">
+      <!-- Viste rapide (Recenti / In lettura / Preferiti) -->
+      {#if onSelectQuickView}
+        <section class="sb-section">
+          <div class="sec-head">
+            <span class="sec-title">{tr(lang, 'quickViewsSection')}</span>
+            {#if onSaveCurrentView}
+              <button
+                type="button"
+                class="sb-icon-btn"
+                title={tr(lang, 'saveCurrentViewTip')}
+                onclick={() => (addingSavedView = !addingSavedView)}
+              >
+                +
+              </button>
+            {/if}
+          </div>
+          <div class="quick-grid">
+            <button
+              type="button"
+              class="qv-pill"
+              class:selected={!activeRecentOnly && !activeReadingStatus && !activeStarredOnly && !activeCollectionId}
+              onclick={() => onSelectQuickView('all')}
+            >
+              {tr(lang, 'viewAll')}
+            </button>
+            <button
+              type="button"
+              class="qv-pill"
+              class:selected={Boolean(activeRecentOnly)}
+              onclick={() => onSelectQuickView('recent')}
+            >
+              {tr(lang, 'viewRecent')}
+            </button>
+            <button
+              type="button"
+              class="qv-pill"
+              class:selected={activeReadingStatus === 'reading'}
+              onclick={() => onSelectQuickView('reading')}
+            >
+              {tr(lang, 'viewReading')}
+            </button>
+            <button
+              type="button"
+              class="qv-pill"
+              class:selected={Boolean(activeStarredOnly)}
+              onclick={() => onSelectQuickView('starred')}
+            >
+              {tr(lang, 'viewStarred')}
+            </button>
+          </div>
+          {#if addingSavedView}
+            <form class="rename-row" onsubmit={submitNewSavedView}>
+              <input
+                type="text"
+                placeholder={lang === 'en' ? 'View name…' : 'Nome vista rapida…'}
+                bind:value={newSavedViewName}
+                onkeydown={(e) => e.key === 'Escape' && (addingSavedView = false)}
+              />
+              <button type="submit" class="mini-btn accent">OK</button>
+            </form>
+          {/if}
+          {#if savedSearches.length > 0}
+            <ul class="tree-list">
+              {#each savedSearches as sv (sv.id)}
+                <li>
+                  <div class="tree-row">
+                    <button
+                      type="button"
+                      class="row-label-btn"
+                      title={sv.query_text || sv.name}
+                      onclick={() => onApplySavedSearch?.(sv)}
+                    >
+                      <span class="sv-badge">{sv.search_mode === 'content' ? '⌕' : '⛃'}</span>
+                      <span class="row-text">{sv.name}</span>
+                    </button>
+                    {#if onDeleteSavedSearch}
+                      <button
+                        type="button"
+                        class="edit-btn"
+                        title="Elimina vista salvata"
+                        onclick={() => onDeleteSavedSearch(sv.id)}
+                      >
+                        ×
+                      </button>
+                    {/if}
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
+      {/if}
+
+      <!-- Collezioni (Progetti / Liste di lettura) -->
+      {#if onSelectCollection}
+        <section class="sb-section">
+          <div class="sec-head">
+            <button
+              type="button"
+              class="sec-toggle"
+              onclick={() => (secOpen.collections = !secOpen.collections)}
+            >
+              <span>{secOpen.collections ? '▾' : '▸'}</span>
+              <span class="sec-title">{tr(lang, 'collectionsSection')}</span>
+            </button>
+            {#if onCreateCollection}
+              <button
+                type="button"
+                class="sb-icon-btn"
+                title={tr(lang, 'newCollectionPlaceholder')}
+                onclick={() => {
+                  secOpen.collections = true;
+                  addingCollection = !addingCollection;
+                }}
+              >
+                +
+              </button>
+            {/if}
+          </div>
+          {#if secOpen.collections}
+            {#if addingCollection}
+              <form class="rename-row" onsubmit={submitNewCollection}>
+                <input
+                  type="text"
+                  placeholder={tr(lang, 'newCollectionPlaceholder')}
+                  bind:value={newCollectionName}
+                  onkeydown={(e) => e.key === 'Escape' && (addingCollection = false)}
+                />
+                <button type="submit" class="mini-btn accent">OK</button>
+              </form>
+            {/if}
+            {#if collections.length === 0}
+              <p class="empty-note">
+                {lang === 'en' ? 'No collections yet.' : 'Nessuna collezione. Premi + per crearne una.'}
+              </p>
+            {:else}
+              <ul class="tree-list">
+                {#each collections as col, idx (col.id)}
+                  {@const colSelected = activeCollectionId === col.id}
+                  <li>
+                    {#if editingCollectionId === col.id}
+                      <form
+                        class="rename-row"
+                        onsubmit={(e) => {
+                          e.preventDefault();
+                          void commitRenameCollection(col.id);
+                        }}
+                      >
+                        <input
+                          type="text"
+                          bind:value={editingCollectionName}
+                          onkeydown={(e) => e.key === 'Escape' && (editingCollectionId = null)}
+                        />
+                        <button type="submit" class="mini-btn accent">OK</button>
+                      </form>
+                    {:else}
+                      <div class="tree-row col-row" class:selected={colSelected}>
+                        <button
+                          type="button"
+                          class="row-label-btn"
+                          onclick={() => onSelectCollection(colSelected ? null : col.id)}
+                          title={col.name}
+                        >
+                          <span class="row-text">{col.name}</span>
+                        </button>
+                        <span class="cnt confirmed">{col.document_count}</span>
+                        <div class="col-hover-acts">
+                          {#if onReorderCollections && idx > 0}
+                            <button
+                              type="button"
+                              class="edit-btn"
+                              title="Sposta su"
+                              onclick={() => moveCollection(idx, -1)}
+                            >
+                              ↑
+                            </button>
+                          {/if}
+                          {#if onReorderCollections && idx < collections.length - 1}
+                            <button
+                              type="button"
+                              class="edit-btn"
+                              title="Sposta giù"
+                              onclick={() => moveCollection(idx, 1)}
+                            >
+                              ↓
+                            </button>
+                          {/if}
+                          {#if onRenameCollection}
+                            <button
+                              type="button"
+                              class="edit-btn"
+                              title="Rinomina"
+                              onclick={() => {
+                                editingCollectionId = col.id;
+                                editingCollectionName = col.name;
+                              }}
+                            >
+                              ✎
+                            </button>
+                          {/if}
+                          {#if onDeleteCollection}
+                            <button
+                              type="button"
+                              class="edit-btn"
+                              title="Elimina collezione"
+                              onclick={() => onDeleteCollection(col.id)}
+                            >
+                              ×
+                            </button>
+                          {/if}
+                        </div>
+                      </div>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          {/if}
+        </section>
+      {/if}
+
       <!-- MSC2020 -->
       <section class="sb-section">
         <div class="sec-head">
-          <span class="sec-title" title={tr(lang, 'mscSection')}>{tr(lang, 'mscSection')}</span>
+          <button type="button" class="sec-toggle" onclick={() => (secOpen.msc = !secOpen.msc)}>
+            <span>{secOpen.msc ? '▾' : '▸'}</span>
+            <span class="sec-title" title={tr(lang, 'mscSection')}>{tr(lang, 'mscSection')}</span>
+          </button>
           <div class="sec-actions">
             <button
               class="sb-icon-btn"
@@ -155,6 +474,7 @@
           </div>
         </div>
 
+        {#if secOpen.msc}
         {#if visibleMscNodes.length === 0}
           <p class="empty-note">Nessuna classe MSC assegnata. Clicca “Tutte” o modifica i metadati.</p>
         {:else}
@@ -224,12 +544,16 @@
             {/each}
           </ul>
         {/if}
+        {/if}
       </section>
 
       <!-- Gruppi Tematici (Clustering) -->
       <section class="sb-section">
         <div class="sec-head">
-          <span class="sec-title" title={tr(lang, 'clustersSection')}>{tr(lang, 'clustersSection')}</span>
+          <button type="button" class="sec-toggle" onclick={() => (secOpen.clusters = !secOpen.clusters)}>
+            <span>{secOpen.clusters ? '▾' : '▸'}</span>
+            <span class="sec-title" title={tr(lang, 'clustersSection')}>{tr(lang, 'clustersSection')}</span>
+          </button>
           <button
             class="sb-icon-btn accent"
             disabled={clusteringBusy}
@@ -246,6 +570,7 @@
           </button>
         </div>
 
+        {#if secOpen.clusters}
         {#if clusters.length === 0}
           <p class="empty-note">Nessun gruppo generato. Indicizza gli embeddings e premi Clusterizza.</p>
         {:else}
@@ -298,13 +623,18 @@
             {/each}
           </ul>
         {/if}
+        {/if}
       </section>
 
       <!-- Tag liberi -->
       <section class="sb-section">
         <div class="sec-head">
-          <span class="sec-title">{tr(lang, 'tagsSection')}</span>
+          <button type="button" class="sec-toggle" onclick={() => (secOpen.tags = !secOpen.tags)}>
+            <span>{secOpen.tags ? '▾' : '▸'}</span>
+            <span class="sec-title">{tr(lang, 'tagsSection')}</span>
+          </button>
         </div>
+        {#if secOpen.tags}
         {#if tags.length === 0}
           <p class="empty-note">Nessun tag assegnato.</p>
         {:else}
@@ -322,13 +652,18 @@
             {/each}
           </div>
         {/if}
+        {/if}
       </section>
 
       <!-- Cartelle sorgente -->
       <section class="sb-section">
         <div class="sec-head">
-          <span class="sec-title">{tr(lang, 'foldersSection')}</span>
+          <button type="button" class="sec-toggle" onclick={() => (secOpen.folders = !secOpen.folders)}>
+            <span>{secOpen.folders ? '▾' : '▸'}</span>
+            <span class="sec-title">{tr(lang, 'foldersSection')}</span>
+          </button>
         </div>
+        {#if secOpen.folders}
         <ul class="tree-list">
           {#each roots as root (root.id)}
             {@const rtSelected = activeRootId === root.id}
@@ -348,6 +683,7 @@
             </li>
           {/each}
         </ul>
+        {/if}
       </section>
     </div>
   </aside>
@@ -753,5 +1089,62 @@
 
   .dot.online {
     background: #16a34a;
+  }
+
+  .sec-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: none;
+    background: transparent;
+    padding: 0;
+    cursor: pointer;
+    color: var(--text-muted);
+    min-width: 0;
+  }
+
+  .quick-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+
+  .qv-pill {
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: center;
+  }
+
+  .qv-pill:hover {
+    background: var(--bg-muted);
+  }
+
+  .qv-pill.selected {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .sv-badge {
+    font-size: 10px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .col-hover-acts {
+    display: none;
+    align-items: center;
+    gap: 1px;
+  }
+
+  .col-row:hover .col-hover-acts {
+    display: inline-flex;
   }
 </style>

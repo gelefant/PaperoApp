@@ -477,6 +477,10 @@ pub fn record_level1_identical_copy(
     Ok(is_new)
 }
 
+fn default_reading_status() -> String {
+    "unread".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentListItem {
     pub document_id: i64,
@@ -502,6 +506,14 @@ pub struct DocumentListItem {
     pub metadata_source: Option<String>,
     #[serde(default)]
     pub metadata_verified: bool,
+    #[serde(default = "default_reading_status")]
+    pub reading_status: String,
+    #[serde(default)]
+    pub is_starred: bool,
+    #[serde(default)]
+    pub last_opened_at: Option<i64>,
+    #[serde(default)]
+    pub last_page_ord: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +545,7 @@ pub struct FilePageInfo {
 pub struct FileViewerInfo {
     pub file_id: i64,
     pub document_id: i64,
+    pub blake3_hash: String,
     pub title: String,
     pub format: String,
     pub byte_size: u64,
@@ -541,6 +554,10 @@ pub struct FileViewerInfo {
     pub abs_path: String,
     pub pages: Vec<FilePageInfo>,
     pub outline: Vec<OutlineItem>,
+    pub last_page_ord: Option<u32>,
+    pub zoom_mode: Option<String>,
+    pub custom_zoom: Option<f32>,
+    pub rotation_deg: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -552,6 +569,8 @@ pub struct ContentSearchPassageHit {
     pub score: f32,
     pub text_content: String,
     pub bboxes: Vec<NormalizedRect>,
+    #[serde(default)]
+    pub is_alt_formula: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,10 +608,12 @@ pub fn list_documents_for_ui(conn: &Connection) -> Result<Vec<DocumentListItem>>
                 ) AS authors_display,
                 d.year, f.format, f.rel_path, f.page_count, f.is_available,
                 f.index_state, f.error_message, d.msc_primary, d.msc_primary_status,
-                f.has_text_layer, f.ocr_status, d.metadata_source, d.metadata_verified
+                f.has_text_layer, f.ocr_status, d.metadata_source, d.metadata_verified,
+                d.reading_status, d.is_starred, rs.last_opened_at, rs.last_page_ord
          FROM files f
          JOIN documents d ON d.id = f.document_id
          JOIN source_roots sr ON sr.id = f.root_id
+         LEFT JOIN file_reading_state rs ON rs.blake3_hash = f.blake3_hash
          GROUP BY d.id
          ORDER BY d.updated_at DESC, d.id DESC",
     )?;
@@ -618,6 +639,10 @@ pub fn list_documents_for_ui(conn: &Connection) -> Result<Vec<DocumentListItem>>
             ocr_status: r.get(17)?,
             metadata_source: r.get(18)?,
             metadata_verified: r.get::<_, i64>(19)? != 0,
+            reading_status: r.get::<_, Option<String>>(20)?.unwrap_or_else(default_reading_status),
+            is_starred: r.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
+            last_opened_at: r.get(22)?,
+            last_page_ord: r.get::<_, Option<i64>>(23)?.map(|v| v.max(1) as u32),
         })
     })?;
     let mut out = Vec::new();
@@ -763,9 +788,13 @@ pub fn get_file_viewer_info(conn: &Connection, file_id: i64) -> Result<Option<Fi
         std::fs::metadata(&loc.abs_path).map(|m| m.len()).unwrap_or(0)
     };
 
+    let reading_state =
+        crate::db::repos::annotations::get_reading_state_for_hash(conn, &loc.blake3_hash)?;
+
     Ok(Some(FileViewerInfo {
         file_id: loc.file_id,
         document_id: loc.document_id,
+        blake3_hash: loc.blake3_hash,
         title: loc.title,
         format: loc.format,
         byte_size,
@@ -774,6 +803,10 @@ pub fn get_file_viewer_info(conn: &Connection, file_id: i64) -> Result<Option<Fi
         abs_path: loc.abs_path.to_string_lossy().into_owned(),
         pages,
         outline,
+        last_page_ord: reading_state.as_ref().map(|s| s.last_page_ord),
+        zoom_mode: reading_state.as_ref().map(|s| s.zoom_mode.clone()),
+        custom_zoom: reading_state.as_ref().map(|s| s.custom_zoom),
+        rotation_deg: reading_state.as_ref().map(|s| s.rotation_deg).unwrap_or(0),
     }))
 }
 
@@ -809,7 +842,8 @@ pub fn hydrate_bm25_results_filtered(
     };
     let sql = format!(
         "SELECT p.id, p.document_id, p.file_id, p.page_ord, p.printed_label,
-                p.text_content, p.bboxes_blob, d.work_type, d.title, f.format, f.rel_path, f.is_available
+                p.text_content, p.bboxes_blob, d.work_type, d.title, f.format, f.rel_path, f.is_available,
+                p.is_alt_formula
          FROM passages p
          JOIN documents d ON d.id = p.document_id
          JOIN files f ON f.id = p.file_id
@@ -835,6 +869,7 @@ pub fn hydrate_bm25_results_filtered(
         let format: String = r.get(9)?;
         let rel_path: String = r.get(10)?;
         let is_available: bool = r.get::<_, i64>(11)? != 0;
+        let is_alt_formula: bool = r.get::<_, i64>(12)? != 0;
         Ok((
             pid,
             doc_id,
@@ -848,6 +883,7 @@ pub fn hydrate_bm25_results_filtered(
             format,
             rel_path,
             is_available,
+            is_alt_formula,
         ))
     })?;
 
@@ -865,6 +901,7 @@ pub fn hydrate_bm25_results_filtered(
             format,
             rel_path,
             is_available,
+            is_alt_formula,
         ) = row?;
         let score = *score_by_pid.get(&pid).unwrap_or(&0.0);
         let entry = grouped.entry(doc_id).or_insert_with(|| ContentSearchDocResult {
@@ -889,6 +926,7 @@ pub fn hydrate_bm25_results_filtered(
             score,
             text_content,
             bboxes: unpack_bboxes(&blob),
+            is_alt_formula,
         });
     }
 

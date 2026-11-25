@@ -1,6 +1,7 @@
 use papero_core::backup::{
     apply_pending_restore_if_ready, create_backup_bundle_with_bm25, BackupReport,
 };
+use papero_core::bibtex::BibtexExportOptions;
 use papero_core::config::{init_logging, AppConfig, AppPaths, WorkerGuard};
 use papero_core::db::repos::docs::{get_file_stream_info, FileStreamInfo};
 use papero_core::db::repos::roots::{
@@ -13,6 +14,8 @@ use papero_core::fs::watcher::{FsChangeBatch, RootWatcher};
 use papero_core::index::bm25::Bm25Index;
 use papero_core::index::vector::VectorIndex;
 use papero_core::index::worker::run_extract_bm25_queue;
+use papero_core::metadata::io::{export_documents_bibtex, write_bibtex_file_atomically};
+use papero_core::metadata::resolver::get_documents_metadata_for_export;
 use papero_core::metadata::WaterfallClients;
 use papero_core::ml::{LazyModelSlot, ModelProfile, OnnxEmbedder, OnnxReranker};
 use papero_core::viewer::djvu_cache::DjvuCache;
@@ -122,6 +125,9 @@ pub struct AppState {
     pub backup_mutex: Arc<tokio::sync::Mutex<()>>,
     pub auto_backup_dirty: Arc<AtomicBool>,
     pub auto_backup_notify: Arc<Notify>,
+    pub bibtex_sync_mutex: Arc<tokio::sync::Mutex<()>>,
+    pub bibtex_sync_dirty: Arc<AtomicBool>,
+    pub bibtex_sync_notify: Arc<Notify>,
     _log_guard: Option<WorkerGuard>,
 }
 
@@ -195,6 +201,9 @@ impl AppState {
             backup_mutex: Arc::new(tokio::sync::Mutex::new(())),
             auto_backup_dirty: Arc::new(AtomicBool::new(false)),
             auto_backup_notify: Arc::new(Notify::new()),
+            bibtex_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            bibtex_sync_dirty: Arc::new(AtomicBool::new(false)),
+            bibtex_sync_notify: Arc::new(Notify::new()),
             _log_guard: Some(log_guard),
         })
     }
@@ -264,6 +273,7 @@ impl AppState {
 
     pub fn stop_background_activity(&self) {
         self.auto_backup_dirty.store(false, Ordering::SeqCst);
+        self.bibtex_sync_dirty.store(false, Ordering::SeqCst);
         self.metadata_batch_cancel.store(true, Ordering::SeqCst);
         self.bg_metadata_cancel.store(true, Ordering::SeqCst);
         self.metadata_cancel_notify.notify_waiters();
@@ -557,6 +567,137 @@ impl AppState {
         });
     }
 
+    /// Marks the external auto-sync `.bib` file as dirty if enabled and configured.
+    pub fn schedule_bibtex_auto_sync(&self) {
+        let should_schedule = self
+            .config
+            .read()
+            .map(|c| {
+                c.bibtex_auto_sync_enabled
+                    && c.bibtex_auto_sync_path
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|p| !p.is_empty())
+            })
+            .unwrap_or(false);
+        if should_schedule {
+            self.bibtex_sync_dirty.store(true, Ordering::SeqCst);
+            self.bibtex_sync_notify.notify_one();
+        }
+    }
+
+    /// Synchronizes the entire library's BibTeX export atomically to the configured external
+    /// `.bib` file (strictly refusing any destination inside configured `source_roots`).
+    pub async fn run_bibtex_auto_sync_now(
+        state: &Arc<Self>,
+    ) -> std::result::Result<(String, usize), String> {
+        let _guard = state.bibtex_sync_mutex.lock().await;
+        state.bibtex_sync_dirty.store(false, Ordering::SeqCst);
+
+        let st = Arc::clone(state);
+        let (path_str, count) =
+            tokio::task::spawn_blocking(move || -> std::result::Result<(String, usize), String> {
+                let cfg = st.config.read().expect("config poisoned").clone();
+                let target = cfg
+                    .bibtex_auto_sync_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "Nessun file .bib configurato per la sincronizzazione automatica."
+                            .to_string()
+                    })?
+                    .to_string();
+
+                let (views, roots) = {
+                    let r = st.db.reader();
+                    let all_ids =
+                        papero_core::metadata::resolver::list_all_document_ids(&r)
+                            .map_err(|e| e.to_string())?;
+                    let views = get_documents_metadata_for_export(&r, &all_ids)
+                        .map_err(|e| e.to_string())?;
+                    let roots = list_source_roots(&r).unwrap_or_default();
+                    (views, roots)
+                };
+                let root_paths: Vec<String> =
+                    roots.into_iter().map(|sr| sr.root_path).collect();
+                let opts = BibtexExportOptions {
+                    key_pattern: cfg.bibtex_key_pattern,
+                    format: cfg.bibtex_format,
+                    ..Default::default()
+                };
+                let bibtex = export_documents_bibtex(&views, &opts);
+                write_bibtex_file_atomically(Path::new(&target), &bibtex, &root_paths)
+                    .map_err(|e| e.to_string())?;
+                Ok((target, views.len()))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+        if let Ok(g) = state.app_handle.lock() {
+            if let Some(app) = g.as_ref() {
+                let _ = app.emit(
+                    "papero://bibtex-synced",
+                    serde_json::json!({ "path": path_str, "count": count }),
+                );
+            }
+        }
+        Ok((path_str, count))
+    }
+
+    pub fn spawn_bibtex_auto_sync_loop(state: Arc<Self>) {
+        tauri::async_runtime::spawn(async move {
+            loop {
+                if !state.bibtex_sync_dirty.load(Ordering::SeqCst) {
+                    state.bibtex_sync_notify.notified().await;
+                }
+                // Short 2s debounce (up to 15s max) so live .bib stays fresh for LaTeX editors
+                // while coalescing rapid multi-field edits.
+                let start = tokio::time::Instant::now();
+                loop {
+                    let elapsed = start.elapsed();
+                    if elapsed >= Duration::from_secs(15) {
+                        break;
+                    }
+                    let wait = Duration::from_secs(2).min(Duration::from_secs(15) - elapsed);
+                    tokio::select! {
+                        _ = state.bibtex_sync_notify.notified() => {},
+                        _ = tokio::time::sleep(wait) => break,
+                    }
+                }
+
+                let defer_start = tokio::time::Instant::now();
+                while state.is_foreground_batch_active()
+                    && defer_start.elapsed() < Duration::from_secs(1800)
+                {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+
+                if !state.bibtex_sync_dirty.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
+
+                let enabled = state
+                    .config
+                    .read()
+                    .map(|c| {
+                        c.bibtex_auto_sync_enabled
+                            && c.bibtex_auto_sync_path
+                                .as_deref()
+                                .map(str::trim)
+                                .is_some_and(|p| !p.is_empty())
+                    })
+                    .unwrap_or(false);
+                if !enabled {
+                    continue;
+                }
+                if let Err(err) = Self::run_bibtex_auto_sync_now(&state).await {
+                    tracing::warn!(error = %err, "automatic BibTeX sync failed");
+                }
+            }
+        });
+    }
+
     pub fn vector_index_for(&self, profile: ModelProfile) -> Arc<VectorIndex> {
         match profile {
             ModelProfile::Light => Arc::clone(&self.vector_light),
@@ -629,6 +770,9 @@ impl AppState {
             backup_mutex: Arc::new(tokio::sync::Mutex::new(())),
             auto_backup_dirty: Arc::new(AtomicBool::new(false)),
             auto_backup_notify: Arc::new(Notify::new()),
+            bibtex_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            bibtex_sync_dirty: Arc::new(AtomicBool::new(false)),
+            bibtex_sync_notify: Arc::new(Notify::new()),
             _log_guard: None,
         })
     }

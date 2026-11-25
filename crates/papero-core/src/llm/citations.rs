@@ -12,8 +12,16 @@ fn citation_regex() -> &'static Regex {
     })
 }
 
-/// Extracts clickable `[Doc #id, p. X]` citations from `answer` and resolves each claim
-/// back to the originating `(file_id, page_ord, bboxes)` slice from `passages`.
+fn single_doc_page_citation_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\[p{1,2}\.?\s*(\d+)[^\]]*\]").expect("valid single-doc citation regex")
+    })
+}
+
+/// Extracts clickable `[Doc #id, p. X]` citations (and `[p. X]` citations when all passages
+/// belong to a single document) from `answer` and resolves each claim back to the originating
+/// `(file_id, page_ord, bboxes)` slice from `passages`.
 pub fn parse_citations(answer: &str, passages: &[SelectedPassage]) -> Vec<LlmCitation> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -62,6 +70,51 @@ pub fn parse_citations(answer: &str, passages: &[SelectedPassage]) -> Vec<LlmCit
                 bboxes: Vec::new(),
                 snippet: make_preview(&same_doc.text_content),
             });
+        }
+    }
+
+    // When all passages come from a single document (e.g. "Ask this document" in viewer),
+    // also resolve compact `[p. X]` markers directly to that document & page.
+    let single_doc = passages.first().filter(|first| {
+        passages
+            .iter()
+            .all(|p| p.document_id == first.document_id && p.file_id == first.file_id)
+    });
+    if let Some(base) = single_doc {
+        for cap in single_doc_page_citation_regex().captures_iter(answer) {
+            let Some(page_str) = cap.get(1).map(|m| m.as_str()) else {
+                continue;
+            };
+            let Ok(page_ord) = page_str.parse::<u32>() else {
+                continue;
+            };
+            if page_ord == 0 || !seen.insert((base.document_id, page_ord)) {
+                continue;
+            }
+            let marker = cap.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+            if let Some(exact) = passages.iter().find(|p| p.page_ord == page_ord) {
+                out.push(LlmCitation {
+                    marker,
+                    document_id: exact.document_id,
+                    file_id: exact.file_id,
+                    page_ord: exact.page_ord,
+                    printed_label: exact.printed_label.clone(),
+                    doc_title: exact.doc_title.clone(),
+                    bboxes: exact.bboxes.clone(),
+                    snippet: make_preview(&exact.text_content),
+                });
+            } else {
+                out.push(LlmCitation {
+                    marker,
+                    document_id: base.document_id,
+                    file_id: base.file_id,
+                    page_ord,
+                    printed_label: None,
+                    doc_title: base.doc_title.clone(),
+                    bboxes: Vec::new(),
+                    snippet: make_preview(&base.text_content),
+                });
+            }
         }
     }
 

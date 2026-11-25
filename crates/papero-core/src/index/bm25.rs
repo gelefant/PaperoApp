@@ -257,9 +257,31 @@ impl Bm25Index {
         root_ids: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<Bm25Hit>> {
+        self.search_with_doc_ids(query_text, root_ids, None, limit)
+    }
+
+    /// Searches passages matching `query_text`, optionally restricted to `root_ids` and/or
+    /// an exact allowlist of `document_ids` (used for Tag / Cluster / Author / Year / Collection filters).
+    pub fn search_with_doc_ids(
+        &self,
+        query_text: &str,
+        root_ids: Option<&[String]>,
+        document_ids: Option<&[u64]>,
+        limit: usize,
+    ) -> Result<Vec<Bm25Hit>> {
         let trimmed = query_text.trim();
         if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(roots) = root_ids {
+            if roots.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(docs) = document_ids {
+            if docs.is_empty() {
+                return Ok(Vec::new());
+            }
         }
 
         let mut parser = QueryParser::for_index(&self.index, vec![self.f_text_content]);
@@ -273,10 +295,9 @@ impl Bm25Index {
             }
         };
 
-        let final_query: Box<dyn Query> = if let Some(roots) = root_ids {
-            if roots.is_empty() {
-                return Ok(Vec::new());
-            }
+        let mut must_clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, parsed)];
+
+        if let Some(roots) = root_ids {
             let root_clauses: Vec<(Occur, Box<dyn Query>)> = roots
                 .iter()
                 .map(|r| {
@@ -287,13 +308,27 @@ impl Bm25Index {
                     )
                 })
                 .collect();
-            let root_filter = BooleanQuery::new(root_clauses);
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Must, parsed),
-                (Occur::Must, Box::new(root_filter)),
-            ]))
+            must_clauses.push((Occur::Must, Box::new(BooleanQuery::new(root_clauses))));
+        }
+
+        if let Some(docs) = document_ids {
+            let doc_clauses: Vec<(Occur, Box<dyn Query>)> = docs
+                .iter()
+                .map(|&doc_id| {
+                    let t = Term::from_field_u64(self.f_document_id, doc_id);
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(t, IndexRecordOption::Basic)) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            must_clauses.push((Occur::Must, Box::new(BooleanQuery::new(doc_clauses))));
+        }
+
+        let final_query: Box<dyn Query> = if must_clauses.len() == 1 {
+            must_clauses.pop().expect("single clause").1
         } else {
-            parsed
+            Box::new(BooleanQuery::new(must_clauses))
         };
 
         let searcher = self.reader.searcher();

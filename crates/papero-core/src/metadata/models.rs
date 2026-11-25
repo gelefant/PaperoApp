@@ -129,6 +129,10 @@ pub struct ExtractedIdentifiers {
     pub is_user_query: bool,
 }
 
+fn default_unread_status() -> String {
+    "unread".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentMetadataView {
     pub document_id: i64,
@@ -167,6 +171,12 @@ pub struct DocumentMetadataView {
     #[serde(default)]
     pub metadata_verified: bool,
     pub exclude_from_cloud_llm: bool,
+    #[serde(default = "default_unread_status")]
+    pub reading_status: String,
+    #[serde(default)]
+    pub is_starred: bool,
+    #[serde(default)]
+    pub collection_ids: Vec<i64>,
     pub tags: Vec<String>,
     pub pending_candidates: Vec<CandidateRow>,
 }

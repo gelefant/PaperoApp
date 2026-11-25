@@ -327,6 +327,23 @@ pub fn parse_tesseract_tsv(
     })
 }
 
+/// Enqueues available files belonging to the specified `document_ids` for OCR processing.
+pub fn enqueue_ocr_for_documents(conn: &rusqlite::Connection, document_ids: &[i64]) -> Result<usize> {
+    let mut count = 0usize;
+    for &doc_id in document_ids {
+        let n = conn.execute(
+            "UPDATE files
+             SET ocr_status = 'queued'
+             WHERE document_id = ?1
+               AND is_available = 1
+               AND ocr_status NOT IN ('running', 'queued')",
+            rusqlite::params![doc_id],
+        )?;
+        count += n;
+    }
+    Ok(count)
+}
+
 /// Runs external Tesseract OCR page-by-page over a PDF or DjVu file, rendering temporary
 /// raster images exclusively inside `<cache_dir>/ocr_tmp/` and updating SQLite + Tantivy BM25
 /// (and cleaning stale keys from `VectorIndex` if opened) while preserving source files read-only.

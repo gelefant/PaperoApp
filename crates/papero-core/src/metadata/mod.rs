@@ -15,8 +15,10 @@ pub mod models;
 pub mod mrlookup;
 pub mod openalex;
 pub mod openlibrary;
+pub mod relations;
 pub mod resolver;
 pub mod semanticscholar;
+pub mod smart_paste;
 pub mod zbmath;
 
 pub use extract::{

@@ -519,6 +519,7 @@ fn evaluate_mode(
         rrf_k: 60.0,
         aggregation: DocScoreAggregation::Max,
         work_category: None,
+        filter: Default::default(),
     };
 
     let mut r5 = 0usize;

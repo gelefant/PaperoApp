@@ -1,18 +1,27 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   AltFormulaImportReport,
+  AnnotationSearchHit,
   BackupReport,
+  BibtexSyncReport,
   BulkMetadataProgressEvent,
+  CiteKeyPayload,
   ClusteringReport,
+  CollectionView,
   ContentSearchDocResult,
+  ContentSearchFilter,
+  DocLlmScope,
   DocumentListItem,
   DocumentMetadataView,
+  DocumentRelationsView,
   DownloadProgressEvent,
   DuplicateGroupView,
   DuplicateReport,
   EmbedProgressStatus,
   ExternalReaderPreset,
   ExtractedSpan,
+  FileAnnotation,
+  FileReadingState,
   FileViewerInfo,
   HybridSearchResponse,
   ImportMetadataReport,
@@ -23,21 +32,27 @@ import type {
   LlmModelInfo,
   LlmPromptPreview,
   LlmProvider,
+  LlmStreamEvent,
   ManualMetadataEdit,
   MetadataSearchFilter,
   MlEnvironmentStatus,
   MscTreeNode,
+  NewFileAnnotation,
   OcrEnvironmentStatus,
   OcrFileReport,
   OcrProgressEvent,
+  ReadingStatePatch,
   ResolveOutcome,
   RestoreReport,
   SaveAndFetchResult,
+  SavedSearchView,
   ScanProgressEvent,
+  SmartPasteApplyResult,
   SourceRoot,
   TagSummary,
   TopicClusterView,
   UiSettingsPayload,
+  UpdateFileAnnotation,
 } from './types';
 
 export const api = {
@@ -78,20 +93,23 @@ export const api = {
     query: string,
     rootIds?: string[],
     limit = 50,
-    workCategory?: string | null
+    workCategory?: string | null,
+    filter?: ContentSearchFilter | null
   ) =>
     invoke<ContentSearchDocResult[]>('search_content_bm25', {
       query,
       rootIds: rootIds ?? null,
       limit,
       workCategory: workCategory && workCategory !== 'all' ? workCategory : null,
+      filter: filter ?? null,
     }),
   searchContentHybrid: (
     query: string,
     rootIds?: string[],
     rerankOverride?: boolean | null,
     limitOverride?: number | null,
-    workCategory?: string | null
+    workCategory?: string | null,
+    filter?: ContentSearchFilter | null
   ) =>
     invoke<HybridSearchResponse>('search_content_hybrid', {
       query,
@@ -99,6 +117,7 @@ export const api = {
       rerankOverride: rerankOverride ?? null,
       limitOverride: limitOverride ?? null,
       workCategory: workCategory && workCategory !== 'all' ? workCategory : null,
+      filter: filter ?? null,
     }),
   listModelStatuses: () => invoke<MlEnvironmentStatus>('list_model_statuses'),
   downloadMlProfile: (
@@ -345,4 +364,151 @@ export const api = {
       maxPassages: maxPassages ?? null,
       maxInputTokens: maxInputTokens ?? null,
     }),
+  generateLlmAnswerStream: (
+    query: string,
+    results: ContentSearchDocResult[],
+    onEvent: (ev: LlmStreamEvent) => void,
+    maxPassages?: number | null,
+    maxInputTokens?: number | null
+  ) => {
+    const channel = new Channel<LlmStreamEvent>();
+    channel.onmessage = onEvent;
+    return invoke<LlmAnswerResult>('generate_llm_answer_stream_cmd', {
+      query,
+      results,
+      maxPassages: maxPassages ?? null,
+      maxInputTokens: maxInputTokens ?? null,
+      onEvent: channel,
+    });
+  },
+  previewDocLlmPrompt: (opts: {
+    documentId: number;
+    fileId: number;
+    scope: DocLlmScope;
+    pageOrd: number;
+    selectionText?: string | null;
+    question: string;
+    maxPassages?: number | null;
+    maxInputTokens?: number | null;
+  }) =>
+    invoke<LlmPromptPreview>('preview_doc_llm_prompt_cmd', {
+      documentId: opts.documentId,
+      fileId: opts.fileId,
+      scope: opts.scope,
+      pageOrd: opts.pageOrd,
+      selectionText: opts.selectionText ?? null,
+      question: opts.question,
+      maxPassages: opts.maxPassages ?? null,
+      maxInputTokens: opts.maxInputTokens ?? null,
+    }),
+  askDocumentLlmStream: (
+    opts: {
+      documentId: number;
+      fileId: number;
+      scope: DocLlmScope;
+      pageOrd: number;
+      selectionText?: string | null;
+      question: string;
+      maxPassages?: number | null;
+      maxInputTokens?: number | null;
+    },
+    onEvent: (ev: LlmStreamEvent) => void
+  ) => {
+    const channel = new Channel<LlmStreamEvent>();
+    channel.onmessage = onEvent;
+    return invoke<LlmAnswerResult>('ask_document_llm_stream_cmd', {
+      documentId: opts.documentId,
+      fileId: opts.fileId,
+      scope: opts.scope,
+      pageOrd: opts.pageOrd,
+      selectionText: opts.selectionText ?? null,
+      question: opts.question,
+      maxPassages: opts.maxPassages ?? null,
+      maxInputTokens: opts.maxInputTokens ?? null,
+      onEvent: channel,
+    });
+  },
+
+  // Citation key & Live BibTeX Auto-Sync (v0.5.0)
+  getDocumentCiteKey: (documentId: number) =>
+    invoke<CiteKeyPayload>('get_document_cite_key_cmd', { documentId }),
+  syncBibtexNow: () => invoke<BibtexSyncReport>('sync_bibtex_now_cmd'),
+
+  // Smart Paste & Document Relations (v0.5.0)
+  applySmartPaste: (documentId: number, rawInput: string) =>
+    invoke<SmartPasteApplyResult>('apply_smart_paste_cmd', { documentId, rawInput }),
+  getDocumentRelations: (documentId: number) =>
+    invoke<DocumentRelationsView>('get_document_relations_cmd', { documentId }),
+
+  // Non-destructive Annotations, Bookmarks, Notes & Reading State (v0.5.0)
+  listFileAnnotations: (fileId: number) =>
+    invoke<FileAnnotation[]>('list_file_annotations_cmd', { fileId }),
+  createFileAnnotation: (fileId: number, input: NewFileAnnotation) =>
+    invoke<FileAnnotation>('create_file_annotation_cmd', { fileId, input }),
+  updateFileAnnotation: (annotationId: number, patch: UpdateFileAnnotation) =>
+    invoke<FileAnnotation>('update_file_annotation_cmd', { annotationId, patch }),
+  deleteFileAnnotation: (annotationId: number) =>
+    invoke<void>('delete_file_annotation_cmd', { annotationId }),
+  togglePageBookmark: (fileId: number, pageOrd: number, label?: string | null) =>
+    invoke<FileAnnotation | null>('toggle_page_bookmark_cmd', {
+      fileId,
+      pageOrd,
+      label: label ?? null,
+    }),
+  searchAnnotations: (query: string, fileId?: number | null) =>
+    invoke<AnnotationSearchHit[]>('search_annotations_cmd', {
+      query,
+      fileId: fileId ?? null,
+    }),
+  exportAnnotationsMarkdown: (fileId?: number | null, filePath?: string | null) =>
+    invoke<string>('export_annotations_markdown_cmd', {
+      fileId: fileId ?? null,
+      filePath: filePath ?? null,
+    }),
+  upsertReadingState: (fileId: number, patch: ReadingStatePatch) =>
+    invoke<FileReadingState>('upsert_reading_state_cmd', { fileId, patch }),
+  setDocumentReadingStatus: (documentId: number, status: string) =>
+    invoke<void>('set_document_reading_status_cmd', { documentId, status }),
+  setDocumentStarred: (documentId: number, starred: boolean) =>
+    invoke<void>('set_document_starred_cmd', { documentId, starred }),
+
+  // Collections & Saved Views (v0.5.0)
+  listCollections: () => invoke<CollectionView[]>('list_collections_cmd'),
+  createCollection: (name: string, colorHex?: string | null) =>
+    invoke<CollectionView>('create_collection_cmd', { name, colorHex: colorHex ?? null }),
+  renameCollection: (collectionId: number, name: string) =>
+    invoke<void>('rename_collection_cmd', { collectionId, name }),
+  deleteCollection: (collectionId: number) =>
+    invoke<void>('delete_collection_cmd', { collectionId }),
+  reorderCollections: (orderedIds: number[]) =>
+    invoke<void>('reorder_collections_cmd', { orderedIds }),
+  addDocsToCollection: (collectionId: number, documentIds: number[]) =>
+    invoke<number>('add_docs_to_collection_cmd', { collectionId, documentIds }),
+  removeDocsFromCollection: (collectionId: number, documentIds: number[]) =>
+    invoke<number>('remove_docs_from_collection_cmd', { collectionId, documentIds }),
+  listSavedSearches: () => invoke<SavedSearchView[]>('list_saved_searches_cmd'),
+  createSavedSearch: (
+    name: string,
+    searchMode: 'metadata' | 'content',
+    queryText: string,
+    filterJson: string
+  ) =>
+    invoke<SavedSearchView>('create_saved_search_cmd', {
+      name,
+      searchMode,
+      queryText,
+      filterJson,
+    }),
+  deleteSavedSearch: (savedSearchId: number) =>
+    invoke<void>('delete_saved_search_cmd', { savedSearchId }),
+
+  // Batch Catalog Actions (v0.5.0)
+  batchAddTag: (documentIds: number[], tagName: string) =>
+    invoke<number>('batch_add_tag_cmd', { documentIds, tagName }),
+  batchRemoveTag: (documentIds: number[], tagName: string) =>
+    invoke<number>('batch_remove_tag_cmd', { documentIds, tagName }),
+  batchSetVerified: (documentIds: number[], verified: boolean) =>
+    invoke<number>('batch_set_verified_cmd', { documentIds, verified }),
+  batchEnqueueOcr: (documentIds: number[]) =>
+    invoke<number>('batch_enqueue_ocr_cmd', { documentIds }),
 };

@@ -1,10 +1,16 @@
-use crate::bibtex::{format_mrlookup_bibtex, parse_bibtex_entries, BibtexExportOptions};
+use crate::bibtex::{
+    compute_citation_key, disambiguate_citation_keys, format_mrlookup_bibtex, parse_bibtex_entries,
+    BibtexExportOptions,
+};
 use crate::error::{CoreError, Result};
 use crate::metadata::models::{
     normalize_doi, normalize_pages, BibliographicAuthor, BibliographicRecord, DocumentMetadataView,
     WorkType,
 };
 use serde_json::Value;
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
 
 pub fn metadata_view_to_record(doc: &DocumentMetadataView) -> BibliographicRecord {
     BibliographicRecord {
@@ -46,12 +52,165 @@ pub fn metadata_view_to_record(doc: &DocumentMetadataView) -> BibliographicRecor
     }
 }
 
-/// Exports multiple documents as concatenated MRLookup-style BibTeX entries.
+/// Exports multiple documents as concatenated BibTeX/BibLaTeX entries with automatic
+/// anti-collision key disambiguation (`a`, `b`, `c`, ...).
 pub fn export_documents_bibtex(docs: &[DocumentMetadataView], opts: &BibtexExportOptions) -> String {
-    docs.iter()
-        .map(|d| format_mrlookup_bibtex(&metadata_view_to_record(d), opts))
+    if docs.is_empty() {
+        return String::new();
+    }
+    let records: Vec<BibliographicRecord> = docs.iter().map(metadata_view_to_record).collect();
+    let base_keys: Vec<String> = records
+        .iter()
+        .map(|r| compute_citation_key(r, opts.key_pattern))
+        .collect();
+    let unique_keys = disambiguate_citation_keys(&base_keys);
+
+    records
+        .iter()
+        .zip(base_keys.iter())
+        .zip(unique_keys.iter())
+        .map(|((rec, base_k), uniq_k)| {
+            let mut item_opts = opts.clone();
+            if uniq_k != base_k {
+                item_opts.citation_key_override = Some(uniq_k.clone());
+            }
+            format_mrlookup_bibtex(rec, &item_opts)
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Verifies `dest` is strictly outside all configured read-only `source_roots` directories,
+/// then writes `content` atomically via a temporary sibling file (Windows sharing-safe).
+pub fn write_bibtex_file_atomically(
+    dest: &Path,
+    content: &str,
+    source_root_paths: &[String],
+) -> Result<()> {
+    if dest.as_os_str().is_empty() {
+        return Err(CoreError::Config("BibTeX destination path is empty".into()));
+    }
+
+    let check_dir = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canon_parent = canonicalize_best_effort(check_dir);
+    for root_raw in source_root_paths {
+        let canon_root = canonicalize_best_effort(Path::new(root_raw));
+        if path_is_inside(&canon_parent, &canon_root) {
+            return Err(CoreError::Config(format!(
+                "Strictly read-only guard: cannot write .bib file inside source folder '{}'",
+                root_raw
+            )));
+        }
+    }
+
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let base_name = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("papero.bib");
+    let tmp_path = dest.with_file_name(format!(".{base_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        if !content.is_empty() && !content.ends_with('\n') {
+            f.write_all(b"\n")?;
+        }
+        f.sync_all()?;
+    }
+
+    // Rename with Windows-safe overwrite & brief retry if an editor/TeX compiler is reading the .bib
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..10 {
+        match std::fs::rename(&tmp_path, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                #[cfg(target_os = "windows")]
+                if dest.exists() {
+                    let _ = std::fs::remove_file(dest);
+                    if std::fs::rename(&tmp_path, dest).is_ok() {
+                        return Ok(());
+                    }
+                }
+                last_err = Some(e);
+                if attempt < 9 {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+    Err(CoreError::Io(
+        last_err.unwrap_or_else(|| std::io::Error::other("atomic bibtex write failed")),
+    ))
+}
+
+fn canonicalize_best_effort(path: &Path) -> std::path::PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    if let Ok(canon) = std::fs::canonicalize(&abs) {
+        return canon;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if parent.exists() {
+            let mut base = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            for seg in tail.into_iter().rev() {
+                base.push(seg);
+            }
+            return base;
+        }
+        cur = parent;
+    }
+    abs
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn normalize_windows_path_for_prefix(raw: &str) -> String {
+    let stripped = crate::db::repos::roots::strip_windows_verbatim_prefix(raw);
+    stripped
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .trim_end_matches('\\')
+        .to_string()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_path_is_inside_str(candidate: &str, root: &str) -> bool {
+    let c = normalize_windows_path_for_prefix(candidate);
+    let r = normalize_windows_path_for_prefix(root);
+    if r.is_empty() {
+        return false;
+    }
+    c == r || c.starts_with(&format!("{r}\\"))
+}
+
+fn path_is_inside(candidate: &Path, root: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_path_is_inside_str(&candidate.to_string_lossy(), &root.to_string_lossy())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        candidate.starts_with(root)
+    }
 }
 
 /// Exports multiple documents as RFC 4180 CSV.
@@ -236,4 +395,108 @@ fn json_str_or_int(v: &Value) -> Option<String> {
     v.as_str()
         .map(ToOwned::to_owned)
         .or_else(|| v.as_i64().map(|n| n.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bibtex::BibtexKeyPattern;
+
+    #[test]
+    fn write_bibtex_atomically_blocks_source_roots_and_writes_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_root = tmp.path().join("readonly_papers");
+        let external_dir = tmp.path().join("latex_project");
+        std::fs::create_dir_all(&src_root).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+
+        let roots = vec![src_root.to_string_lossy().into_owned()];
+        let forbidden = src_root.join("refs.bib");
+        assert!(write_bibtex_file_atomically(&forbidden, "@misc{a,}", &roots).is_err());
+        assert!(!forbidden.exists());
+
+        // Non-existent nested subdirectory inside a source root must also be rejected without creating dirs.
+        let forbidden_nested = src_root.join("new_sub").join("refs.bib");
+        assert!(write_bibtex_file_atomically(&forbidden_nested, "@misc{a,}", &roots).is_err());
+        assert!(!src_root.join("new_sub").exists());
+
+        // Windows verbatim `\\?\` / mixed-slash / case-insensitive prefix checks.
+        assert!(windows_path_is_inside_str(
+            r"C:\Users\Math\Papers\sub",
+            r"\\?\c:\users\math\papers"
+        ));
+        assert!(windows_path_is_inside_str(
+            "c:/Users/Math/Papers/sub",
+            r"\\?\C:\Users\Math\Papers\"
+        ));
+        assert!(!windows_path_is_inside_str(
+            r"C:\Users\Math\Papers2\refs",
+            r"\\?\C:\Users\Math\Papers"
+        ));
+
+        let allowed = external_dir.join("refs.bib");
+        write_bibtex_file_atomically(&allowed, "@misc{a,}", &roots).unwrap();
+        assert_eq!(std::fs::read_to_string(&allowed).unwrap(), "@misc{a,}\n");
+    }
+
+    #[test]
+    fn export_documents_bibtex_disambiguates_colliding_keys() {
+        let mk = |id: i64, title: &str| DocumentMetadataView {
+            document_id: id,
+            work_type: "article".into(),
+            title: title.into(),
+            authors: vec![BibliographicAuthor {
+                family_name: "Erdős".into(),
+                given_name: "Paul".into(),
+                role: "author".into(),
+            }],
+            journal_abbrev: None,
+            journal_full: None,
+            booktitle: None,
+            series: None,
+            volume: None,
+            issue_number: None,
+            year: Some(1975),
+            pages: None,
+            edition: None,
+            publisher: None,
+            address: None,
+            isbn: None,
+            issn: None,
+            doi: None,
+            arxiv_id: None,
+            arxiv_version: None,
+            mr_number: None,
+            mr_number_display: None,
+            mr_reviewer: None,
+            zbl_number: None,
+            url: None,
+            msc_primary: None,
+            msc_primary_status: "none".into(),
+            msc_secondary: vec![],
+            abstract_text: None,
+            raw_mrlookup_bibtex: None,
+            metadata_source: Some("manual".into()),
+            metadata_license_note: None,
+            manual_locked_fields: vec![],
+            metadata_verified: false,
+            exclude_from_cloud_llm: false,
+            reading_status: "unread".into(),
+            is_starred: false,
+            collection_ids: vec![],
+            tags: vec![],
+            pending_candidates: vec![],
+        };
+        let docs = vec![mk(1, "First Paper"), mk(2, "Second Paper")];
+        let out = export_documents_bibtex(
+            &docs,
+            &BibtexExportOptions {
+                key_pattern: BibtexKeyPattern::AuthorYear,
+                include_source_comment: false,
+                ..Default::default()
+            },
+        );
+        assert!(out.contains("@article {Erdos1975a,"));
+        assert!(out.contains("@article {Erdos1975b,"));
+    }
 }

@@ -1,8 +1,14 @@
 <script lang="ts">
+  import { api } from '../api';
+  import { hasMathDelimiters } from '../katexLoader';
   import type {
+    CollectionView,
     DocumentMetadataView,
+    DocumentRelationsView,
     ManualMetadataEdit,
+    ReadingStatus,
     ResolveOutcome,
+    SmartPasteApplyResult,
     TopicClusterView,
   } from '../types';
   import {
@@ -15,11 +21,13 @@
     normalizeInputText,
     type InspectorFormFields,
   } from '../inspectorUtils';
+  import MathMarkdown from './MathMarkdown.svelte';
 
   interface Props {
     meta: DocumentMetadataView | null;
     selectedFileId?: number | null;
     clusters?: TopicClusterView[];
+    collections?: CollectionView[];
     loading: boolean;
     fetchingOnline: boolean;
     lastFetchMessage: string;
@@ -41,6 +49,13 @@
     ) => Promise<void>;
     onDismissCandidate: (candidateId: number) => Promise<void>;
     onCopyBibtex: (documentId: number) => Promise<string>;
+    onCopyCiteCommand?: (documentId: number) => Promise<string>;
+    onApplySmartPaste?: (documentId: number, rawInput: string) => Promise<SmartPasteApplyResult | void>;
+    onSetReadingStatus?: (documentId: number, status: ReadingStatus) => Promise<void>;
+    onSetStarred?: (documentId: number, starred: boolean) => Promise<void>;
+    onAddToCollection?: (collectionId: number, documentId: number) => Promise<void>;
+    onRemoveFromCollection?: (collectionId: number, documentId: number) => Promise<void>;
+    onSelectRelatedDoc?: (documentId: number) => void;
     onImportAltFormula?: (fileId: number, markdownText: string) => Promise<void>;
     onRunOcr?: (fileId: number) => Promise<void>;
     onConfirmMsc?: (documentId: number, mscCode: string | null) => Promise<void>;
@@ -57,6 +72,7 @@
     meta,
     selectedFileId = null,
     clusters = [],
+    collections = [],
     loading,
     fetchingOnline,
     lastFetchMessage,
@@ -70,6 +86,13 @@
     onConfirmCandidate,
     onDismissCandidate,
     onCopyBibtex,
+    onCopyCiteCommand,
+    onApplySmartPaste,
+    onSetReadingStatus,
+    onSetStarred,
+    onAddToCollection,
+    onRemoveFromCollection,
+    onSelectRelatedDoc,
     onImportAltFormula,
     onRunOcr,
     onConfirmMsc,
@@ -83,6 +106,10 @@
   }: Props = $props();
 
   let newTagInput = $state('');
+  let smartPasteInput = $state('');
+  let smartPasteBusy = $state(false);
+  let relations = $state.raw<DocumentRelationsView | null>(null);
+  let relationsReqSeq = 0;
 
   let workType = $state('article');
   let title = $state('');
@@ -200,6 +227,16 @@
       overwriteQueryFields = !nextLocked.includes('title') && !nextLocked.includes('authors');
       saveFeedback = '';
       saveError = '';
+      smartPasteInput = '';
+      relations = null;
+      const req = ++relationsReqSeq;
+      const targetDocId = meta.document_id;
+      void api
+        .getDocumentRelations(targetDocId)
+        .then((rel) => {
+          if (req === relationsReqSeq) relations = rel;
+        })
+        .catch(() => {});
     } else if (nextLocked.includes('title') || nextLocked.includes('authors')) {
       overwriteQueryFields = false;
     }
@@ -523,6 +560,59 @@
       copyFeedback = 'BibTeX generato (seleziona e copia qui sotto)';
     }
   }
+
+  async function handleCopyCiteClick() {
+    if (!meta) return;
+    try {
+      const cmd = onCopyCiteCommand
+        ? await onCopyCiteCommand(meta.document_id)
+        : (await api.getDocumentCiteKey(meta.document_id)).cite_command;
+      await navigator.clipboard.writeText(cmd);
+      copyFeedback = `Copiato ${cmd}`;
+    } catch (e) {
+      saveError = `Errore copia \\cite: ${String(e)}`;
+    }
+  }
+
+  async function handleSmartPasteSubmit(e?: Event) {
+    e?.preventDefault();
+    if (!meta || !onApplySmartPaste || !smartPasteInput.trim() || smartPasteBusy) return;
+    smartPasteBusy = true;
+    saveError = '';
+    saveFeedback = '';
+    try {
+      const res = await onApplySmartPaste(meta.document_id, smartPasteInput.trim());
+      smartPasteInput = '';
+      if (res?.summary) {
+        saveFeedback = res.summary;
+      }
+    } catch (err) {
+      saveError = String(err);
+    } finally {
+      smartPasteBusy = false;
+    }
+  }
+
+  async function handleApplyPublishedNotice() {
+    if (!meta || !onApplySmartPaste || !relations?.published_notice) return;
+    const pub = relations.published_notice;
+    const raw = pub.doi ? `https://doi.org/${pub.doi}` : pub.mr_number ? `MR${pub.mr_number}` : '';
+    if (!raw) return;
+    smartPasteInput = raw;
+    await handleSmartPasteSubmit();
+  }
+
+  const docCollections = $derived(
+    meta ? collections.filter((c) => (meta.collection_ids ?? []).includes(c.id)) : []
+  );
+  const availableCollections = $derived(
+    meta ? collections.filter((c) => !(meta.collection_ids ?? []).includes(c.id)) : []
+  );
+  const totalRelationsCount = $derived(
+    (relations?.similar.length ?? 0) +
+      (relations?.cites.length ?? 0) +
+      (relations?.cited_by.length ?? 0)
+  );
 </script>
 
 <aside class="inspector">
@@ -564,7 +654,14 @@
         </button>
       {/if}
       <button type="button" onclick={handleCopyBibtexClick}>
-        Copia BibTeX (MRLookup)
+        Copia BibTeX
+      </button>
+      <button
+        type="button"
+        title={'Copia subito \\cite{chiave} negli appunti'}
+        onclick={handleCopyCiteClick}
+      >
+        Copia \cite
       </button>
       {#if selectedFileId !== null && onImportAltFormula}
         <button
@@ -607,6 +704,119 @@
     {/if}
     {#if altFormulaFeedback}
       <div class="notice">{altFormulaFeedback}</div>
+    {/if}
+
+    <!-- Smart Paste: DOI / arXiv / MR / ISBN / URL / BibTeX (NO thumbnails!) -->
+    {#if onApplySmartPaste}
+      <form class="smart-paste-bar" onsubmit={handleSmartPasteSubmit}>
+        <input
+          type="text"
+          class="smart-paste-input"
+          placeholder="Incolla DOI / arXiv / MR / ISBN / BibTeX…"
+          disabled={smartPasteBusy || fetchingOnline}
+          bind:value={smartPasteInput}
+        />
+        <button
+          type="submit"
+          class="smart-paste-btn"
+          disabled={smartPasteBusy || fetchingOnline || !smartPasteInput.trim()}
+        >
+          {smartPasteBusy ? '…' : 'Applica'}
+        </button>
+      </form>
+    {/if}
+
+    <!-- Reading status & Star -->
+    {#if onSetReadingStatus || onSetStarred}
+      <div class="reading-row">
+        {#if onSetReadingStatus}
+          <select
+            class="reading-select"
+            aria-label="Stato lettura"
+            value={meta.reading_status ?? 'unread'}
+            onchange={(e) =>
+              onSetReadingStatus(
+                meta.document_id,
+                (e.currentTarget as HTMLSelectElement).value as ReadingStatus
+              )}
+          >
+            <option value="unread">Da leggere</option>
+            <option value="reading">In lettura</option>
+            <option value="read">Letto</option>
+          </select>
+        {/if}
+        {#if onSetStarred}
+          <button
+            type="button"
+            class="star-toggle-btn"
+            class:starred={Boolean(meta.is_starred)}
+            onclick={() => onSetStarred(meta.document_id, !meta.is_starred)}
+          >
+            {meta.is_starred ? '★ Preferito' : '☆ Preferito'}
+          </button>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Preprint published version badge -->
+    {#if relations?.published_notice}
+      <div class="pub-notice-banner">
+        <div class="pub-notice-text">
+          <strong>Versione pubblicata:</strong>
+          {#if relations.published_notice.journal}{relations.published_notice.journal}{/if}
+          {#if relations.published_notice.year} ({relations.published_notice.year}){/if}
+          {#if relations.published_notice.doi} · DOI {relations.published_notice.doi}{/if}
+          {#if relations.published_notice.mr_number} · MR{relations.published_notice.mr_number}{/if}
+        </div>
+        {#if onApplySmartPaste && (relations.published_notice.doi || relations.published_notice.mr_number)}
+          <button
+            type="button"
+            class="mini-ok"
+            disabled={smartPasteBusy}
+            onclick={handleApplyPublishedNotice}
+          >
+            Aggiorna
+          </button>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Collections assignment -->
+    {#if collections.length > 0 && onAddToCollection && onRemoveFromCollection}
+      <div class="tax-box">
+        <span class="tax-label">Collezioni</span>
+        {#if docCollections.length > 0}
+          <div class="tag-chips">
+            {#each docCollections as c (c.id)}
+              <span class="tag-chip">
+                {c.name}
+                <button
+                  type="button"
+                  aria-label="Rimuovi da collezione {c.name}"
+                  onclick={() => onRemoveFromCollection(c.id, meta.document_id)}
+                >
+                  ×
+                </button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+        {#if availableCollections.length > 0}
+          <select
+            value=""
+            onchange={async (e) => {
+              const cid = Number((e.currentTarget as HTMLSelectElement).value);
+              (e.currentTarget as HTMLSelectElement).value = '';
+              if (cid > 0) await onAddToCollection(cid, meta.document_id);
+            }}
+          >
+            <option value="">+ Aggiungi a collezione…</option>
+            {#each availableCollections as c (c.id)}
+              <option value={String(c.id)}>{c.name}</option>
+            {/each}
+          </select>
+        {/if}
+      </div>
     {/if}
 
     {#if meta.msc_primary && meta.msc_primary_status === 'proposed' && onConfirmMsc && onRejectMsc}
@@ -1049,6 +1259,11 @@
       <div class="field-group">
         {@render fieldHead('Abstract', 'abstract_text')}
         <textarea rows="3" bind:value={abstractText} oninput={() => touch('abstract_text', abstractText)}></textarea>
+        {#if abstractText.trim() && hasMathDelimiters(abstractText)}
+          <div class="abstract-katex-preview">
+            <MathMarkdown text={abstractText} compact={true} />
+          </div>
+        {/if}
       </div>
 
       <label class="check-row">
@@ -1097,9 +1312,67 @@
       </div>
     </form>
 
+    {#if relations && totalRelationsCount > 0}
+      <details class="rel-details">
+        <summary class="rel-summary">
+          <span>Documenti correlati</span>
+          <span class="rel-count">{totalRelationsCount}</span>
+        </summary>
+        <div class="rel-body">
+          {#if relations.similar.length > 0}
+            <div class="rel-group">
+              <div class="rel-subhead">Simili nella tua libreria</div>
+              {#each relations.similar as sim (sim.document_id)}
+                <button
+                  type="button"
+                  class="rel-item"
+                  onclick={() => onSelectRelatedDoc?.(sim.document_id)}
+                >
+                  <span class="rel-item-title">{sim.title}</span>
+                  <span class="rel-item-meta">
+                    {sim.authors_summary || '—'}{#if sim.year} · {sim.year}{/if} · {Math.round(sim.similarity * 100)}%
+                  </span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+          {#if relations.cites.length > 0}
+            <div class="rel-group">
+              <div class="rel-subhead">Cita (nella libreria)</div>
+              {#each relations.cites as c (c.document_id)}
+                <button
+                  type="button"
+                  class="rel-item"
+                  onclick={() => onSelectRelatedDoc?.(c.document_id)}
+                >
+                  <span class="rel-item-title">{c.title}</span>
+                  <span class="rel-item-meta">{c.authors_summary || '—'}{#if c.year} · {c.year}{/if}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+          {#if relations.cited_by.length > 0}
+            <div class="rel-group">
+              <div class="rel-subhead">Citato da (nella libreria)</div>
+              {#each relations.cited_by as cb (cb.document_id)}
+                <button
+                  type="button"
+                  class="rel-item"
+                  onclick={() => onSelectRelatedDoc?.(cb.document_id)}
+                >
+                  <span class="rel-item-title">{cb.title}</span>
+                  <span class="rel-item-meta">{cb.authors_summary || '—'}{#if cb.year} · {cb.year}{/if}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </details>
+    {/if}
+
     {#if bibPreview}
       <div class="bib-box">
-        <div class="bib-label">Anteprima BibTeX (MRLookup)</div>
+        <div class="bib-label">Anteprima BibTeX</div>
         <pre>{bibPreview}</pre>
       </div>
     {/if}
@@ -1502,6 +1775,130 @@
     color: var(--text-muted);
   }
   .status-msg {
+    color: var(--text-muted);
+  }
+  .smart-paste-bar {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .smart-paste-input {
+    flex: 1;
+    min-width: 0;
+    font-size: 11.5px;
+    padding: 4px 7px;
+  }
+  .smart-paste-btn {
+    font-size: 11px;
+    padding: 4px 8px;
+    flex-shrink: 0;
+  }
+  .reading-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .reading-select {
+    flex: 1;
+    font-size: 11.5px;
+    padding: 3px 6px;
+  }
+  .star-toggle-btn {
+    font-size: 11.5px;
+    padding: 3px 8px;
+    border-radius: 5px;
+  }
+  .star-toggle-btn.starred {
+    border-color: #d97706;
+    background: rgba(245, 158, 11, 0.14);
+    color: #b45309;
+    font-weight: 600;
+  }
+  .pub-notice-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    background: rgba(16, 185, 129, 0.1);
+    font-size: 11px;
+  }
+  .pub-notice-text {
+    line-height: 1.35;
+  }
+  .abstract-katex-preview {
+    margin-top: 4px;
+    padding: 7px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-muted);
+  }
+  .rel-details {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-muted);
+    padding: 5px 8px;
+  }
+  .rel-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text);
+    list-style: none;
+  }
+  .rel-count {
+    font-size: 10px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+  .rel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 7px;
+  }
+  .rel-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .rel-subhead {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  .rel-item {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    text-align: left;
+    padding: 5px 7px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg-panel);
+    cursor: pointer;
+  }
+  .rel-item:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .rel-item-title {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.3;
+  }
+  .rel-item-meta {
+    font-size: 10.5px;
     color: var(--text-muted);
   }
 </style>

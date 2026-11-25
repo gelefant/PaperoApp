@@ -199,6 +199,7 @@ pub fn run() {
         .setup(move |app| {
             AppState::spawn_idle_reaper(Arc::clone(&reaper_state));
             AppState::spawn_auto_backup_loop(Arc::clone(&reaper_state));
+            AppState::spawn_bibtex_auto_sync_loop(Arc::clone(&reaper_state));
             AppState::refresh_watcher(&reaper_state, Some(app.handle().clone()));
             Ok(())
         })
@@ -248,9 +249,37 @@ pub fn run() {
             commands::confirm_candidate,
             commands::dismiss_candidate,
             commands::get_document_bibtex,
+            commands::get_document_cite_key_cmd,
+            commands::sync_bibtex_now_cmd,
             commands::export_bibtex_many,
             commands::export_csv_many,
             commands::import_metadata_file,
+            commands::apply_smart_paste_cmd,
+            commands::get_document_relations_cmd,
+            commands::list_file_annotations_cmd,
+            commands::create_file_annotation_cmd,
+            commands::update_file_annotation_cmd,
+            commands::delete_file_annotation_cmd,
+            commands::toggle_page_bookmark_cmd,
+            commands::search_annotations_cmd,
+            commands::export_annotations_markdown_cmd,
+            commands::upsert_reading_state_cmd,
+            commands::set_document_reading_status_cmd,
+            commands::set_document_starred_cmd,
+            commands::list_collections_cmd,
+            commands::create_collection_cmd,
+            commands::rename_collection_cmd,
+            commands::delete_collection_cmd,
+            commands::reorder_collections_cmd,
+            commands::add_docs_to_collection_cmd,
+            commands::remove_docs_from_collection_cmd,
+            commands::list_saved_searches_cmd,
+            commands::create_saved_search_cmd,
+            commands::delete_saved_search_cmd,
+            commands::batch_add_tag_cmd,
+            commands::batch_remove_tag_cmd,
+            commands::batch_set_verified_cmd,
+            commands::batch_enqueue_ocr_cmd,
             commands::list_duplicates,
             commands::run_dedup_scan,
             commands::merge_duplicates,
@@ -282,6 +311,9 @@ pub fn run() {
             commands::preview_llm_prompt_cmd,
             commands::accept_llm_cloud_consent_cmd,
             commands::generate_llm_answer_cmd,
+            commands::generate_llm_answer_stream_cmd,
+            commands::preview_doc_llm_prompt_cmd,
+            commands::ask_document_llm_stream_cmd,
         ])
         .run(tauri::generate_context!());
 

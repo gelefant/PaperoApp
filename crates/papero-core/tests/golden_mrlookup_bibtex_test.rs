@@ -72,6 +72,7 @@ fn golden_mrlookup_bibtex_matches_verbatim_across_at_least_20_entries() {
                 wrap_lines: true,
                 include_source_comment: false,
                 citation_key_override: Some(entry.key.clone()),
+                ..Default::default()
             },
         );
         let header_prefix = format!("@{} {{{},", entry.entry_type, entry.key);

@@ -1,9 +1,12 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { save as saveFileDialog } from '@tauri-apps/plugin-dialog';
   import { api } from '../api';
   import { APP_VERSION } from '../appVersion';
   import { sanitizeUiSettings } from '../settingsUtils';
   import type {
+    BibtexFormat,
+    BibtexKeyPattern,
     DownloadProgressEvent,
     ExternalReaderPreset,
     LlmKeyStatus,
@@ -247,6 +250,54 @@
   let llmBusy = $state(false);
   let llmMsg = $state('');
   let llmErr = $state('');
+  let bibSyncBusy = $state(false);
+  let bibSyncMsg = $state('');
+
+  function citeKeyPreview(pattern?: BibtexKeyPattern): string {
+    switch (pattern) {
+      case 'author_year':
+        return 'Poincare1895';
+      case 'author_year_word':
+        return 'Poincare1895Analysis';
+      case 'author_lower_year':
+        return 'poincare1895';
+      default:
+        return 'MR1234567';
+    }
+  }
+
+  async function handleChooseBibSyncPath() {
+    try {
+      const chosen = await saveFileDialog({
+        defaultPath: draft.bibtex_auto_sync_path || 'papero-library.bib',
+        filters: [{ name: 'BibTeX', extensions: ['bib'] }],
+      });
+      if (chosen) {
+        draft.bibtex_auto_sync_path = chosen;
+        draft.bibtex_auto_sync_enabled = true;
+        bibSyncMsg = '';
+      }
+    } catch (e) {
+      bibSyncMsg = String(e);
+    }
+  }
+
+  async function handleSyncBibNow() {
+    bibSyncBusy = true;
+    bibSyncMsg = '';
+    try {
+      await saveDraft();
+      const rep = await api.syncBibtexNow();
+      bibSyncMsg =
+        lang === 'en'
+          ? `Synced ${rep.count} entries to ${rep.path}`
+          : `Sincronizzate ${rep.count} voci in ${rep.path}`;
+    } catch (e) {
+      bibSyncMsg = String(e);
+    } finally {
+      bibSyncBusy = false;
+    }
+  }
 
   $effect(() => {
     if (open) {
@@ -849,6 +900,93 @@
                 <span>{lang === 'en' ? 'Enable online metadata lookups' : 'Abilita ricerche metadati online'}</span>
               </label>
 
+              <div class="status-box">
+                <strong>
+                  {lang === 'en'
+                    ? 'BibTeX / BibLaTeX Keys & Live Auto-Sync .bib'
+                    : 'Chiavi BibTeX / BibLaTeX & Auto-Sync .bib'}
+                </strong>
+                <div class="two-col">
+                  <label>
+                    <span>{lang === 'en' ? 'Citation key pattern' : 'Pattern Citation Key'}</span>
+                    <select
+                      value={draft.bibtex_key_pattern ?? 'mr_default'}
+                      onchange={(e) =>
+                        (draft.bibtex_key_pattern = (e.currentTarget as HTMLSelectElement)
+                          .value as BibtexKeyPattern)}
+                    >
+                      <option value="mr_default">MR (predefinito)</option>
+                      <option value="author_year">CognomeAnno</option>
+                      <option value="author_year_word">CognomeAnnoParola</option>
+                      <option value="author_lower_year">cognomeanno</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>{lang === 'en' ? 'Export dialect' : 'Dialetto export'}</span>
+                    <select
+                      value={draft.bibtex_format ?? 'bibtex'}
+                      onchange={(e) =>
+                        (draft.bibtex_format = (e.currentTarget as HTMLSelectElement)
+                          .value as BibtexFormat)}
+                    >
+                      <option value="bibtex">BibTeX (AMS / MRLookup)</option>
+                      <option value="biblatex">BibLaTeX (journaltitle / date)</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="sub-hdr">
+                  {lang === 'en' ? 'Key example:' : 'Esempio chiave:'}
+                  <code class="mono">\cite{'{'}{citeKeyPreview(draft.bibtex_key_pattern)}{'}'}</code>
+                </div>
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(draft.bibtex_auto_sync_enabled)}
+                    onchange={(e) =>
+                      (draft.bibtex_auto_sync_enabled = (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>
+                    {lang === 'en'
+                      ? 'Auto-sync external .bib file on every metadata edit/verification'
+                      : 'Sincronizza automaticamente un file .bib esterno a ogni modifica/verifica'}
+                  </span>
+                </label>
+                <div class="key-row">
+                  <input
+                    type="text"
+                    readonly
+                    value={draft.bibtex_auto_sync_path ?? ''}
+                    placeholder={lang === 'en'
+                      ? 'Choose an external .bib path (outside source folders)…'
+                      : 'Scegli un file .bib esterno (fuori dalle cartelle sorgente)…'}
+                  />
+                  <button type="button" onclick={handleChooseBibSyncPath}>
+                    {lang === 'en' ? 'Choose…' : 'Scegli…'}
+                  </button>
+                  {#if draft.bibtex_auto_sync_path}
+                    <button
+                      type="button"
+                      disabled={bibSyncBusy}
+                      onclick={handleSyncBibNow}
+                    >
+                      {bibSyncBusy ? '…' : lang === 'en' ? 'Sync now' : 'Sincronizza'}
+                    </button>
+                    <button
+                      type="button"
+                      onclick={() => {
+                        draft.bibtex_auto_sync_path = null;
+                        draft.bibtex_auto_sync_enabled = false;
+                      }}
+                    >
+                      ✕
+                    </button>
+                  {/if}
+                </div>
+                {#if bibSyncMsg}
+                  <div class="notice">{bibSyncMsg}</div>
+                {/if}
+              </div>
+
               <div class="prio-header">
                 <div>
                   <strong>
@@ -1253,11 +1391,15 @@
             </div>
           {:else}
             <div class="shortcuts-list">
-              <div class="sc-row"><kbd>/</kbd> <kbd>Cmd/Ctrl + K</kbd> <span>{lang === 'en' ? 'Focus search bar' : 'Focus sulla ricerca'}</span></div>
-              <div class="sc-row"><kbd>Cmd/Ctrl + R</kbd> <span>{lang === 'en' ? 'Incremental rescan' : 'Riscansione incrementale'}</span></div>
-              <div class="sc-row"><kbd>Cmd/Ctrl + B</kbd> <span>{lang === 'en' ? 'Copy selected BibTeX' : 'Copia BibTeX selezionato'}</span></div>
+              <div class="sc-row"><kbd>/</kbd> <kbd>Cmd/Ctrl + K</kbd> <span>{lang === 'en' ? 'Focus search bar' : 'Focus sulla barra di ricerca'}</span></div>
+              <div class="sc-row"><kbd>Cmd/Ctrl + F</kbd> <span>{lang === 'en' ? 'Find inside open PDF / DjVu' : 'Trova nel documento aperto (PDF / DjVu)'}</span></div>
+              <div class="sc-row"><kbd>Alt + ← / →</kbd> <span>{lang === 'en' ? 'Back / Forward jump history in viewer' : 'Indietro / Avanti nella cronologia di salto del viewer'}</span></div>
+              <div class="sc-row"><kbd>Cmd/Ctrl + S</kbd> <span>{lang === 'en' ? 'Save metadata changes in Inspector' : 'Salva modifiche metadati nell’Ispettore'}</span></div>
+              <div class="sc-row"><kbd>Shift / Cmd + Click</kbd> <span>{lang === 'en' ? 'Multi-select documents for batch actions' : 'Selezione multipla documenti per azioni batch'}</span></div>
+              <div class="sc-row"><kbd>Cmd/Ctrl + B</kbd> <span>{lang === 'en' ? 'Toggle left sidebar' : 'Mostra/nascondi barra laterale sinistra'}</span></div>
+              <div class="sc-row"><kbd>Cmd/Ctrl + R</kbd> <span>{lang === 'en' ? 'Incremental rescan' : 'Riscansione incrementale cartelle'}</span></div>
               <div class="sc-row"><kbd>Cmd/Ctrl + ,</kbd> <span>{lang === 'en' ? 'Open settings' : 'Apri Impostazioni'}</span></div>
-              <div class="sc-row"><kbd>Esc</kbd> <span>{lang === 'en' ? 'Close modal / menu' : 'Chiudi modale / menu'}</span></div>
+              <div class="sc-row"><kbd>Esc</kbd> <span>{lang === 'en' ? 'Close modal / Find bar / popover' : 'Chiudi modale / barra Trova / popover'}</span></div>
             </div>
           {/if}
         </section>

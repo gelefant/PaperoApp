@@ -37,6 +37,10 @@ export interface DocumentListItem {
   ocr_status: 'none' | 'queued' | 'running' | 'done' | 'failed' | string;
   metadata_source?: string | null;
   metadata_verified?: boolean;
+  reading_status?: 'unread' | 'reading' | 'read' | string;
+  is_starred?: boolean;
+  last_opened_at?: number | null;
+  last_page_ord?: number | null;
 }
 
 export interface ContentSearchPassageHit {
@@ -47,6 +51,7 @@ export interface ContentSearchPassageHit {
   score: number;
   text_content: string;
   bboxes: NormalizedRect[];
+  is_alt_formula?: boolean;
 }
 
 export interface ContentSearchDocResult {
@@ -77,6 +82,7 @@ export interface OutlineItem {
 export interface FileViewerInfo {
   file_id: number;
   document_id: number;
+  blake3_hash?: string;
   title: string;
   format: 'pdf' | 'djvu' | string;
   page_count: number;
@@ -85,6 +91,10 @@ export interface FileViewerInfo {
   abs_path: string;
   pages: FilePageInfo[];
   outline: OutlineItem[];
+  last_page_ord?: number | null;
+  zoom_mode?: 'fit-width' | 'fit-page' | 'custom' | string | null;
+  custom_zoom?: number | null;
+  rotation_deg?: number;
 }
 
 export interface ExtractedSpan {
@@ -99,12 +109,33 @@ export interface ViewerTargetPassage {
   text_content: string;
 }
 
+export type BibtexKeyPattern =
+  | 'mr_default'
+  | 'author_year'
+  | 'author_year_word'
+  | 'author_lower_year';
+
+export type BibtexFormat = 'bibtex' | 'biblatex';
+
+export interface CiteKeyPayload {
+  key: string;
+  cite_command: string;
+}
+
+export interface BibtexSyncReport {
+  path: string;
+  count: number;
+}
+
 export interface ViewerTab {
   tabId: string;
   fileId: number;
+  documentId?: number;
   title: string;
   format: string;
   targetPage: number;
+  /** True when opened from a search hit or explicit citation jump (do not override with last_page_ord). */
+  explicitPageJump?: boolean;
   highlightRects: NormalizedRect[];
   matches: ViewerTargetPassage[];
   activeMatchIndex: number;
@@ -174,6 +205,10 @@ export interface UiSettingsPayload {
   auto_backup_enabled?: boolean;
   last_backup_at?: number | null;
   last_backup_bytes?: number | null;
+  bibtex_key_pattern?: BibtexKeyPattern;
+  bibtex_format?: BibtexFormat;
+  bibtex_auto_sync_path?: string | null;
+  bibtex_auto_sync_enabled?: boolean;
 }
 
 export interface HybridSearchStats {
@@ -319,6 +354,9 @@ export interface DocumentMetadataView {
   manual_locked_fields: string[];
   exclude_from_cloud_llm: boolean;
   metadata_verified: boolean;
+  reading_status?: 'unread' | 'reading' | 'read' | string;
+  is_starred?: boolean;
+  collection_ids?: number[];
   tags: string[];
   pending_candidates: CandidateRow[];
 }
@@ -381,7 +419,8 @@ export interface BulkMetadataProgressEvent {
 
 export type WorkCategory = 'all' | 'paper' | 'book';
 export type VerifiedFilter = 'all' | 'unverified' | 'verified';
-export type SortField = 'updated' | 'title' | 'author' | 'year';
+export type ReadingStatus = 'unread' | 'reading' | 'read';
+export type SortField = 'updated' | 'title' | 'author' | 'year' | 'last_opened';
 export type SortDirection = 'asc' | 'desc';
 
 export interface MetadataSearchFilter {
@@ -394,12 +433,30 @@ export interface MetadataSearchFilter {
   msc_prefix?: string | null;
   tag?: string | null;
   cluster_id?: number | null;
+  collection_id?: number | null;
   root_id?: string | null;
   format?: string | null;
   work_category?: WorkCategory | string | null;
   verified_filter?: VerifiedFilter | string | null;
+  reading_status?: ReadingStatus | string | null;
+  starred_only?: boolean | null;
+  recent_only?: boolean | null;
   sort_by?: SortField | null;
   sort_dir?: SortDirection | null;
+}
+
+/** Content search filter (intentionally excludes MSC2020 per Papero design). */
+export interface ContentSearchFilter {
+  root_ids?: string[] | null;
+  tag?: string | null;
+  cluster_id?: number | null;
+  collection_id?: number | null;
+  author?: string | null;
+  year_from?: number | null;
+  year_to?: number | null;
+  work_category?: WorkCategory | string | null;
+  reading_status?: ReadingStatus | string | null;
+  starred_only?: boolean | null;
 }
 
 export interface ImportMetadataReport {
@@ -630,4 +687,125 @@ export interface EmbedProgressStatus {
   running: boolean;
   paused: boolean;
   user_paused: boolean;
+}
+
+export type DocLlmScope = 'selection' | 'page' | 'document';
+
+export type LlmStreamEvent =
+  | { event: 'delta'; text: string }
+  | { event: 'done'; result: LlmAnswerResult }
+  | { event: 'error'; message: string };
+
+export interface FileAnnotation {
+  id: number;
+  blake3_hash: string;
+  page_ord: number;
+  kind: 'highlight' | 'bookmark' | 'note' | string;
+  color: 'yellow' | 'green' | 'blue' | 'pink' | string;
+  rects: NormalizedRect[];
+  quoted_text: string;
+  note_markdown: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface NewFileAnnotation {
+  page_ord: number;
+  kind: 'highlight' | 'bookmark' | 'note';
+  color?: 'yellow' | 'green' | 'blue' | 'pink';
+  rects?: NormalizedRect[];
+  quoted_text?: string;
+  note_markdown?: string;
+}
+
+export interface UpdateFileAnnotation {
+  color?: string | null;
+  note_markdown?: string | null;
+  quoted_text?: string | null;
+}
+
+export interface AnnotationSearchHit {
+  annotation: FileAnnotation;
+  document_id: number | null;
+  file_id: number | null;
+  doc_title: string;
+}
+
+export interface FileReadingState {
+  blake3_hash: string;
+  last_page_ord: number;
+  last_opened_at: number | null;
+  zoom_mode: 'fit-width' | 'fit-page' | 'custom' | string;
+  custom_zoom: number;
+  rotation_deg: number;
+  updated_at: number;
+}
+
+export interface ReadingStatePatch {
+  last_page_ord?: number | null;
+  zoom_mode?: 'fit-width' | 'fit-page' | 'custom' | string | null;
+  custom_zoom?: number | null;
+  rotation_deg?: number | null;
+  touch_opened?: boolean;
+}
+
+export interface CollectionView {
+  id: number;
+  name: string;
+  color_hex: string | null;
+  sort_order: number;
+  document_count: number;
+  document_ids: number[];
+}
+
+export interface SavedSearchView {
+  id: number;
+  name: string;
+  search_mode: 'metadata' | 'content' | string;
+  query_text: string;
+  filter_json: string;
+  sort_order: number;
+  created_at: number;
+}
+
+export interface SimilarDocumentItem {
+  document_id: number;
+  file_id: number;
+  title: string;
+  authors_summary: string;
+  year: number | null;
+  work_type: string;
+  similarity: number;
+}
+
+export interface CitationLinkItem {
+  document_id: number;
+  file_id: number;
+  title: string;
+  authors_summary: string;
+  year: number | null;
+  source: string;
+}
+
+export interface PreprintPublishedNotice {
+  doi: string | null;
+  mr_number: string | null;
+  journal: string | null;
+  year: number | null;
+  title: string | null;
+  source: string;
+}
+
+export interface DocumentRelationsView {
+  similar: SimilarDocumentItem[];
+  cites: CitationLinkItem[];
+  cited_by: CitationLinkItem[];
+  published_notice: PreprintPublishedNotice | null;
+}
+
+export interface SmartPasteApplyResult {
+  kind: 'bibtex' | 'identifiers' | string;
+  summary: string;
+  outcome: ResolveOutcome | null;
+  metadata: DocumentMetadataView;
 }

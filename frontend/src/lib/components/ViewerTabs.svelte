@@ -1,23 +1,29 @@
 <script lang="ts">
-  import type { ViewerTab } from '../types';
+  import type { LlmProvider, ViewerTab } from '../types';
   import UnifiedViewer from './UnifiedViewer.svelte';
 
   interface Props {
     tabs: ViewerTab[];
     activeTabId: string | null;
+    llmProvider?: LlmProvider;
     onSelectTab: (tabId: string) => void;
     onCloseTab: (tabId: string) => void;
     onSelectMatchIndex: (tabId: string, idx: number) => void;
     onOpenExternal: (fileId: number, pageOrd: number) => void;
+    onConsentAccepted?: (provider: LlmProvider) => void;
+    onStatusMessage?: (msg: string) => void;
   }
 
   let {
     tabs,
     activeTabId,
+    llmProvider = 'disabled',
     onSelectTab,
     onCloseTab,
     onSelectMatchIndex,
     onOpenExternal,
+    onConsentAccepted,
+    onStatusMessage,
   }: Props = $props();
 
   const activeTab = $derived(tabs.find((t) => t.tabId === activeTabId) ?? null);
@@ -53,11 +59,15 @@
           <UnifiedViewer
             fileId={activeTab.fileId}
             targetPage={activeTab.targetPage}
+            explicitPageJump={Boolean(activeTab.explicitPageJump)}
             highlightRects={activeTab.highlightRects}
             matches={activeTab.matches}
             activeMatchIndex={activeTab.activeMatchIndex}
+            {llmProvider}
             onSelectMatchIndex={(idx) => onSelectMatchIndex(activeTab.tabId, idx)}
             {onOpenExternal}
+            {onConsentAccepted}
+            {onStatusMessage}
           />
         {/key}
       </div>

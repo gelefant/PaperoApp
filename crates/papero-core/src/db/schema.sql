@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS documents (
     metadata_verified       INTEGER NOT NULL DEFAULT 0,
                             -- 1 when user explicitly checked and confirmed metadata are accurate
     exclude_from_cloud_llm  INTEGER NOT NULL DEFAULT 0,
+    reading_status          TEXT NOT NULL DEFAULT 'unread',
+                            -- 'unread' | 'reading' | 'read'
+    is_starred              INTEGER NOT NULL DEFAULT 0,
+    published_notice_json   TEXT,
+                            -- Cached JSON notice when an arXiv preprint has a published journal version
     minhash_sig             BLOB,             -- 128 x u64 (1024 bytes) MinHash signature of extracted text
     content_modified_notice INTEGER NOT NULL DEFAULT 0, -- Flag set if underlying file was replaced on disk
     created_at              INTEGER NOT NULL,
@@ -279,3 +284,71 @@ CREATE TABLE IF NOT EXISTS index_jobs (
     UNIQUE(file_id, stage)
 );
 CREATE INDEX IF NOT EXISTS idx_index_jobs_stage_status ON index_jobs(stage, status, priority, id);
+
+-- 15. Non-destructive annotations, highlights, page bookmarks & Markdown/LaTeX notes (keyed by blake3_hash)
+CREATE TABLE IF NOT EXISTS file_annotations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    blake3_hash     TEXT NOT NULL,
+    page_ord        INTEGER NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'highlight', -- 'highlight' | 'bookmark' | 'note'
+    color           TEXT NOT NULL DEFAULT 'yellow',    -- 'yellow' | 'green' | 'blue' | 'pink'
+    rects_json      TEXT NOT NULL DEFAULT '[]',        -- JSON array of NormalizedRect
+    quoted_text     TEXT NOT NULL DEFAULT '',
+    note_markdown   TEXT NOT NULL DEFAULT '',
+    search_norm     TEXT NOT NULL DEFAULT '',          -- Math-diacritic-folded text for fast search
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_annotations_hash_page ON file_annotations(blake3_hash, page_ord, id);
+CREATE INDEX IF NOT EXISTS idx_file_annotations_hash_kind ON file_annotations(blake3_hash, kind);
+
+-- 16. Persistent reading position, zoom mode, rotation & last opened timestamp (keyed by blake3_hash)
+CREATE TABLE IF NOT EXISTS file_reading_state (
+    blake3_hash     TEXT PRIMARY KEY,
+    last_page_ord   INTEGER NOT NULL DEFAULT 1,
+    last_opened_at  INTEGER,
+    zoom_mode       TEXT NOT NULL DEFAULT 'fit-width', -- 'fit-width' | 'fit-page' | 'custom'
+    custom_zoom     REAL NOT NULL DEFAULT 1.0,
+    rotation_deg    INTEGER NOT NULL DEFAULT 0,        -- 0 | 90 | 180 | 270
+    updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_reading_state_opened ON file_reading_state(last_opened_at DESC);
+
+-- 17. User collections ("Projects / Reading Lists")
+CREATE TABLE IF NOT EXISTS collections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    color_hex   TEXT,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_documents (
+    collection_id   INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL DEFAULT 0,
+    added_at        INTEGER NOT NULL,
+    PRIMARY KEY (collection_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_collection_docs_doc ON collection_documents(document_id);
+
+-- 18. Saved quick views / searches
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    search_mode TEXT NOT NULL DEFAULT 'metadata', -- 'content' | 'metadata'
+    query_text  TEXT NOT NULL DEFAULT '',
+    filter_json TEXT NOT NULL DEFAULT '{}',
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL
+);
+
+-- 19. Local citation graph between documents in the user's library
+CREATE TABLE IF NOT EXISTS document_citations (
+    citing_doc_id   INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    cited_doc_id    INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    source          TEXT NOT NULL, -- 'extracted_ref' | 'openalex' | 'semanticscholar' | 'crossref'
+    confidence      REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (citing_doc_id, cited_doc_id)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_citations_cited ON document_citations(cited_doc_id);

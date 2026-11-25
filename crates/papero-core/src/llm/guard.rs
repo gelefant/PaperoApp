@@ -1,9 +1,10 @@
 use crate::config::AppConfig;
 use crate::db::repos::docs::ContentSearchDocResult;
 use crate::error::Result;
-use crate::extract::types::NormalizedRect;
-use crate::llm::provider::{LlmPromptPreview, LlmProvider};
-use rusqlite::Connection;
+use crate::extract::types::{unpack_bboxes, NormalizedRect};
+use crate::llm::provider::{DocLlmScope, LlmPromptPreview, LlmProvider};
+use crate::text_norm::normalize_math_text;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 pub const REFUSAL_IT: &str =
@@ -245,6 +246,268 @@ pub fn prepare_grounded_prompt(
         } else if selected_passages.is_empty() && max_input_tokens > base_tokens + 40 {
             // Fit the top passage safely truncated within max_input_tokens.
             let remaining_tokens = max_input_tokens.saturating_sub(base_tokens + estimate_tokens(&header) + 10);
+            let max_chars = remaining_tokens.saturating_mul(3);
+            let truncated: String = passage.text_content.trim().chars().take(max_chars).collect();
+            if !truncated.trim().is_empty() {
+                passage.text_content = format!("{truncated}…");
+                let trunc_block = format!("{header}{}", passage.text_content);
+                running_tokens = base_tokens + estimate_tokens(&trunc_block) + 4;
+                blocks.push(trunc_block);
+                selected_passages.push(passage);
+            } else {
+                passages_dropped_budget += 1;
+            }
+        } else {
+            passages_dropped_budget += 1;
+        }
+    }
+
+    let user_prompt = format!("{query_header}{}", blocks.join("\n\n---\n\n"));
+
+    let preview = LlmPromptPreview {
+        provider,
+        model: config.llm_model.clone(),
+        requires_cloud_consent: !has_cloud_consent(config, provider),
+        estimated_input_tokens: running_tokens,
+        max_input_tokens,
+        max_passages,
+        passages_total,
+        passages_included: selected_passages.len(),
+        passages_excluded_cloud,
+        passages_dropped_budget,
+        excluded_doc_titles,
+    };
+
+    Ok(PreparedPrompt {
+        preview,
+        system_prompt,
+        user_prompt,
+        selected_passages,
+    })
+}
+
+pub fn build_document_grounding_system_prompt(ui_language: &str, doc_title: &str) -> String {
+    let is_en = ui_language.trim().eq_ignore_ascii_case("en");
+    let refusal = if is_en { REFUSAL_EN } else { REFUSAL_IT };
+    if is_en {
+        format!(
+            "You are a precise mathematical research assistant embedded in Papero, currently helping \
+             the reader inspect the single document \"{doc_title}\". \
+             Answer using ONLY facts, definitions, formulas, and theorems present in the provided \
+             excerpts from this document.\n\
+             Strict rules:\n\
+             1. Cite pages inline using the exact bracket format `[p. <page_ord>]` matching the excerpt headers.\n\
+             2. Use clean Markdown and LaTeX (`$...$` inline, `$$...$$` display) for mathematical notation.\n\
+             3. Do NOT extrapolate outside the provided text and do NOT invent page numbers.\n\
+             4. If the provided excerpts do not contain enough information, respond strictly with: \"{refusal}\""
+        )
+    } else {
+        format!(
+            "Sei un assistente di ricerca matematica integrato in Papero che aiuta il lettore a \
+             consultare il documento \"{doc_title}\". \
+             Rispondi basandoti ESCLUSIVAMENTE sui fatti, definizioni, formule e teoremi presenti \
+             negli estratti forniti di questo documento.\n\
+             Regole rigorose:\n\
+             1. Cita sempre la pagina nel formato esatto `[p. <page_ord>]` corrispondente alle intestazioni.\n\
+             2. Usa Markdown pulito e LaTeX (`$...$` inline, `$$...$$` display) per le formule matematiche.\n\
+             3. NON aggiungere conoscenze esterne agli estratti forniti e NON inventare numeri di pagina.\n\
+             4. Se gli estratti forniti non contengono informazioni sufficienti per rispondere, \
+                rispondi esattamente con: \"{refusal}\""
+        )
+    }
+}
+
+/// Prepares a grounded prompt scoped strictly to a single open document, current page, or text
+/// selection inside the viewer, enforcing `exclude_from_cloud_llm` (both document and source folder)
+/// and token/passage budgets before any network call.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_document_scoped_prompt(
+    conn: &Connection,
+    config: &AppConfig,
+    document_id: i64,
+    file_id: i64,
+    scope: DocLlmScope,
+    page_ord: u32,
+    selection_text: Option<&str>,
+    question: &str,
+    max_passages_override: Option<usize>,
+    max_input_tokens_override: Option<usize>,
+) -> Result<PreparedPrompt> {
+    let provider = config.llm_provider;
+    let max_passages = max_passages_override
+        .unwrap_or(config.llm_max_passages)
+        .clamp(1, 40);
+    let max_input_tokens = max_input_tokens_override
+        .unwrap_or(config.llm_max_input_tokens)
+        .clamp(256, 64_000);
+
+    let doc_title: String = conn
+        .query_row(
+            "SELECT title FROM documents WHERE id = ?1",
+            params![document_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| format!("Document #{document_id}"));
+
+    let is_excluded = if provider.is_cloud() {
+        let excl = query_cloud_exclusion_map(conn, &[document_id])?;
+        *excl.get(&document_id).unwrap_or(&false)
+    } else {
+        false
+    };
+
+    let mut raw_passages: Vec<SelectedPassage> = Vec::new();
+    let trimmed_sel = selection_text.map(str::trim).filter(|s| !s.is_empty());
+
+    match scope {
+        DocLlmScope::Selection if trimmed_sel.is_some() => {
+            raw_passages.push(SelectedPassage {
+                passage_id: 0,
+                document_id,
+                file_id,
+                doc_title: doc_title.clone(),
+                page_ord: page_ord.max(1),
+                printed_label: None,
+                score: 10.0,
+                text_content: trimmed_sel.unwrap().to_string(),
+                bboxes: Vec::new(),
+            });
+        }
+        DocLlmScope::Selection | DocLlmScope::Page => {
+            let mut stmt = conn.prepare(
+                "SELECT id, page_ord, printed_label, text_content, bboxes_blob
+                 FROM passages
+                 WHERE file_id = ?1 AND page_ord = ?2
+                 ORDER BY chunk_index ASC",
+            )?;
+            let rows = stmt.query_map(params![file_id, page_ord.max(1) as i64], |r| {
+                let blob: Vec<u8> = r.get(4)?;
+                Ok(SelectedPassage {
+                    passage_id: r.get::<_, i64>(0)? as u64,
+                    document_id,
+                    file_id,
+                    doc_title: doc_title.clone(),
+                    page_ord: r.get::<_, i64>(1)? as u32,
+                    printed_label: r.get(2)?,
+                    score: 5.0,
+                    text_content: r.get(3)?,
+                    bboxes: unpack_bboxes(&blob),
+                })
+            })?;
+            for row in rows {
+                raw_passages.push(row?);
+            }
+        }
+        DocLlmScope::Document => {
+            // Load indexed passages for this file (capped generously for fast in-memory ranking).
+            let mut stmt = conn.prepare(
+                "SELECT id, page_ord, printed_label, text_content, bboxes_blob
+                 FROM passages
+                 WHERE file_id = ?1
+                 ORDER BY page_ord ASC, chunk_index ASC
+                 LIMIT 1200",
+            )?;
+            let all_rows: Vec<SelectedPassage> = stmt
+                .query_map(params![file_id], |r| {
+                    let blob: Vec<u8> = r.get(4)?;
+                    Ok(SelectedPassage {
+                        passage_id: r.get::<_, i64>(0)? as u64,
+                        document_id,
+                        file_id,
+                        doc_title: doc_title.clone(),
+                        page_ord: r.get::<_, i64>(1)? as u32,
+                        printed_label: r.get(2)?,
+                        score: 0.0,
+                        text_content: r.get(3)?,
+                        bboxes: unpack_bboxes(&blob),
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            let q_terms: Vec<String> = normalize_math_text(question)
+                .split_whitespace()
+                .filter(|t| t.len() >= 3)
+                .map(ToOwned::to_owned)
+                .collect();
+
+            if !all_rows.is_empty() {
+                let mut scored: Vec<(f32, usize, SelectedPassage)> = all_rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, mut p)| {
+                        let norm_text = normalize_math_text(&p.text_content);
+                        let mut score = 0.0f32;
+                        for term in &q_terms {
+                            if norm_text.contains(term.as_str()) {
+                                score += 2.0;
+                            }
+                        }
+                        // Mild proximity boost for current reading page and opening abstract/intro.
+                        let dist = p.page_ord.abs_diff(page_ord.max(1));
+                        if dist == 0 {
+                            score += 1.25;
+                        } else if dist <= 2 {
+                            score += 0.4;
+                        }
+                        if p.page_ord <= 2 {
+                            score += 0.35;
+                        }
+                        p.score = score;
+                        (score, idx, p)
+                    })
+                    .collect();
+
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                raw_passages = scored.into_iter().map(|(_, _, p)| p).collect();
+            }
+        }
+    }
+
+    let passages_total = raw_passages.len();
+    let (allowed, passages_excluded_cloud, excluded_doc_titles) = if is_excluded {
+        (Vec::new(), passages_total, vec![doc_title.clone()])
+    } else {
+        (raw_passages, 0, Vec::new())
+    };
+
+    let system_prompt = build_document_grounding_system_prompt(&config.ui_language, &doc_title);
+    let scope_label = match scope {
+        DocLlmScope::Selection => format!("Selected excerpt (page {})", page_ord.max(1)),
+        DocLlmScope::Page => format!("Current page ({})", page_ord.max(1)),
+        DocLlmScope::Document => format!("Document \"{doc_title}\""),
+    };
+    let query_header = format!(
+        "Scope: {scope_label}\nUser question:\n{}\n\nExcerpts:\n",
+        question.trim()
+    );
+    let base_tokens = estimate_tokens(&system_prompt) + estimate_tokens(&query_header) + 16;
+
+    let mut running_tokens = base_tokens;
+    let mut selected_passages = Vec::new();
+    let mut blocks = Vec::new();
+    let mut passages_dropped_budget = 0usize;
+
+    for (idx, mut passage) in allowed.into_iter().enumerate() {
+        if idx >= max_passages {
+            passages_dropped_budget += 1;
+            continue;
+        }
+        let header = format!("[p. {}]\n", passage.page_ord);
+        let full_block = format!("{header}{}", passage.text_content.trim());
+        let block_tokens = estimate_tokens(&full_block) + 4;
+
+        if running_tokens + block_tokens <= max_input_tokens {
+            running_tokens += block_tokens;
+            blocks.push(full_block);
+            selected_passages.push(passage);
+        } else if selected_passages.is_empty() && max_input_tokens > base_tokens + 40 {
+            let remaining_tokens =
+                max_input_tokens.saturating_sub(base_tokens + estimate_tokens(&header) + 10);
             let max_chars = remaining_tokens.saturating_mul(3);
             let truncated: String = passage.text_content.trim().chars().take(max_chars).collect();
             if !truncated.trim().is_empty() {

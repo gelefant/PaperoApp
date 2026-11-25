@@ -3252,7 +3252,7 @@ pub fn get_document_metadata(db: &Database, document_id: i64) -> Result<Document
                 arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer, zbl_number,
                 url, msc_primary, msc_primary_status, abstract_text, raw_mrlookup_bibtex,
                 metadata_source, metadata_license_note, manual_locked_fields, exclude_from_cloud_llm,
-                metadata_verified
+                metadata_verified, reading_status, is_starred
          FROM documents WHERE id = ?1",
         params![document_id],
         |r| {
@@ -3294,6 +3294,11 @@ pub fn get_document_metadata(db: &Database, document_id: i64) -> Result<Document
                 manual_locked_fields: locked,
                 exclude_from_cloud_llm: r.get::<_, i64>(30)? != 0,
                 metadata_verified: r.get::<_, i64>(31)? != 0,
+                reading_status: r
+                    .get::<_, Option<String>>(32)?
+                    .unwrap_or_else(|| "unread".to_string()),
+                is_starred: r.get::<_, Option<i64>>(33)?.unwrap_or(0) != 0,
+                collection_ids: Vec::new(),
                 tags: Vec::new(),
                 pending_candidates: Vec::new(),
             })
@@ -3337,6 +3342,17 @@ pub fn get_document_metadata(db: &Database, document_id: i64) -> Result<Document
              WHERE dt.document_id = ?1 ORDER BY t.name ASC",
         )?;
         doc.tags = st
+            .query_map(params![document_id], |r| r.get(0))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+    }
+
+    {
+        let mut st = conn.prepare(
+            "SELECT collection_id FROM collection_documents
+             WHERE document_id = ?1 ORDER BY collection_id ASC",
+        )?;
+        doc.collection_ids = st
             .query_map(params![document_id], |r| r.get(0))?
             .filter_map(std::result::Result::ok)
             .collect();
@@ -3417,6 +3433,11 @@ pub fn get_documents_metadata_for_export(
                 manual_locked_fields: locked,
                 exclude_from_cloud_llm: r.get::<_, i64>(31)? != 0,
                 metadata_verified: r.get::<_, i64>(32)? != 0,
+                reading_status: r
+                    .get::<_, Option<String>>(33)?
+                    .unwrap_or_else(|| "unread".to_string()),
+                is_starred: r.get::<_, Option<i64>>(34)?.unwrap_or(0) != 0,
+                collection_ids: Vec::new(),
                 tags: Vec::new(),
                 pending_candidates: Vec::new(),
             },
@@ -3428,7 +3449,7 @@ pub fn get_documents_metadata_for_export(
         arxiv_id, arxiv_version, mr_number, mr_number_display, mr_reviewer, zbl_number,
         url, msc_primary, msc_primary_status, abstract_text, raw_mrlookup_bibtex,
         metadata_source, metadata_license_note, manual_locked_fields, exclude_from_cloud_llm,
-        metadata_verified FROM documents";
+        metadata_verified, reading_status, is_starred FROM documents";
 
     if document_ids.is_empty() {
         let sql = format!("{SELECT_COLS} ORDER BY updated_at DESC, id DESC");
@@ -3549,13 +3570,21 @@ pub struct MetadataSearchFilter {
     pub tag: Option<String>,
     #[serde(default)]
     pub cluster_id: Option<i64>,
+    #[serde(default)]
+    pub collection_id: Option<i64>,
     pub root_id: Option<String>,
     pub format: Option<String>,
     #[serde(default)]
     pub work_category: Option<String>, // "all" | "paper" | "book"
     #[serde(default)]
     pub verified_filter: Option<String>, // "all" | "verified" | "unverified"
-    pub sort_by: Option<String>, // "updated" | "title" | "year" | "author"
+    #[serde(default)]
+    pub reading_status: Option<String>, // "unread" | "reading" | "read"
+    #[serde(default)]
+    pub starred_only: Option<bool>,
+    #[serde(default)]
+    pub recent_only: Option<bool>,
+    pub sort_by: Option<String>, // "updated" | "title" | "year" | "author" | "last_opened"
     #[serde(default)]
     pub sort_dir: Option<String>, // "asc" | "desc"
 }
@@ -3595,6 +3624,9 @@ pub fn search_documents_metadata(
         "author" => format!(
             "CASE WHEN TRIM(d.authors_norm_summary) = '' THEN 1 ELSE 0 END ASC, d.authors_norm_summary {dir_sql}, d.title_norm ASC"
         ),
+        "last_opened" => format!(
+            "CASE WHEN rs.last_opened_at IS NULL THEN 1 ELSE 0 END ASC, rs.last_opened_at {dir_sql}, d.updated_at DESC"
+        ),
         _ => format!("d.updated_at {dir_sql}, d.id {dir_sql}"),
     };
 
@@ -3618,6 +3650,30 @@ pub fn search_documents_metadata(
         Some("verified") => "AND d.metadata_verified != 0",
         Some("unverified") => "AND d.metadata_verified = 0",
         _ => "",
+    };
+
+    let reading_clause = match filter
+        .reading_status
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("unread") => "AND d.reading_status = 'unread'",
+        Some("reading") => "AND d.reading_status = 'reading'",
+        Some("read") => "AND d.reading_status = 'read'",
+        _ => "",
+    };
+
+    let starred_clause = if filter.starred_only == Some(true) {
+        "AND d.is_starred != 0"
+    } else {
+        ""
+    };
+
+    let recent_clause = if filter.recent_only == Some(true) {
+        "AND rs.last_opened_at IS NOT NULL"
+    } else {
+        ""
     };
 
     let text_q = norm_opt(&filter.text);
@@ -3644,10 +3700,15 @@ pub fn search_documents_metadata(
                 f.ocr_status,
                 d.metadata_source,
                 d.metadata_verified,
-                d.title_norm
+                d.title_norm,
+                d.reading_status,
+                d.is_starred,
+                rs.last_opened_at,
+                rs.last_page_ord
          FROM files f
          JOIN documents d ON d.id = f.document_id
          JOIN source_roots sr ON sr.id = f.root_id
+         LEFT JOIN file_reading_state rs ON rs.blake3_hash = f.blake3_hash
          WHERE (?1 IS NULL OR f.root_id = ?1)
            AND (?2 IS NULL OR f.format = ?2)
            AND (?3 IS NULL OR d.year >= ?3)
@@ -3668,8 +3729,15 @@ pub fn search_documents_metadata(
                 SELECT 1 FROM document_clusters dc
                 WHERE dc.document_id = d.id AND dc.cluster_id = ?7
            ))
+           AND (?8 IS NULL OR EXISTS (
+                SELECT 1 FROM collection_documents cd
+                WHERE cd.document_id = d.id AND cd.collection_id = ?8
+           ))
            {cat_clause}
            {verified_clause}
+           {reading_clause}
+           {starred_clause}
+           {recent_clause}
          GROUP BY d.id
          ORDER BY {order_clause}"
     );
@@ -3754,6 +3822,7 @@ pub fn search_documents_metadata(
         p_msc,
         p_tag,
         filter.cluster_id,
+        filter.collection_id,
     ])?;
 
     let mut out = Vec::new();
@@ -3862,6 +3931,12 @@ pub fn search_documents_metadata(
             ocr_status: r.get(18)?,
             metadata_source: r.get(19)?,
             metadata_verified: r.get::<_, i64>(20)? != 0,
+            reading_status: r
+                .get::<_, Option<String>>(22)?
+                .unwrap_or_else(|| "unread".to_string()),
+            is_starred: r.get::<_, Option<i64>>(23)?.unwrap_or(0) != 0,
+            last_opened_at: r.get(24)?,
+            last_page_ord: r.get::<_, Option<i64>>(25)?.map(|v| v.max(1) as u32),
         });
         fallback_norm_summaries.push(raw_authors_norm);
     }

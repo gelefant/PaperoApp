@@ -10,7 +10,9 @@
     WorkCategory,
   } from '../types';
   import { tr, type Lang } from '../i18n';
-  import { buildHighlightedSnippet, splitAnswerWithCitations } from '../viewerUtils';
+  import { hasMathDelimiters } from '../katexLoader';
+  import { buildHighlightedSnippet } from '../viewerUtils';
+  import MathMarkdown from './MathMarkdown.svelte';
 
   interface Props {
     lang?: Lang;
@@ -18,10 +20,21 @@
     results: ContentSearchDocResult[];
     searchStats?: HybridSearchStats | null;
     workCategory?: WorkCategory;
+    activeFilterChips?: string[];
+    authorFilter?: string;
+    yearFromFilter?: number | null;
+    yearToFilter?: number | null;
     onChangeWorkCategory?: (cat: WorkCategory) => void;
+    onChangeContentMetaFilters?: (patch: {
+      author?: string | null;
+      year_from?: number | null;
+      year_to?: number | null;
+    }) => void;
+    onClearContentFilters?: () => void;
     llmProvider?: LlmProvider;
     llmPreview?: LlmPromptPreview | null;
     llmAnswer?: LlmAnswerResult | null;
+    llmStreamText?: string;
     llmLoading?: boolean;
     llmError?: string;
     onGenerateAnswer?: () => void;
@@ -37,10 +50,17 @@
     results,
     searchStats = null,
     workCategory = 'all',
+    activeFilterChips = [],
+    authorFilter = '',
+    yearFromFilter = null,
+    yearToFilter = null,
     onChangeWorkCategory,
+    onChangeContentMetaFilters,
+    onClearContentFilters,
     llmProvider = 'disabled',
     llmPreview = null,
     llmAnswer = null,
+    llmStreamText = '',
     llmLoading = false,
     llmError = '',
     onGenerateAnswer,
@@ -50,9 +70,50 @@
     onContextMenu,
   }: Props = $props();
   let collapsed = $state<Record<number, boolean>>({});
-  let answerSegments = $derived(
-    llmAnswer ? splitAnswerWithCitations(llmAnswer.answer_markdown, llmAnswer.citations) : []
-  );
+  let showAdvFilters = $state(false);
+  let authorDraft = $state('');
+  let yearFromDraft = $state('');
+  let yearToDraft = $state('');
+
+  $effect(() => {
+    authorDraft = authorFilter ?? '';
+    yearFromDraft = yearFromFilter !== null && yearFromFilter !== undefined ? String(yearFromFilter) : '';
+    yearToDraft = yearToFilter !== null && yearToFilter !== undefined ? String(yearToFilter) : '';
+  });
+
+  function applyAdvFilters(e: Event) {
+    e.preventDefault();
+    onChangeContentMetaFilters?.({
+      author: authorDraft.trim() || null,
+      year_from: yearFromDraft.trim() ? Number(yearFromDraft) : null,
+      year_to: yearToDraft.trim() ? Number(yearToDraft) : null,
+    });
+  }
+
+  function handleMarkdownCiteClick(docId: number, pageOrd: number) {
+    if (!onOpenCitation) return;
+    const exact = llmAnswer?.citations.find(
+      (c) => c.document_id === docId && c.page_ord === pageOrd
+    );
+    if (exact) {
+      onOpenCitation(exact);
+      return;
+    }
+    const matchingDoc = results.find((r) => r.document_id === docId);
+    if (matchingDoc) {
+      const pass = matchingDoc.passages.find((p) => p.page_ord === pageOrd);
+      onOpenCitation({
+        marker: `[Doc #${docId}, p. ${pageOrd}]`,
+        document_id: docId,
+        file_id: pass?.file_id ?? matchingDoc.file_id,
+        page_ord: pageOrd,
+        printed_label: pass?.printed_label ?? null,
+        doc_title: matchingDoc.title,
+        bboxes: pass?.bboxes ?? [],
+        snippet: pass?.text_content ?? '',
+      });
+    }
+  }
 
   function providerLabel(p: LlmProvider): string {
     switch (p) {
@@ -126,7 +187,51 @@
           </button>
         </div>
       {/if}
+      {#if onChangeContentMetaFilters}
+        <button
+          type="button"
+          class="adv-filter-toggle"
+          class:active={showAdvFilters || Boolean(authorFilter) || yearFromFilter !== null || yearToFilter !== null}
+          title={lang === 'en' ? 'Filter content search by author and year range' : 'Filtra ricerca nel contenuto per autore e intervallo anni'}
+          onclick={() => (showAdvFilters = !showAdvFilters)}
+        >
+          {lang === 'en' ? 'Filters' : 'Filtri'}
+        </button>
+      {/if}
     </div>
+    {#if activeFilterChips.length > 0}
+      <div class="active-filter-chips">
+        {#each activeFilterChips as chip (chip)}
+          <span class="af-chip">{chip}</span>
+        {/each}
+        {#if onClearContentFilters}
+          <button type="button" class="af-clear" onclick={onClearContentFilters}>✕</button>
+        {/if}
+      </div>
+    {/if}
+    {#if showAdvFilters && onChangeContentMetaFilters}
+      <form class="adv-filter-row" onsubmit={applyAdvFilters}>
+        <input
+          type="text"
+          class="adv-input"
+          placeholder={lang === 'en' ? 'Author…' : 'Autore…'}
+          bind:value={authorDraft}
+        />
+        <input
+          type="number"
+          class="adv-year"
+          placeholder={lang === 'en' ? 'From' : 'Da'}
+          bind:value={yearFromDraft}
+        />
+        <input
+          type="number"
+          class="adv-year"
+          placeholder={lang === 'en' ? 'To' : 'A'}
+          bind:value={yearToDraft}
+        />
+        <button type="submit" class="adv-apply">OK</button>
+      </form>
+    {/if}
     <span class="hint">{lang === 'en' ? 'Double-click passage or document to open' : 'Doppio clic sul passaggio o sul documento'}</span>
   </div>
   {#if llmProvider !== 'disabled' && results.length > 0}
@@ -171,45 +276,41 @@
     <div class="llm-error">{llmError}</div>
   {/if}
 
-  {#if llmAnswer}
-    <section class="llm-answer" class:refused={llmAnswer.refused}>
+  {#if llmAnswer || (llmLoading && llmStreamText)}
+    <section class="llm-answer" class:refused={llmAnswer?.refused}>
       <header class="llm-ans-head">
         <div class="llm-ans-title">
           <strong>{tr(lang, 'llmAnswerHeading')}</strong>
-          <span class="llm-chip">{llmAnswer.model}</span>
-          {#if llmAnswer.refused}
+          {#if llmAnswer?.model || llmPreview?.model}
+            <span class="llm-chip">{llmAnswer?.model ?? llmPreview?.model}</span>
+          {/if}
+          {#if llmAnswer?.refused}
             <span class="llm-warn-chip">
               {lang === 'en' ? 'Insufficient passage support' : 'Informazioni insufficienti nei passaggi'}
             </span>
           {/if}
         </div>
         <span class="llm-usage">
-          {#if llmAnswer.usage.input_tokens !== null || llmAnswer.usage.output_tokens !== null}
+          {#if llmAnswer && (llmAnswer.usage.input_tokens !== null || llmAnswer.usage.output_tokens !== null)}
             Token: in {llmAnswer.usage.input_tokens ?? '?'} · out {llmAnswer.usage.output_tokens ?? '?'}{#if llmAnswer.usage.total_tokens !== null} · tot {llmAnswer.usage.total_tokens}{/if}
-          {:else if llmAnswer.refusal_reason}
+          {:else if llmAnswer?.refusal_reason}
             {llmAnswer.refusal_reason}
+          {:else if llmLoading}
+            streaming…
           {/if}
         </span>
       </header>
       <div class="llm-ans-body">
-        {#each answerSegments as seg, idx (idx)}
-          {#if seg.kind === 'text'}
-            {seg.text}
-          {:else if seg.citation}
-            <button
-              type="button"
-              class="cite-pill"
-              title={`${seg.citation.doc_title} — p. ${seg.citation.page_ord}`}
-              onclick={() => onOpenCitation?.(seg.citation!)}
-            >
-              {seg.label}
-            </button>
-          {:else}
-            <span class="cite-unresolved">{seg.label}</span>
-          {/if}
-        {/each}
+        <MathMarkdown
+          text={llmAnswer ? llmAnswer.answer_markdown : llmStreamText}
+          clickableCitations={true}
+          onCitationClick={handleMarkdownCiteClick}
+        />
+        {#if llmLoading}
+          <span class="stream-cursor" aria-hidden="true">▍</span>
+        {/if}
       </div>
-      {#if llmAnswer.citations.length > 0}
+      {#if llmAnswer && llmAnswer.citations.length > 0}
         <div class="llm-cites-foot">
           <span class="cites-label">{lang === 'en' ? 'Sources:' : 'Fonti:'}</span>
           {#each llmAnswer.citations as c (c.marker + '-' + c.file_id + '-' + c.page_ord)}
@@ -275,7 +376,13 @@
                     </span>
                     <span class="pass-score">{pass.score.toFixed(2)}</span>
                   </div>
-                  <div class="snippet">{buildHighlightedSnippet(pass.text_content, query)}</div>
+                  <div class="snippet">
+                    {#if pass.is_alt_formula || hasMathDelimiters(pass.text_content)}
+                      <MathMarkdown text={buildHighlightedSnippet(pass.text_content, query)} compact={true} />
+                    {:else}
+                      {buildHighlightedSnippet(pass.text_content, query)}
+                    {/if}
+                  </div>
                 </div>
               {/each}
             </div>
@@ -537,30 +644,7 @@
   .llm-ans-body {
     font-size: 13px;
     line-height: 1.55;
-    white-space: pre-wrap;
     color: var(--text);
-  }
-  .cite-pill {
-    display: inline-block;
-    padding: 0 5px;
-    margin: 0 1px;
-    border-radius: 4px;
-    border: 1px solid var(--accent);
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .cite-pill:hover {
-    background: var(--accent);
-    color: #fff;
-  }
-  .cite-unresolved {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    color: var(--text-muted);
   }
   .llm-cites-foot {
     display: flex;
@@ -589,5 +673,74 @@
   .cite-foot-btn:hover {
     border-color: var(--accent);
     color: var(--accent);
+  }
+  .adv-filter-toggle {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .adv-filter-toggle.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .active-filter-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+  }
+  .af-chip {
+    font-size: 10.5px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .af-clear {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .adv-filter-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .adv-input {
+    flex: 1;
+    min-width: 0;
+    height: 24px;
+    font-size: 11.5px;
+    padding: 2px 6px;
+  }
+  .adv-year {
+    width: 60px;
+    height: 24px;
+    font-size: 11.5px;
+    padding: 2px 5px;
+  }
+  .adv-apply {
+    height: 24px;
+    font-size: 11px;
+    padding: 0 8px;
+  }
+  .stream-cursor {
+    color: var(--accent);
+    animation: cr-blink 0.9s steps(2, start) infinite;
+  }
+  @keyframes cr-blink {
+    to {
+      opacity: 0;
+    }
   }
 </style>

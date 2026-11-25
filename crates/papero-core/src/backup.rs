@@ -1033,4 +1033,113 @@ mod tests {
         assert!(validate_safe_rel_path("C:\\papero.db").is_err());
         assert!(validate_safe_rel_path("/etc/passwd").is_err());
     }
+
+    #[test]
+    fn backup_v2_preserves_v7_annotations_reading_state_collections_and_saved_searches() {
+        use crate::db::repos::annotations::{
+            create_annotation_for_file, get_reading_state_for_file, list_annotations_for_file,
+            set_document_reading_status, set_document_starred, upsert_reading_state_for_file,
+            NewFileAnnotation, ReadingStatePatch,
+        };
+        use crate::db::repos::collections::{
+            add_documents_to_collection, create_collection, create_saved_search, list_collections,
+            list_saved_searches,
+        };
+        use crate::db::repos::docs::{insert_file_record, NewFileRecord};
+        use crate::db::repos::roots::{insert_source_root, NewSourceRoot};
+        use crate::extract::types::NormalizedRect;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_paths = AppPaths::from_data_dir(tmp.path().join("src_v7"));
+        src_paths.ensure_dirs().unwrap();
+        let src_db = Database::open(&src_paths.db_path, 2).unwrap();
+
+        let (doc_id, file_id) = {
+            let w = src_db.writer();
+            insert_source_root(
+                &w,
+                &NewSourceRoot {
+                    id: "r1".into(),
+                    label: "Library".into(),
+                    root_path: tmp.path().to_string_lossy().into_owned(),
+                    is_network_or_cloud: false,
+                },
+            )
+            .unwrap();
+            let did = create_heuristic_document(&w, "Harmonic Analysis").unwrap();
+            let fid = insert_file_record(
+                &w,
+                &NewFileRecord {
+                    document_id: did,
+                    root_id: "r1",
+                    rel_path: "harmonic.pdf",
+                    format: "pdf",
+                    size_bytes: 512,
+                    mtime_ns: 1,
+                    blake3_hash: "blake3_harmonic_v7",
+                    index_state: "ready",
+                },
+            )
+            .unwrap();
+            create_annotation_for_file(
+                &w,
+                fid,
+                &NewFileAnnotation {
+                    page_ord: 9,
+                    kind: "highlight".into(),
+                    color: "green".into(),
+                    rects: vec![NormalizedRect {
+                        x: 0.1,
+                        y: 0.2,
+                        w: 0.5,
+                        h: 0.03,
+                    }],
+                    quoted_text: "Calderón–Zygmund".into(),
+                    note_markdown: "Key bound $\\|Tf\\|_p \\le C_p \\|f\\|_p$".into(),
+                },
+            )
+            .unwrap();
+            upsert_reading_state_for_file(
+                &w,
+                fid,
+                &ReadingStatePatch {
+                    last_page_ord: Some(45),
+                    zoom_mode: Some("custom".into()),
+                    custom_zoom: Some(1.25),
+                    rotation_deg: Some(90),
+                    touch_opened: true,
+                },
+            )
+            .unwrap();
+            set_document_reading_status(&w, did, "reading").unwrap();
+            set_document_starred(&w, did, true).unwrap();
+            let col = create_collection(&w, "Course Notes", Some("#10b981")).unwrap();
+            add_documents_to_collection(&w, col.id, &[did]).unwrap();
+            create_saved_search(&w, "Reading now", "metadata", "", r#"{"reading_status":"reading"}"#)
+                .unwrap();
+            (did, fid)
+        };
+
+        let archive = tmp.path().join("v7.papero-backup");
+        create_backup_bundle(&src_paths, &src_db, &archive).unwrap();
+
+        let dst_paths = AppPaths::from_data_dir(tmp.path().join("dst_v7"));
+        dst_paths.ensure_dirs().unwrap();
+        restore_backup_bundle(&dst_paths, &archive).unwrap();
+
+        let restored_db = Database::open(&dst_paths.db_path, 2).unwrap();
+        let r = restored_db.reader();
+        let anns = list_annotations_for_file(&r, file_id).unwrap();
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].color, "green");
+        let rs = get_reading_state_for_file(&r, file_id).unwrap().unwrap();
+        assert_eq!(rs.last_page_ord, 45);
+        assert_eq!(rs.rotation_deg, 90);
+        let cols = list_collections(&r).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].document_ids, vec![doc_id]);
+        let saved = list_saved_searches(&r).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "Reading now");
+    }
 }

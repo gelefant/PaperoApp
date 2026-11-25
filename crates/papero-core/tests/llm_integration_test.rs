@@ -9,8 +9,9 @@ use papero_core::db::Database;
 use papero_core::extract::types::NormalizedRect;
 use papero_core::index::bm25::Bm25Index;
 use papero_core::llm::{
-    accept_cloud_consent, generate_grounded_answer, list_models, prepare_grounded_prompt,
-    verify_provider_key, LlmProvider, REFUSAL_IT,
+    accept_cloud_consent, generate_grounded_answer, generate_grounded_answer_streaming,
+    list_models, prepare_document_scoped_prompt, prepare_grounded_prompt,
+    send_prepared_prompt_streaming, verify_provider_key, DocLlmScope, LlmProvider, REFUSAL_IT,
 };
 use rusqlite::params;
 use std::sync::{Arc, Mutex};
@@ -189,6 +190,7 @@ fn sample_results() -> Vec<ContentSearchDocResult> {
                 score: 9.5,
                 text_content: "TOP_SECRET_DOC_TOKEN_DO_NOT_SEND".to_string(),
                 bboxes: vec![],
+                is_alt_formula: false,
             }],
         },
         ContentSearchDocResult {
@@ -208,6 +210,7 @@ fn sample_results() -> Vec<ContentSearchDocResult> {
                 score: 8.5,
                 text_content: "TOP_SECRET_FOLDER_TOKEN_DO_NOT_SEND".to_string(),
                 bboxes: vec![],
+                is_alt_formula: false,
             }],
         },
         ContentSearchDocResult {
@@ -232,6 +235,7 @@ fn sample_results() -> Vec<ContentSearchDocResult> {
                     w: 0.72,
                     h: 0.05,
                 }],
+                is_alt_formula: false,
             }],
         },
     ]
@@ -540,4 +544,216 @@ async fn live_model_listing_token_usage_and_http_error_masking_for_all_providers
         .any(|w| w == gemini_secret.as_bytes()));
     let cfg_disk = std::fs::read_to_string(&paths.config_path).unwrap();
     assert!(!cfg_disk.contains(gemini_secret));
+}
+
+#[tokio::test]
+async fn streaming_deltas_and_document_scoped_qa_work_across_providers_and_enforce_privacy() {
+    let dir = tempdir().unwrap();
+    let (db, allowed_doc_id, excluded_doc_id, excluded_folder_doc_id) =
+        setup_test_library_db(dir.path());
+
+    // Insert indexed passage on page 58 for allowed_doc_id (file_id = 100)
+    {
+        let w = db.writer();
+        let blob = papero_core::extract::types::pack_bboxes(&[NormalizedRect {
+            x: 0.1,
+            y: 0.2,
+            w: 0.8,
+            h: 0.05,
+        }]);
+        w.execute(
+            "INSERT INTO passages (id, document_id, file_id, page_ord, printed_label, chunk_index, is_alt_formula, token_count, text_content, bboxes_blob)
+             VALUES (9001, ?1, 100, 58, '58', 0, 0, 20, 'Theorem 3.2 (Hahn-Banach): Every continuous linear functional extends.', ?2)",
+            params![allowed_doc_id, blob],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO passages (id, document_id, file_id, page_ord, printed_label, chunk_index, is_alt_formula, token_count, text_content, bboxes_blob)
+             VALUES (9002, ?1, 200, 1, '1', 0, 0, 10, 'SECRET_DOC_PASSAGE', ?2)",
+            params![excluded_doc_id, Vec::<u8>::new()],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO passages (id, document_id, file_id, page_ord, printed_label, chunk_index, is_alt_formula, token_count, text_content, bboxes_blob)
+             VALUES (9003, ?1, 300, 1, '1', 0, 0, 10, 'SECRET_FOLDER_PASSAGE', ?2)",
+            params![excluded_folder_doc_id, Vec::<u8>::new()],
+        )
+        .unwrap();
+    }
+
+    // 1. OpenAI SSE streaming with multi-byte UTF-8 math symbols + usage chunk
+    let openai_sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"By Hahn-Banach, $\\\\forall f$, \"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"every functional extends [p. 58].\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":60,\"completion_tokens\":15,\"total_tokens\":75}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_string();
+
+    // 2. Ollama NDJSON streaming
+    let ollama_ndjson = concat!(
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"Hahn-Banach \"},\"done\":false}\n",
+        "{\"message\":{\"role\":\"assistant\",\"content\":\"holds [Doc #10, p. 58].\"},\"done\":true,\"prompt_eval_count\":33,\"eval_count\":7}\n"
+    )
+    .to_string();
+
+    // 3. Anthropic SSE streaming
+    let anthropic_sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Theorem 3.2 [p. 58].\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":8}}\n\n"
+    )
+    .to_string();
+
+    // 4. Gemini SSE streaming
+    let gemini_sse = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Norm-preserving \"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"extension [p. 58].\"}]} }],\"usageMetadata\":{\"promptTokenCount\":41,\"candidatesTokenCount\":6,\"totalTokenCount\":47}}\n\n"
+    )
+    .to_string();
+
+    let (mock_url, _cap) = spawn_mock_http_server(vec![
+        (200, vec![], openai_sse),
+        (200, vec![], ollama_ndjson),
+        (200, vec![], anthropic_sse),
+        (200, vec![], gemini_sse),
+    ])
+    .await;
+
+    let mut cfg = AppConfig {
+        llm_provider: LlmProvider::OpenAi,
+        llm_model: Some("gpt-4o-mini".to_string()),
+        ..Default::default()
+    };
+    accept_cloud_consent(&mut cfg, LlmProvider::OpenAi);
+    accept_cloud_consent(&mut cfg, LlmProvider::Anthropic);
+    accept_cloud_consent(&mut cfg, LlmProvider::Gemini);
+
+    let key = SecretApiKey::new("sk-stream-test");
+
+    // Document-scoped Q&A on excluded document MUST be stripped for cloud provider
+    {
+        let r = db.reader();
+        let excl_doc_prep = prepare_document_scoped_prompt(
+            &r,
+            &cfg,
+            excluded_doc_id,
+            200,
+            DocLlmScope::Page,
+            1,
+            None,
+            "Explain",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(excl_doc_prep.preview.passages_included, 0);
+        assert_eq!(excl_doc_prep.preview.passages_excluded_cloud, 1);
+
+        let excl_folder_prep = prepare_document_scoped_prompt(
+            &r,
+            &cfg,
+            excluded_folder_doc_id,
+            300,
+            DocLlmScope::Selection,
+            1,
+            Some("selected secret text"),
+            "Explain selection",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(excl_folder_prep.preview.passages_included, 0);
+        assert_eq!(excl_folder_prep.preview.passages_excluded_cloud, 1);
+    }
+
+    // OpenAI streaming on document-scoped page query resolves `[p. 58]` back to file_id=100 + bboxes!
+    let prep_doc = {
+        let r = db.reader();
+        prepare_document_scoped_prompt(
+            &r,
+            &cfg,
+            allowed_doc_id,
+            100,
+            DocLlmScope::Page,
+            58,
+            None,
+            "What does Theorem 3.2 state?",
+            None,
+            None,
+        )
+        .unwrap()
+    };
+    let mut deltas = Vec::new();
+    let res_openai = send_prepared_prompt_streaming(
+        &cfg,
+        Some(&key),
+        prep_doc.clone(),
+        Some(&mock_url),
+        |chunk| deltas.push(chunk.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(res_openai.usage.total_tokens, Some(75));
+    assert_eq!(res_openai.citations.len(), 1);
+    assert_eq!(res_openai.citations[0].document_id, allowed_doc_id);
+    assert_eq!(res_openai.citations[0].file_id, 100);
+    assert_eq!(res_openai.citations[0].page_ord, 58);
+    assert_eq!(res_openai.citations[0].bboxes.len(), 1);
+
+    // Ollama streaming via `generate_grounded_answer_streaming`
+    cfg.llm_provider = LlmProvider::Ollama;
+    cfg.llm_ollama_url = mock_url.clone();
+    let mut ollama_chunks = Vec::new();
+    let res_ollama = generate_grounded_answer_streaming(
+        Some(&db),
+        &cfg,
+        None,
+        "Hahn-Banach",
+        &sample_results()[2..],
+        None,
+        None,
+        None,
+        |c| ollama_chunks.push(c.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ollama_chunks.len(), 2);
+    assert_eq!(res_ollama.usage.total_tokens, Some(40));
+    assert_eq!(res_ollama.citations.len(), 1);
+
+    // Anthropic streaming
+    cfg.llm_provider = LlmProvider::Anthropic;
+    let mut ant_chunks = Vec::new();
+    let res_ant = send_prepared_prompt_streaming(
+        &cfg,
+        Some(&key),
+        prep_doc.clone(),
+        Some(&mock_url),
+        |c| ant_chunks.push(c.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ant_chunks, vec!["Theorem 3.2 [p. 58]."]);
+    assert_eq!(res_ant.usage.input_tokens, Some(50));
+    assert_eq!(res_ant.usage.output_tokens, Some(8));
+    assert_eq!(res_ant.usage.total_tokens, Some(58));
+    assert_eq!(res_ant.citations[0].page_ord, 58);
+
+    // Gemini streaming
+    cfg.llm_provider = LlmProvider::Gemini;
+    let mut gem_chunks = Vec::new();
+    let res_gem = send_prepared_prompt_streaming(
+        &cfg,
+        Some(&key),
+        prep_doc,
+        Some(&mock_url),
+        |c| gem_chunks.push(c.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(gem_chunks.len(), 2);
+    assert_eq!(res_gem.usage.total_tokens, Some(47));
+    assert_eq!(res_gem.citations[0].page_ord, 58);
 }
