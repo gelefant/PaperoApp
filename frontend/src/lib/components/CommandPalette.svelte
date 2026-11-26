@@ -56,6 +56,12 @@
     exec: () => void;
   }
 
+  const foldedDocHaystacks = $derived.by((): string[] =>
+    documents.map((doc) =>
+      fold(`${doc.title} ${doc.authors_summary} ${doc.year ?? ''} ${doc.msc_primary ?? ''}`)
+    )
+  );
+
   const rows = $derived.by((): PaletteRow[] => {
     const tokens = fold(query)
       .split(/\s+/)
@@ -122,10 +128,12 @@
     // 4. Documents (cap to keep instantaneous on 10k+ libraries)
     let docAdded = 0;
     const docCap = tokens.length > 0 ? 18 : 8;
-    for (const doc of documents) {
+    const docHays = foldedDocHaystacks;
+    for (let i = 0; i < documents.length; i++) {
       if (docAdded >= docCap) break;
-      const hay = `${doc.title} ${doc.authors_summary} ${doc.year ?? ''} ${doc.msc_primary ?? ''}`;
-      if (matches(hay)) {
+      const doc = documents[i];
+      const fHay = docHays[i] ?? '';
+      if (tokens.length === 0 || tokens.every((t) => fHay.includes(t))) {
         docAdded++;
         out.push({
           key: `doc:${doc.document_id}`,

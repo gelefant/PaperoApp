@@ -20,7 +20,7 @@ use papero_core::metadata::resolver::get_documents_metadata_for_export;
 use papero_core::metadata::WaterfallClients;
 use papero_core::ml::{LazyModelSlot, ModelProfile, OnnxEmbedder, OnnxReranker};
 use papero_core::viewer::djvu_cache::DjvuCache;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -129,6 +129,7 @@ pub struct AppState {
     pub bibtex_sync_mutex: Arc<tokio::sync::Mutex<()>>,
     pub bibtex_sync_dirty: Arc<AtomicBool>,
     pub bibtex_sync_notify: Arc<Notify>,
+    pub relations_scan_cache: Mutex<HashMap<i64, (i64, i64)>>,
     _log_guard: Option<WorkerGuard>,
 }
 
@@ -149,6 +150,11 @@ impl AppState {
         let bm25 = Arc::new(Bm25Index::open_or_create(&paths.tantivy_dir)?);
         {
             let w = db.writer();
+            // Recover any indexing jobs interrupted mid-flight by a previous unclean exit.
+            let _ = w.execute(
+                "UPDATE index_jobs SET status = 'queued' WHERE status = 'running'",
+                [],
+            );
             if let Err(err) = reconcile_source_roots_with_local_map(&w, &paths.local_roots_path()) {
                 tracing::warn!(error = %err, "failed reconciling source roots on startup");
             }
@@ -205,6 +211,7 @@ impl AppState {
             bibtex_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
             bibtex_sync_dirty: Arc::new(AtomicBool::new(false)),
             bibtex_sync_notify: Arc::new(Notify::new()),
+            relations_scan_cache: Mutex::new(HashMap::new()),
             _log_guard: Some(log_guard),
         })
     }
@@ -801,6 +808,58 @@ impl AppState {
         });
     }
 
+    /// Automatically drains any queued `extract_bm25` jobs on startup (e.g. DjVu files healed by
+    /// migration v10 or interrupted indexing runs) and notifies the UI when ready.
+    pub fn spawn_startup_pending_indexing(state: Arc<Self>) {
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if state.is_foreground_batch_active() {
+                return;
+            }
+            let st_check = Arc::clone(&state);
+            let queued_count: i64 = tokio::task::spawn_blocking(move || {
+                let r = st_check.db.reader();
+                r.query_row(
+                    "SELECT COUNT(*) FROM index_jobs WHERE stage = 'extract_bm25' AND status = 'queued'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0);
+
+            if queued_count <= 0 || state.is_foreground_batch_active() {
+                return;
+            }
+
+            let db = Arc::clone(&state.db);
+            let bm25 = Arc::clone(&state.bm25);
+            let cfg = state.config.read().expect("config poisoned").clone();
+            let processed_ok = tokio::task::spawn_blocking(move || {
+                run_extract_bm25_queue(&db, &bm25, &cfg, None)
+                    .map(|rep| rep.succeeded > 0 || rep.processed > 0)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+
+            if processed_ok {
+                state.invalidate_viewer_file_cache();
+                if let Ok(mut rel_cache) = state.relations_scan_cache.lock() {
+                    rel_cache.clear();
+                }
+                state.schedule_auto_backup();
+                if let Ok(g) = state.app_handle.lock() {
+                    if let Some(app) = g.as_ref() {
+                        let _ = app.emit("library-fs-updated", ());
+                    }
+                }
+                crate::commands::search::spawn_background_embedder(Arc::clone(&state));
+            }
+        });
+    }
+
     #[cfg(test)]
     pub fn from_paths_without_logging(paths: AppPaths) -> Result<Self> {
         paths.ensure_dirs()?;
@@ -850,6 +909,7 @@ impl AppState {
             bibtex_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
             bibtex_sync_dirty: Arc::new(AtomicBool::new(false)),
             bibtex_sync_notify: Arc::new(Notify::new()),
+            relations_scan_cache: Mutex::new(HashMap::new()),
             _log_guard: None,
         })
     }

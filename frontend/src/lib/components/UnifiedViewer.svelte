@@ -1580,8 +1580,18 @@
         return;
       }
       insertBoundedDjvuUrl(key, url);
-    } catch {
-      // Ignore per-page DjVu render error
+    } catch (e) {
+      if (
+        !destroyed &&
+        seq === loadSeq &&
+        fileId === activeFid &&
+        dpi !== 60 &&
+        pageOrd === currentPage &&
+        Object.keys(djvuImgUrls).length === 0 &&
+        !loadError
+      ) {
+        loadError = `Impossibile renderizzare la pagina DjVu: ${String(e)}`;
+      }
     } finally {
       djvuInFlight.delete(key);
     }

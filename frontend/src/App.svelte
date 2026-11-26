@@ -1695,6 +1695,36 @@
     await navigator.clipboard.writeText(info.abs_path);
   }
 
+  async function runRevealFileInFolder(fileId: number) {
+    try {
+      await api.revealFileInFolder(fileId);
+    } catch (e) {
+      scanStatusText =
+        lang === 'en'
+          ? `Could not reveal file in folder: ${String(e)}`
+          : `Impossibile mostrare il file nella cartella: ${String(e)}`;
+    }
+  }
+
+  async function runOpenFileExternal(
+    fileId: number,
+    pageOrd?: number | null,
+    templateOverride?: string | null
+  ) {
+    try {
+      await api.openFileExternal(
+        fileId,
+        pageOrd ?? undefined,
+        templateOverride ?? undefined
+      );
+    } catch (e) {
+      scanStatusText =
+        lang === 'en'
+          ? `Could not open external reader: ${String(e)}`
+          : `Impossibile aprire il lettore esterno: ${String(e)}`;
+    }
+  }
+
   async function handleCopyBibtex(docId: number): Promise<string> {
     const bib = await api.getDocumentBibtex(docId, metaFilter.collection_id ?? null);
     try {
@@ -2318,7 +2348,7 @@
       fileId={detachedFileId}
       targetPage={detachedPage}
       highlightRects={detachedBboxes}
-      onOpenExternal={(fid, p) => api.openFileExternal(fid, p, null)}
+      onOpenExternal={(fid, p) => void runOpenFileExternal(fid, p, null)}
     />
   </main>
 {:else}
@@ -2526,7 +2556,7 @@
                       openInViewer(m.file_id, m.title, m.format, 1);
                     });
                   }}
-                  onRevealFile={(fid) => api.revealFileInFolder(fid)}
+                  onRevealFile={(fid) => void runRevealFileInFolder(fid)}
                 />
               {:else if displayedSearchResults !== null}
                 <ContentResults
@@ -2652,7 +2682,7 @@
             onFocusPane={(pane) => (viewerTabs.focusedPane = pane)}
             onToggleZen={handleToggleZenMode}
             onSelectMatchIndex={handleSelectMatchIndex}
-            onOpenExternal={(fid, page) => api.openFileExternal(fid, page, null)}
+            onOpenExternal={(fid, page) => void runOpenFileExternal(fid, page, null)}
             onOpenLibraryDoc={handleOpenLibraryDocFromCite}
             onConsentAccepted={(prov) => {
               if (settings) {
@@ -2732,7 +2762,7 @@
         const doc = catalogStats.byFileId.get(fid);
         openInViewer(fid, doc?.title ?? `File #${fid}`, doc?.format ?? 'pdf', page ?? 1);
       }}
-      onOpenExternal={(fid, page, tpl) => api.openFileExternal(fid, page, tpl)}
+      onOpenExternal={(fid, page, tpl) => void runOpenFileExternal(fid, page, tpl)}
       onInspectMetadata={(docId) => {
         layout.inspectorOpen = true;
         requestSelectDocument(docId);
@@ -2746,7 +2776,7 @@
         }
       }}
       onRunOcr={(fid) => handleRunOcrForFile(fid)}
-      onRevealInFolder={(fid) => api.revealFileInFolder(fid)}
+      onRevealInFolder={(fid) => void runRevealFileInFolder(fid)}
       onCopyPath={handleCopyPath}
     />
 

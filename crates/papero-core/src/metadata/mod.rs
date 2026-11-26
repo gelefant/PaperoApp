@@ -38,8 +38,9 @@ pub use models::{
 };
 pub use relations::{
     find_missing_cited_classics, find_similar_documents, get_document_relations,
-    refresh_local_citations_for_doc, resolve_citation_snippet_in_library, CitationLinkItem,
-    DocumentRelationsView, MissingClassicItem, PreprintPublishedNotice, SimilarDocumentItem,
+    refresh_local_citations_for_doc, refresh_local_citations_on_db,
+    resolve_citation_snippet_in_library, CitationLinkItem, DocumentRelationsView,
+    MissingClassicItem, PreprintPublishedNotice, SimilarDocumentItem,
 };
 pub use resolver::{
     apply_manual_metadata_edit, apply_manual_metadata_edit_with_locks, confirm_metadata_candidate,

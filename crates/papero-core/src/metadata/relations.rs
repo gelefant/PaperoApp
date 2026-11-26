@@ -229,14 +229,11 @@ fn load_library_id_lookup(conn: &Connection) -> Result<LibraryIdLookup> {
     Ok(lut)
 }
 
-/// Scans bibliography passages + cached OpenAlex/Crossref/Semantic Scholar HTTP payloads for
-/// `document_id` and records local outgoing citations in `document_citations`.
-pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> Result<usize> {
-    let lut = load_library_id_lookup(conn)?;
-    if lut.by_doi.is_empty() && lut.by_arxiv.is_empty() && lut.by_mr.is_empty() {
-        return Ok(0);
-    }
-
+///Read-only discovery of local outgoing citations for `document_id` (suitable for `db.reader()`).
+fn discover_local_citations_for_doc(
+    conn: &Connection,
+    document_id: i64,
+) -> Result<(Vec<(i64, &'static str)>, usize)> {
     let doc_ids_row: Option<(Option<String>, Option<String>, Option<i64>)> = conn
         .query_row(
             "SELECT d.doi, d.arxiv_id, MAX(f.page_count)
@@ -249,11 +246,24 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
         )
         .optional()?;
     let Some((doc_doi, doc_arxiv, page_count_opt)) = doc_ids_row else {
-        return Ok(0);
+        return Ok((Vec::new(), 0));
     };
 
-    let mut edges: Vec<(i64, &'static str)> = Vec::new();
+    let lut = load_library_id_lookup(conn)?;
+    if lut.by_doi.is_empty() && lut.by_arxiv.is_empty() && lut.by_mr.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let existing_cited: HashSet<i64> = {
+        let mut stmt =
+            conn.prepare_cached("SELECT cited_doc_id FROM document_citations WHERE citing_doc_id = ?1")?;
+        let rows = stmt.query_map(params![document_id], |r| r.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()?
+    };
+
+    let mut new_edges: Vec<(i64, &'static str)> = Vec::new();
     let mut seen_cited: HashSet<i64> = HashSet::new();
+    let mut total_found = 0usize;
 
     // 1. Inspect cached Crossref / Semantic Scholar / OpenAlex JSON for this doc's DOI or arXiv
     let mut cache_keys: Vec<(&str, String)> = Vec::new();
@@ -288,7 +298,10 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
                     if let Some(d) = r.get("DOI").and_then(Value::as_str).and_then(normalize_doi) {
                         if let Some(&cited_id) = lut.by_doi.get(&d) {
                             if cited_id != document_id && seen_cited.insert(cited_id) {
-                                edges.push((cited_id, "crossref"));
+                                total_found += 1;
+                                if !existing_cited.contains(&cited_id) {
+                                    new_edges.push((cited_id, "crossref"));
+                                }
                             }
                         }
                     }
@@ -305,7 +318,10 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
                     {
                         if let Some(&cited_id) = lut.by_doi.get(&d) {
                             if cited_id != document_id && seen_cited.insert(cited_id) {
-                                edges.push((cited_id, "semanticscholar"));
+                                total_found += 1;
+                                if !existing_cited.contains(&cited_id) {
+                                    new_edges.push((cited_id, "semanticscholar"));
+                                }
                             }
                         }
                     }
@@ -316,20 +332,23 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
                     {
                         if let Some(&cited_id) = lut.by_arxiv.get(&ax) {
                             if cited_id != document_id && seen_cited.insert(cited_id) {
-                                edges.push((cited_id, "semanticscholar"));
+                                total_found += 1;
+                                if !existing_cited.contains(&cited_id) {
+                                    new_edges.push((cited_id, "semanticscholar"));
+                                }
                             }
                         }
                     }
                 }
             }
-        } else if src == "openalex" {
+        } else if src == "openalex" && !lut.by_doi.is_empty() {
             // OpenAlex stores `referenced_works: ["https://openalex.org/W..."]`.
             // Cross-reference against any cached OpenAlex work IDs belonging to local library DOIs.
             if let Some(ref_works) = v.get("referenced_works").and_then(Value::as_array) {
                 let ref_set: HashSet<&str> =
                     ref_works.iter().filter_map(Value::as_str).collect();
                 if !ref_set.is_empty() {
-                    let mut c_stmt = conn.prepare(
+                    let mut c_stmt = conn.prepare_cached(
                         "SELECT lookup_key, response_body FROM metadata_http_cache
                          WHERE source = 'openalex' AND lookup_key LIKE 'doi:%' AND status_code < 400",
                     )?;
@@ -347,6 +366,10 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
                         if cited_id == document_id || seen_cited.contains(&cited_id) {
                             continue;
                         }
+                        // Fast substring pre-filter avoids full JSON parsing on 99%+ of cached works.
+                        if !ref_set.iter().any(|wid| rb.contains(wid)) {
+                            continue;
+                        }
                         if let Ok(other_v) = serde_json::from_str::<Value>(&rb) {
                             if other_v
                                 .get("id")
@@ -354,7 +377,10 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
                                 .is_some_and(|wid| ref_set.contains(wid))
                             {
                                 seen_cited.insert(cited_id);
-                                edges.push((cited_id, "openalex"));
+                                total_found += 1;
+                                if !existing_cited.contains(&cited_id) {
+                                    new_edges.push((cited_id, "openalex"));
+                                }
                             }
                         }
                     }
@@ -370,7 +396,7 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
     } else {
         1
     };
-    let mut p_stmt = conn.prepare(
+    let mut p_stmt = conn.prepare_cached(
         "SELECT text_content FROM passages
          WHERE document_id = ?1 AND page_ord >= ?2
          ORDER BY page_ord DESC, chunk_index DESC
@@ -382,7 +408,10 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
             if let Some(d) = normalize_doi(m.as_str()) {
                 if let Some(&cited_id) = lut.by_doi.get(&d) {
                     if cited_id != document_id && seen_cited.insert(cited_id) {
-                        edges.push((cited_id, "extracted_ref"));
+                        total_found += 1;
+                        if !existing_cited.contains(&cited_id) {
+                            new_edges.push((cited_id, "extracted_ref"));
+                        }
                     }
                 }
             }
@@ -391,7 +420,10 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
             if let Some(ax) = cap.get(1).and_then(|m| normalize_arxiv_base_id(m.as_str())) {
                 if let Some(&cited_id) = lut.by_arxiv.get(&ax) {
                     if cited_id != document_id && seen_cited.insert(cited_id) {
-                        edges.push((cited_id, "extracted_ref"));
+                        total_found += 1;
+                        if !existing_cited.contains(&cited_id) {
+                            new_edges.push((cited_id, "extracted_ref"));
+                        }
                     }
                 }
             }
@@ -400,24 +432,60 @@ pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> R
             if let Some(mr) = cap.get(1).and_then(|m| normalize_mr_digits(m.as_str())) {
                 if let Some(&cited_id) = lut.by_mr.get(&mr) {
                     if cited_id != document_id && seen_cited.insert(cited_id) {
-                        edges.push((cited_id, "extracted_ref"));
+                        total_found += 1;
+                        if !existing_cited.contains(&cited_id) {
+                            new_edges.push((cited_id, "extracted_ref"));
+                        }
                     }
                 }
             }
         }
     }
 
-    if !edges.is_empty() {
-        let mut ins = conn.prepare_cached(
-            "INSERT OR IGNORE INTO document_citations (citing_doc_id, cited_doc_id, source, confidence)
-             VALUES (?1, ?2, ?3, 1.0)",
-        )?;
-        for (cited_id, src) in &edges {
-            ins.execute(params![document_id, cited_id, src])?;
-        }
-    }
+    Ok((new_edges, total_found))
+}
 
-    Ok(edges.len())
+fn persist_discovered_citations(
+    conn: &Connection,
+    document_id: i64,
+    new_edges: &[(i64, &'static str)],
+) -> Result<()> {
+    if new_edges.is_empty() {
+        return Ok(());
+    }
+    let mut ins = conn.prepare_cached(
+        "INSERT OR IGNORE INTO document_citations (citing_doc_id, cited_doc_id, source, confidence)
+         VALUES (?1, ?2, ?3, 1.0)",
+    )?;
+    for (cited_id, src) in new_edges {
+        ins.execute(params![document_id, cited_id, src])?;
+    }
+    Ok(())
+}
+
+/// Scans bibliography passages + cached OpenAlex/Crossref/Semantic Scholar HTTP payloads for
+/// `document_id` and records local outgoing citations in `document_citations`.
+pub fn refresh_local_citations_for_doc(conn: &Connection, document_id: i64) -> Result<usize> {
+    let (new_edges, total_found) = discover_local_citations_for_doc(conn, document_id)?;
+    persist_discovered_citations(conn, document_id, &new_edges)?;
+    Ok(total_found)
+}
+
+/// Reader-first variant of `refresh_local_citations_for_doc` that avoids locking `db.writer()`
+/// unless newly discovered citation edges actually need to be inserted.
+pub fn refresh_local_citations_on_db(
+    db: &crate::db::Database,
+    document_id: i64,
+) -> Result<usize> {
+    let (new_edges, total_found) = {
+        let r = db.reader();
+        discover_local_citations_for_doc(&r, document_id)?
+    };
+    if !new_edges.is_empty() {
+        let w = db.writer();
+        persist_discovered_citations(&w, document_id, &new_edges)?;
+    }
+    Ok(total_found)
 }
 
 struct PreprintDocRow {

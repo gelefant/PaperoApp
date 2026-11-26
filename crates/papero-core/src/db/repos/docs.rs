@@ -595,25 +595,47 @@ pub struct ContentSearchDocResult {
     pub passages: Vec<ContentSearchPassageHit>,
 }
 
+fn preload_formatted_authors_by_doc(conn: &Connection) -> Result<HashMap<i64, String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT document_id, family_name, given_name
+         FROM document_authors
+         ORDER BY document_id ASC, role ASC, position ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut map: HashMap<i64, String> = HashMap::new();
+    for row in rows {
+        let (doc_id, family, given) = row?;
+        let piece = if given.trim().is_empty() {
+            family
+        } else if family.trim().is_empty() {
+            given
+        } else {
+            format!("{family}, {given}")
+        };
+        if piece.is_empty() {
+            continue;
+        }
+        map.entry(doc_id)
+            .and_modify(|acc| {
+                acc.push_str("; ");
+                acc.push_str(&piece);
+            })
+            .or_insert(piece);
+    }
+    Ok(map)
+}
+
 pub fn list_documents_for_ui(conn: &Connection) -> Result<Vec<DocumentListItem>> {
-    let mut stmt = conn.prepare(
+    let mut authors_by_doc = preload_formatted_authors_by_doc(conn)?;
+    let mut stmt = conn.prepare_cached(
         "SELECT d.id, f.id, f.root_id, sr.label, d.work_type, d.title,
-                COALESCE(
-                    (SELECT GROUP_CONCAT(
-                        CASE WHEN TRIM(given_name) = '' THEN family_name
-                             WHEN TRIM(family_name) = '' THEN given_name
-                             ELSE family_name || ', ' || given_name END,
-                        '; '
-                     )
-                     FROM (
-                        SELECT family_name, given_name
-                        FROM document_authors
-                        WHERE document_id = d.id
-                        ORDER BY role ASC, position ASC
-                     )),
-                    NULLIF(d.authors_norm_summary, ''),
-                    ''
-                ) AS authors_display,
+                d.authors_norm_summary,
                 d.year, f.format, f.rel_path, f.page_count, f.is_available,
                 f.index_state, f.error_message, d.msc_primary, d.msc_primary_status,
                 f.has_text_layer, f.ocr_status, d.metadata_source, d.metadata_verified,
@@ -626,14 +648,20 @@ pub fn list_documents_for_ui(conn: &Connection) -> Result<Vec<DocumentListItem>>
          ORDER BY d.updated_at DESC, d.id DESC",
     )?;
     let rows = stmt.query_map([], |r| {
+        let doc_id: i64 = r.get(0)?;
+        let fallback_authors: String = r.get::<_, Option<String>>(6)?.unwrap_or_default();
+        let authors_summary = authors_by_doc
+            .remove(&doc_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback_authors);
         Ok(DocumentListItem {
-            document_id: r.get(0)?,
+            document_id: doc_id,
             file_id: r.get(1)?,
             root_id: r.get(2)?,
             root_label: r.get(3)?,
             work_type: r.get(4)?,
             title: r.get(5)?,
-            authors_summary: r.get(6)?,
+            authors_summary,
             year: r.get(7)?,
             format: r.get(8)?,
             rel_path: r.get(9)?,

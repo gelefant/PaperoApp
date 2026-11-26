@@ -201,6 +201,7 @@ pub fn run() {
             AppState::spawn_auto_backup_loop(Arc::clone(&reaper_state));
             AppState::spawn_bibtex_auto_sync_loop(Arc::clone(&reaper_state));
             AppState::refresh_watcher(&reaper_state, Some(app.handle().clone()));
+            AppState::spawn_startup_pending_indexing(Arc::clone(&reaper_state));
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("papero-doc", move |_ctx, request, responder| {

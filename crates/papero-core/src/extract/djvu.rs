@@ -4,16 +4,235 @@ use crate::extract::types::{
     ExtractedDocument, ExtractedPage, ExtractedSpan, NormalizedRect, OutlineItem,
 };
 use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_SEXPR_DEPTH: usize = 128;
+
+#[cfg(target_os = "windows")]
+static CLI_STAGE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn strip_utf8_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+fn parse_page_count_line(line: &str) -> Option<u32> {
+    strip_utf8_bom(line).trim().parse::<u32>().ok()
+}
+
+/// RAII wrapper providing an OS-safe path for narrow-`argv` external DjVuLibre tools (`djvused`, `ddjvu`).
+/// On Windows, DjVuLibre 3.5.30 tools use narrow `main(int argc, char **argv)` without UTF-8 manifest
+/// or wide-char `setlocale`, which fails when paths contain characters outside the active codepage
+/// or non-ASCII accents under `"C"` locale. Pure-ASCII paths run in place with zero overhead; non-ASCII
+/// paths use Win32 `GetShortPathNameW` (8.3 alias) or a temporary ASCII hardlink/copy outside `source_roots`.
+pub(crate) struct PreparedCliInputPath {
+    effective_path: PathBuf,
+    temp_cleanup: Option<PathBuf>,
+}
+
+impl PreparedCliInputPath {
+    pub(crate) fn path(&self) -> &Path {
+        &self.effective_path
+    }
+}
+
+impl Drop for PreparedCliInputPath {
+    fn drop(&mut self) {
+        if let Some(ref tmp) = self.temp_cleanup {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn prepare_cli_input_path(path: &Path) -> Result<PreparedCliInputPath> {
+    Ok(PreparedCliInputPath {
+        effective_path: path.to_path_buf(),
+        temp_cleanup: None,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn try_windows_short_ascii_path(path: &Path) -> Option<PathBuf> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(
+            lpsz_long_path: *const u16,
+            lpsz_short_path: *mut u16,
+            cch_buffer: u32,
+        ) -> u32;
+    }
+
+    let norm = crate::viewer::os_actions::normalize_windows_shell_path(path);
+    let wide: Vec<u16> = norm.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated; querying with buffer length 0 returns required buffer size.
+    let needed = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; (needed as usize) + 1];
+    // SAFETY: `buf` has capacity `needed + 1` UTF-16 code units.
+    let written = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if written == 0 || (written as usize) >= buf.len() {
+        return None;
+    }
+    let short = String::from_utf16(&buf[..written as usize]).ok()?;
+    if short.is_ascii() && Path::new(&short).exists() {
+        Some(PathBuf::from(short))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_ascii_staging_dir() -> Result<PathBuf> {
+    let temp_root = std::env::temp_dir();
+    let temp_norm = crate::viewer::os_actions::normalize_windows_shell_path(&temp_root);
+    if temp_norm.is_ascii() {
+        let dir = PathBuf::from(temp_norm).join("papero_djvu_cli");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return Ok(dir);
+        }
+    }
+    if let Some(short_tmp) = try_windows_short_ascii_path(&temp_root) {
+        let dir = short_tmp.join("papero_djvu_cli");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return Ok(dir);
+        }
+    }
+    let public_base = std::env::var("PUBLIC").unwrap_or_else(|_| r"C:\Users\Public".to_string());
+    let fallback_dir = PathBuf::from(public_base)
+        .join("PaperoCache")
+        .join("djvu_cli");
+    std::fs::create_dir_all(&fallback_dir)?;
+    Ok(fallback_dir)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn prepare_cli_input_path(path: &Path) -> Result<PreparedCliInputPath> {
+    let clean_str = crate::viewer::os_actions::normalize_windows_shell_path(path);
+    let clean_path = PathBuf::from(&clean_str);
+    if clean_str.is_ascii() {
+        return Ok(PreparedCliInputPath {
+            effective_path: clean_path,
+            temp_cleanup: None,
+        });
+    }
+    if let Some(short_path) = try_windows_short_ascii_path(&clean_path) {
+        return Ok(PreparedCliInputPath {
+            effective_path: short_path,
+            temp_cleanup: None,
+        });
+    }
+    let stage_dir = resolve_ascii_staging_dir()?;
+    let seq = CLI_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let staged = stage_dir.join(format!("djvu_{}_{seq}.djvu", std::process::id()));
+    if std::fs::hard_link(&clean_path, &staged).is_err() {
+        std::fs::copy(&clean_path, &staged)?;
+    }
+    Ok(PreparedCliInputPath {
+        effective_path: staged.clone(),
+        temp_cleanup: Some(staged),
+    })
+}
+
+/// Distinguishes OS/DLL loader or file-open errors (`CoreError::Io` / `MissingExternalTool`)
+/// from genuine DjVu format corruption (`CoreError::CorruptFile`) so transient OS/runtime issues
+/// never permanently mark valid user books as `corrupt`.
+pub(crate) fn classify_djvu_cli_failure(
+    tool_label: &str,
+    bin: &str,
+    status: ExitStatus,
+    stderr_bytes: &[u8],
+) -> CoreError {
+    let stderr = strip_utf8_bom(&String::from_utf8_lossy(stderr_bytes))
+        .trim()
+        .to_string();
+    let stderr_low = stderr.to_ascii_lowercase();
+
+    if let Some(code) = status.code() {
+        // On Windows, negative / NTSTATUS codes (e.g. 0xC0000135 STATUS_DLL_NOT_FOUND = -1073741515)
+        // indicate a missing runtime DLL or OS loader crash, never a corrupt DjVu document.
+        if !(0..=64).contains(&code) {
+            return CoreError::MissingExternalTool {
+                tool: bin.to_string(),
+                detail: format!(
+                    "{tool_label} failed to initialize (exit code {code} / 0x{:08X}): {stderr}",
+                    code as u32
+                ),
+            };
+        }
+    } else {
+        return CoreError::Io(std::io::Error::other(format!(
+            "{tool_label} terminated by signal ({status}): {stderr}"
+        )));
+    }
+
+    if stderr.is_empty()
+        || stderr_low.contains("open_fail")
+        || stderr_low.contains("failed to open")
+        || stderr_low.contains("cannot open")
+        || stderr_low.contains("no such file")
+        || stderr_low.contains("permission denied")
+        || stderr_low.contains("access is denied")
+        || stderr_low.contains("invalid argument")
+        || stderr_low.contains("system error")
+    {
+        return CoreError::Io(std::io::Error::other(format!(
+            "{tool_label} I/O or invocation error ({status}): {stderr}"
+        )));
+    }
+
+    CoreError::CorruptFile(format!("{tool_label} exited with {status}: {stderr}"))
+}
+
+pub(crate) fn configure_djvu_tool_env(cmd: &mut Command, resolved_bin: &str) {
+    configure_background_command(cmd);
+    #[cfg(target_os = "windows")]
+    {
+        let bin_path = Path::new(resolved_bin);
+        if let Some(dir) = bin_path.parent().filter(|p| !p.as_os_str().is_empty() && p.is_dir()) {
+            let current_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut joined = std::ffi::OsString::from(dir.as_os_str());
+            joined.push(";");
+            joined.push(current_path);
+            cmd.env("PATH", joined);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = resolved_bin;
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum SExpr {
     Atom(String),
     Str(String),
     List(Vec<SExpr>),
+}
+
+/// Fast header-only probe returning `(page_count, outline)` via `djvused` without scanning page text.
+pub fn probe_djvu_page_count_and_outline(
+    path: &Path,
+    djvused_bin: Option<&str>,
+) -> Result<(u32, Vec<OutlineItem>)> {
+    let bin = resolve_external_tool(djvused_bin, "djvused");
+    let meta_out = run_djvused(&bin, path, "n; print-outline\n")?;
+    let mut lines = meta_out.lines();
+    let page_count: u32 = lines
+        .next()
+        .and_then(parse_page_count_line)
+        .ok_or_else(|| {
+            CoreError::CorruptFile(format!(
+                "djvused did not return a valid page count for {}",
+                path.display()
+            ))
+        })?;
+    let outline_str: String = lines.collect::<Vec<_>>().join("\n");
+    let outline = parse_djvu_outline(&outline_str);
+    Ok((page_count, outline))
 }
 
 /// Extracts pages, dimensions, normalized top-left line bounding boxes, and outline
@@ -26,7 +245,7 @@ pub fn extract_djvu(path: &Path, djvused_bin: Option<&str>) -> Result<ExtractedD
     let mut lines = meta_out.lines();
     let page_count: u32 = lines
         .next()
-        .and_then(|l| l.trim().parse::<u32>().ok())
+        .and_then(parse_page_count_line)
         .ok_or_else(|| {
             CoreError::CorruptFile(format!(
                 "djvused did not return a valid page count for {}",
@@ -76,7 +295,7 @@ pub fn extract_djvu_front_matter(path: &Path, djvused_bin: Option<&str>) -> Resu
             let mut lines = combined.lines();
             let count = lines
                 .next()
-                .and_then(|l| l.trim().parse::<u32>().ok())
+                .and_then(parse_page_count_line)
                 .ok_or_else(|| {
                     CoreError::CorruptFile(format!(
                         "djvused did not return a valid page count for {}",
@@ -92,7 +311,7 @@ pub fn extract_djvu_front_matter(path: &Path, djvused_bin: Option<&str>) -> Resu
             let count = count_out
                 .lines()
                 .next()
-                .and_then(|l| l.trim().parse::<u32>().ok())
+                .and_then(parse_page_count_line)
                 .ok_or_else(|| {
                     CoreError::CorruptFile(format!(
                         "djvused did not return a valid page count for {}",
@@ -144,8 +363,8 @@ pub fn extract_djvu_front_matter(path: &Path, djvused_bin: Option<&str>) -> Resu
 fn parse_djvu_meta(raw: &str) -> (Option<String>, Option<String>) {
     let mut title = None;
     let mut author = None;
-    for line in raw.lines() {
-        let trimmed = line.trim();
+    for line in strip_utf8_bom(raw).lines() {
+        let trimmed = strip_utf8_bom(line).trim();
         let Some((key, rest)) = trimmed.split_once(char::is_whitespace) else {
             continue;
         };
@@ -268,11 +487,12 @@ fn collect_granular_text_spans(
 }
 
 fn run_djvused(bin: &str, file: &Path, script: &str) -> Result<String> {
+    let prepared = prepare_cli_input_path(file)?;
     let mut cmd = Command::new(bin);
-    configure_background_command(&mut cmd);
+    configure_djvu_tool_env(&mut cmd, bin);
     let mut child = cmd
         .arg("-u")
-        .arg(file)
+        .arg(prepared.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -307,14 +527,19 @@ fn run_djvused(bin: &str, file: &Path, script: &str) -> Result<String> {
     })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(CoreError::CorruptFile(format!(
-            "djvused exited with {}: {}",
-            output.status, stderr
-        )));
+        return Err(classify_djvu_cli_failure(
+            "djvused",
+            bin,
+            output.status,
+            &output.stderr,
+        ));
     }
     write_res?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    // On Windows (`_WIN32`), `djvused -u` prepends a 3-byte UTF-8 BOM (`0xEF 0xBB 0xBF` / `\u{feff}`)
+    // to `stdout` (`tools/djvused.cpp` lines 2364-2367). Strip it so page-count / size / S-expr
+    // parsers never fail with false `CorruptFile` errors.
+    let decoded = String::from_utf8_lossy(&output.stdout);
+    Ok(strip_utf8_bom(&decoded).to_string())
 }
 
 /// Parses concatenated `width=W height=H\n(page ...)` blocks emitted by `djvused`.
@@ -323,6 +548,7 @@ pub fn parse_djvused_pages_output(
     expected_pages: u32,
     outline: Vec<OutlineItem>,
 ) -> Result<ExtractedDocument> {
+    let output = strip_utf8_bom(output);
     let mut pages = Vec::with_capacity(expected_pages as usize);
     let mut has_text_layer = false;
 
@@ -398,7 +624,7 @@ pub fn parse_djvused_pages_output(
 fn parse_size_line(line: &str) -> Option<(f32, f32)> {
     let mut w = None;
     let mut h = None;
-    for part in line.split_whitespace() {
+    for part in strip_utf8_bom(line).split_whitespace() {
         if let Some(val) = part.strip_prefix("width=") {
             w = val.parse::<f32>().ok();
         } else if let Some(val) = part.strip_prefix("height=") {
@@ -559,7 +785,7 @@ fn as_f32(expr: &SExpr) -> Option<f32> {
 }
 
 pub fn parse_djvu_outline(input: &str) -> Vec<OutlineItem> {
-    let trimmed = input.trim();
+    let trimmed = strip_utf8_bom(input).trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
@@ -821,5 +1047,37 @@ mod tests {
         assert_eq!(doc.pages.len(), 1);
         assert_eq!(doc.pages[0].spans.len(), 1);
         assert_eq!(doc.pages[0].spans[0].text, "Visible Header");
+    }
+
+    #[test]
+    fn handles_windows_djvused_utf8_bom_and_crlf_output() {
+        // On Windows (`_WIN32`), `djvused -u` emits a leading UTF-8 BOM (`\u{feff}`) and `\r\n` newlines.
+        let win_count_and_outline = "\u{feff}312\r\n(bookmarks (\"Prefazione\" \"#1\") (\"Capitolo 1\" \"#15\"))\r\n";
+        let mut lines = win_count_and_outline.lines();
+        assert_eq!(lines.next().and_then(parse_page_count_line), Some(312));
+        let outline_str: String = lines.collect::<Vec<_>>().join("\n");
+        let outline = parse_djvu_outline(&outline_str);
+        assert_eq!(outline.len(), 2);
+        assert_eq!(outline[0].title, "Prefazione");
+        assert_eq!(outline[1].page_ord, Some(15));
+
+        let win_pages = concat!(
+            "\u{feff}width=2400 height=3200\r\n",
+            "(page 0 0 2400 3200\r\n",
+            "  (line 240 2800 1800 2960 \"Algebra Commutativa\"))\r\n"
+        );
+        let parsed = parse_djvused_pages_output(win_pages, 1, outline).unwrap();
+        assert_eq!(parsed.page_count, 1);
+        assert!(parsed.has_text_layer);
+        assert_eq!(parsed.pages.len(), 1);
+        assert!((parsed.pages[0].width_pts - 2400.0).abs() < 1e-4);
+        assert!((parsed.pages[0].height_pts - 3200.0).abs() < 1e-4);
+        assert_eq!(parsed.pages[0].spans.len(), 1);
+        assert_eq!(parsed.pages[0].spans[0].text, "Algebra Commutativa");
+
+        let win_meta = "\u{feff}title\t\"Éléments de géométrie algébrique\"\r\nauthor\t\"Grothendieck, Alexander\"\r\n";
+        let (mt, ma) = parse_djvu_meta(win_meta);
+        assert_eq!(mt.as_deref(), Some("Éléments de géométrie algébrique"));
+        assert_eq!(ma.as_deref(), Some("Grothendieck, Alexander"));
     }
 }

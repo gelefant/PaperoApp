@@ -108,6 +108,61 @@ pub fn open_external(
     open_with_os_default(file_path)
 }
 
+#[cfg(target_os = "windows")]
+mod win_shell {
+    use std::ffi::c_void;
+
+    pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    pub const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    pub const SW_SHOWNORMAL: i32 = 1;
+
+    #[link(name = "ole32")]
+    extern "system" {
+        pub fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        pub fn CoUninitialize();
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        pub fn ILCreateFromPathW(psz_path: *const u16) -> *mut c_void;
+        pub fn ILFree(pidl: *mut c_void);
+        pub fn SHOpenFolderAndSelectItems(
+            pidl_folder: *const c_void,
+            cidl: u32,
+            apidl: *const *const c_void,
+            dw_flags: u32,
+        ) -> i32;
+        pub fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+}
+
+/// Normalizes a filesystem path for Windows Shell APIs and `explorer.exe`
+/// (converts `/` to `\` and strips `\\?\` / `\\?\UNC\` verbatim prefixes).
+pub fn normalize_windows_shell_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('/', "\\");
+    if let Some(unc_tail) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc_tail}")
+    } else if let Some(drive_tail) = raw.strip_prefix(r"\\?\") {
+        drive_tail.to_string()
+    } else {
+        raw
+    }
+}
+
+/// Formats the raw command-line switch for `explorer.exe` so quotes wrap only the path
+/// after `/select,` (avoiding Rust `Command::arg` wrapping quotes before `/select,`).
+pub fn format_explorer_select_raw_arg(clean_win_path: &str) -> String {
+    let sanitized = clean_win_path.replace('"', "");
+    format!("/select,\"{sanitized}\"")
+}
+
 pub fn open_with_os_default(file_path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -116,8 +171,31 @@ pub fn open_with_os_default(file_path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        // `explorer <file>` delegates cleanly to the registered default handler without `cmd /C` shell quoting hazards.
-        Command::new("explorer").arg(file_path).spawn()?;
+        let raw_lossy = file_path.to_string_lossy();
+        let target = if raw_lossy.starts_with("https://") || raw_lossy.starts_with("http://") {
+            raw_lossy.into_owned()
+        } else {
+            normalize_windows_shell_path(file_path)
+        };
+        let wide_open: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_target: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: Both `wide_open` and `wide_target` are valid NUL-terminated UTF-16 buffers.
+        let ret = unsafe {
+            win_shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                wide_open.as_ptr(),
+                wide_target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                win_shell::SW_SHOWNORMAL,
+            )
+        };
+        if ret <= 32 {
+            let os_err = std::io::Error::last_os_error();
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "ShellExecuteW failed (code {ret}) for '{target}': {os_err}"
+            ))));
+        }
         return Ok(());
     }
     #[cfg(target_os = "linux")]
@@ -211,9 +289,44 @@ pub fn reveal_in_folder(file_path: &Path, linux_mode: LinuxRevealMode) -> Result
     #[cfg(target_os = "windows")]
     {
         let _ = linux_mode;
-        let win_path = file_path.to_string_lossy().replace('/', "\\");
-        Command::new("explorer")
-            .arg(format!("/select,{win_path}"))
+        let clean_win_path = normalize_windows_shell_path(file_path);
+        let wide_path: Vec<u16> = clean_win_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // Primary path: native Win32 Shell `SHOpenFolderAndSelectItems` via PIDL.
+        // Avoids `explorer.exe`'s custom command-line parser (which rejects Rust's outer quotes
+        // around `"/select,..."` for paths with spaces and splits unquoted paths on commas `,` or `=`).
+        // SAFETY: `wide_path` is NUL-terminated; `pidl` is freed via `ILFree` before returning,
+        // and `CoUninitialize` is balanced only when `CoInitializeEx` returned `S_OK` / `S_FALSE` (`>= 0`).
+        let shell_ok = unsafe {
+            let hr_init = win_shell::CoInitializeEx(
+                std::ptr::null_mut(),
+                win_shell::COINIT_APARTMENTTHREADED | win_shell::COINIT_DISABLE_OLE1DDE,
+            );
+            let should_uninit = hr_init >= 0;
+            let pidl = win_shell::ILCreateFromPathW(wide_path.as_ptr());
+            let ok = if !pidl.is_null() {
+                let hr = win_shell::SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+                win_shell::ILFree(pidl);
+                hr >= 0
+            } else {
+                false
+            };
+            if should_uninit {
+                win_shell::CoUninitialize();
+            }
+            ok
+        };
+        if shell_ok {
+            return Ok(());
+        }
+
+        // Fallback: `explorer.exe` with `raw_arg` so quotes wrap ONLY the path after `/select,`.
+        use std::os::windows::process::CommandExt;
+        Command::new("explorer.exe")
+            .raw_arg(format_explorer_select_raw_arg(&clean_win_path))
             .spawn()?;
         return Ok(());
     }
@@ -340,6 +453,26 @@ mod tests {
                 "7",
                 "C:\\books\\a.pdf"
             ]
+        );
+    }
+
+    #[test]
+    fn windows_shell_path_strips_verbatim_prefixes_and_formats_explorer_select() {
+        assert_eq!(
+            normalize_windows_shell_path(Path::new(r"\\?\C:\Users\Mario Rossi\Libri\Serre, J.-P.djvu")),
+            r"C:\Users\Mario Rossi\Libri\Serre, J.-P.djvu"
+        );
+        assert_eq!(
+            normalize_windows_shell_path(Path::new(r"\\?\UNC\nas\math\Grothendieck EGA 1.djvu")),
+            r"\\nas\math\Grothendieck EGA 1.djvu"
+        );
+        assert_eq!(
+            normalize_windows_shell_path(Path::new("D:/Algebraic Geometry/Hartshorne, R.pdf")),
+            r"D:\Algebraic Geometry\Hartshorne, R.pdf"
+        );
+        assert_eq!(
+            format_explorer_select_raw_arg(r"C:\Users\Mario Rossi\Libri\Serre, J.-P.djvu"),
+            "/select,\"C:\\Users\\Mario Rossi\\Libri\\Serre, J.-P.djvu\""
         );
     }
 }

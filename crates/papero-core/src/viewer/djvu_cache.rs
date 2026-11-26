@@ -1,5 +1,8 @@
-use crate::config::{configure_background_command, resolve_external_tool};
+use crate::config::resolve_external_tool;
 use crate::error::{CoreError, Result};
+use crate::extract::djvu::{
+    classify_djvu_cli_failure, configure_djvu_tool_env, prepare_cli_input_path,
+};
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -43,6 +46,29 @@ impl DjvuCache {
             .join(format!("{blake3_hash}_p{page_ord}_d{safe_dpi}.png"))
     }
 
+    /// Clears all cached rendered DjVu PNG pages on disk, resets `approx_bytes`,
+    /// and ensures `cache_dir` exists so subsequent renders never fail with missing dir.
+    pub fn clear(&self) -> Result<u64> {
+        let _guard = self.evict_lock.lock().expect("djvu_cache mutex poisoned");
+        let mut removed = 0u64;
+        if let Ok(rd) = fs::read_dir(&self.cache_dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if let Ok(m) = ent.metadata() {
+                    if m.is_file() {
+                        let len = m.len();
+                        if fs::remove_file(&p).is_ok() {
+                            removed = removed.saturating_add(len);
+                        }
+                    }
+                }
+            }
+        }
+        fs::create_dir_all(&self.cache_dir)?;
+        self.approx_bytes.store(0, Ordering::Relaxed);
+        Ok(removed)
+    }
+
     /// Returns PNG bytes for the requested DjVu page, reading from disk cache on hit
     /// or spawning `ddjvu -format=ppm -page=<N> -scale=<dpi>` on miss.
     pub fn render_page_png(
@@ -61,14 +87,21 @@ impl DjvuCache {
         }
 
         let bin = resolve_external_tool(ddjvu_bin, "ddjvu");
+        let prepared = prepare_cli_input_path(djvu_file).ok();
         let mut cmd = Command::new(&bin);
-        configure_background_command(&mut cmd);
-        let output = cmd
-            .arg("-format=ppm")
+        configure_djvu_tool_env(&mut cmd, &bin);
+        cmd.arg("-format=ppm")
             .arg(format!("-page={page_ord}"))
-            .arg(format!("-scale={safe_dpi}"))
-            .arg(djvu_file)
-            .arg("-")
+            .arg(format!("-scale={safe_dpi}"));
+
+        if let Some(ref prep) = prepared {
+            cmd.arg(prep.path()).arg("-");
+        } else {
+            let stdin_file = fs::File::open(djvu_file)?;
+            cmd.arg("-").arg("-").stdin(Stdio::from(stdin_file));
+        }
+
+        let output = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -84,15 +117,17 @@ impl DjvuCache {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(CoreError::CorruptFile(format!(
-                "ddjvu failed ({}): {stderr}",
-                output.status
-            )));
+            return Err(classify_djvu_cli_failure(
+                "ddjvu",
+                &bin,
+                output.status,
+                &output.stderr,
+            ));
         }
 
         let png_bytes = ppm_to_png(&output.stdout)?;
 
+        let _ = fs::create_dir_all(&self.cache_dir);
         // Unique temp filename per (hash, page, dpi, atomic seq) prevents concurrent DPI render races!
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp_path = self.cache_dir.join(format!(

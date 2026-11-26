@@ -8,7 +8,7 @@ use papero_core::dedup::{
 use papero_core::metadata::io::{import_bibtex, import_zotero_csl_json};
 use papero_core::metadata::models::DocumentMetadataView;
 use papero_core::metadata::relations::{
-    find_missing_cited_classics, get_document_relations, refresh_local_citations_for_doc,
+    find_missing_cited_classics, get_document_relations, refresh_local_citations_on_db,
     resolve_citation_snippet_in_library, CitationLinkItem, DocumentRelationsView,
     MissingClassicItem,
 };
@@ -588,10 +588,41 @@ pub async fn get_document_relations_cmd(
 ) -> Result<DocumentRelationsView, String> {
     let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
-        {
-            let w = st.db.writer();
-            let _ = refresh_local_citations_for_doc(&w, document_id);
+        let stamp: Option<(i64, i64)> = {
+            let r = st.db.reader();
+            let doc_upd: Option<i64> = r
+                .query_row(
+                    "SELECT updated_at FROM documents WHERE id = ?1",
+                    [document_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            doc_upd.map(|u| {
+                let total_docs: i64 = r
+                    .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+                    .unwrap_or(0);
+                (u, total_docs)
+            })
+        };
+
+        let needs_citation_scan = match stamp {
+            Some(cur) => st
+                .relations_scan_cache
+                .lock()
+                .map(|g| g.get(&document_id).copied() != Some(cur))
+                .unwrap_or(true),
+            None => false,
+        };
+
+        if needs_citation_scan && refresh_local_citations_on_db(&st.db, document_id).is_ok() {
+            if let (Some(cur), Ok(mut g)) = (stamp, st.relations_scan_cache.lock()) {
+                if g.len() > 4096 {
+                    g.clear();
+                }
+                g.insert(document_id, cur);
+            }
         }
+
         let raw_prof = st.config.read().expect("config poisoned").ml_profile.clone();
         let profile = ModelProfile::from_str_lossy(&raw_prof);
         let vindex = st.vector_index_for(profile);

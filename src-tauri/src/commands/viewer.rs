@@ -1,10 +1,13 @@
 use crate::state::{read_file_range_at, AppState, ViewerFileError};
 use papero_core::db::repos::docs::{get_file_location, get_file_viewer_info, FileViewerInfo};
-use papero_core::extract::djvu::extract_djvu_single_page_spans;
+use papero_core::extract::djvu::{
+    extract_djvu_single_page_spans, probe_djvu_page_count_and_outline,
+};
 use papero_core::extract::types::ExtractedSpan;
 use papero_core::viewer::os_actions::{
     external_reader_presets, open_external, reveal_in_folder, ExternalReaderPreset,
 };
+use std::path::Path;
 use std::sync::Arc;
 use tauri::ipc::Response as IpcResponse;
 use tauri::{AppHandle, State, WebviewUrl, WebviewWindowBuilder};
@@ -14,12 +17,45 @@ pub async fn get_viewer_doc(
     state: State<'_, Arc<AppState>>,
     file_id: i64,
 ) -> Result<FileViewerInfo, String> {
-    let db = Arc::clone(&state.db);
+    let st = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
-        let r = db.reader();
-        get_file_viewer_info(&r, file_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("file {file_id} not found"))
+        let mut info = {
+            let r = st.db.reader();
+            get_file_viewer_info(&r, file_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("file {file_id} not found"))?
+        };
+        if info.format == "djvu" && info.page_count == 0 && info.is_available {
+            let djvused_bin = st
+                .config
+                .read()
+                .expect("config poisoned")
+                .djvused_bin
+                .clone();
+            if let Ok((pc, outline)) =
+                probe_djvu_page_count_and_outline(Path::new(&info.abs_path), djvused_bin.as_deref())
+            {
+                if pc > 0 {
+                    info.page_count = pc;
+                    let outline_json = if info.outline.is_empty() && !outline.is_empty() {
+                        let json = serde_json::to_string(&outline).ok();
+                        info.outline = outline;
+                        json
+                    } else {
+                        None
+                    };
+                    let w = st.db.writer();
+                    let _ = w.execute(
+                        "UPDATE files
+                         SET page_count = ?1,
+                             outline_json = COALESCE(?2, outline_json)
+                         WHERE id = ?3 AND COALESCE(page_count, 0) = 0",
+                        (pc as i64, outline_json, file_id),
+                    );
+                }
+            }
+        }
+        Ok(info)
     })
     .await
     .map_err(|e| e.to_string())?

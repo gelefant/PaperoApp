@@ -152,6 +152,52 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         migrate_v9_cite_override_statements_and_snips(conn)?;
     }
 
+    if current_version < 10 {
+        migrate_v10_heal_djvu_false_corrupt(conn)?;
+    }
+
+    Ok(())
+}
+
+/// Self-heals `.djvu` files previously misclassified as `'corrupt'` / `'io_error'` on Windows
+/// (due to `djvused -u` emitting a UTF-8 BOM on `stdout` or non-ASCII narrow paths) by resetting
+/// them to `'pending_extract'` and re-queuing `extract_bm25` + `metadata` jobs automatically.
+fn migrate_v10_heal_djvu_false_corrupt(conn: &Connection) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE files
+         SET index_state = 'pending_extract',
+             error_message = NULL,
+             updated_at = ?1
+         WHERE format = 'djvu'
+           AND index_state IN ('corrupt', 'io_error', 'tool_missing')",
+        rusqlite::params![now],
+    )?;
+    tx.execute_batch(
+        "INSERT INTO index_jobs (file_id, stage, priority, status, attempts, last_error)
+         SELECT id, 'extract_bm25', 10, 'queued', 0, NULL
+         FROM files
+         WHERE format = 'djvu' AND index_state = 'pending_extract'
+         ON CONFLICT(file_id, stage) DO UPDATE SET
+            status = 'queued',
+            attempts = 0,
+            last_error = NULL;
+
+         INSERT INTO index_jobs (file_id, stage, priority, status, attempts, last_error)
+         SELECT id, 'metadata', 20, 'queued', 0, NULL
+         FROM files
+         WHERE format = 'djvu' AND index_state = 'pending_extract'
+         ON CONFLICT(file_id, stage) DO UPDATE SET
+            status = 'queued',
+            attempts = 0,
+            last_error = NULL;",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+        rusqlite::params![10i64, now],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -463,4 +509,72 @@ fn rebuild_minhashes_and_recompute_duplicates_v6(conn: &Connection) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_v10_self_heals_false_corrupt_djvu_files() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Simulate a pre-v10 database (v9) where a DjVu book was falsely marked 'corrupt'
+        conn.execute("DELETE FROM schema_version WHERE version >= 10", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO source_roots (id, label, root_path, created_at) VALUES ('r1', 'Lib', '/tmp', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, work_type, title, title_norm, created_at, updated_at)
+             VALUES (1, 'book', 'Algebra DjVu', 'algebra djvu', 1, 1),
+                    (2, 'book', 'Broken PDF', 'broken pdf', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, document_id, root_id, rel_path, format, size_bytes, mtime_ns, blake3_hash, index_state, error_message, created_at, updated_at)
+             VALUES (10, 1, 'r1', 'alg.djvu', 'djvu', 1024, 1, 'h1', 'corrupt', 'djvused did not return a valid page count', 1, 1),
+                    (20, 2, 'r1', 'bad.pdf', 'pdf', 1024, 1, 'h2', 'corrupt', 'pdfium invalid header', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO index_jobs (file_id, stage, priority, status, attempts, last_error)
+             VALUES (10, 'extract_bm25', 10, 'failed', 1, 'BOM parse fail')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (djvu_state, djvu_err): (String, Option<String>) = conn
+            .query_row(
+                "SELECT index_state, error_message FROM files WHERE id = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(djvu_state, "pending_extract");
+        assert!(djvu_err.is_none());
+
+        let job_status: String = conn
+            .query_row(
+                "SELECT status FROM index_jobs WHERE file_id = 10 AND stage = 'extract_bm25'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_status, "queued");
+
+        let pdf_state: String = conn
+            .query_row("SELECT index_state FROM files WHERE id = 20", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pdf_state, "corrupt");
+    }
 }

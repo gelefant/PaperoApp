@@ -503,9 +503,15 @@ pub async fn compact_database_cmd(
 #[tauri::command]
 pub async fn clear_render_cache_cmd(state: State<'_, Arc<AppState>>) -> Result<u64, String> {
     let st = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || clear_render_cache(&st.paths).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
+    tokio::task::spawn_blocking(move || {
+        let djvu_bytes = st.djvu_cache.clear().unwrap_or(0);
+        let other_bytes = clear_render_cache(&st.paths).map_err(|e| e.to_string())?;
+        // Ensure `djvu_pages/` directory remains intact after clearing `paths.cache_dir`.
+        let _ = st.djvu_cache.clear();
+        Ok(djvu_bytes.saturating_add(other_bytes))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
